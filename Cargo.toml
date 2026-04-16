@@ -1,0 +1,24 @@
+[package]
+name = "lazydb"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal-first SQLite explorer inspired by lazygit/lazydocker"
+license = "MIT"
+readme = "README.md"
+keywords = ["sqlite", "tui", "database", "cli"]
+categories = ["command-line-utilities", "database"]
+rust-version = "1.85"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.29"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
