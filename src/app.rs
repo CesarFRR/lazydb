@@ -1,6 +1,6 @@
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::sqlite;
+use crate::{query, sqlite, storage};
 
 const LARGE_WIDTH: u16 = 120;
 const MEDIUM_WIDTH: u16 = 80;
@@ -45,6 +45,12 @@ pub enum LayoutMode {
     Small,
 }
 
+enum EnterAction {
+    Connect(String),
+    UpdateStatus,
+    None,
+}
+
 impl LayoutMode {
     pub const fn from_width(width: u16) -> Self {
         if width >= LARGE_WIDTH {
@@ -80,10 +86,30 @@ pub struct App {
     pub current_page: u32,
     pub rows_per_page: u32,
     pub total_rows: u32,
+    pub query_state: query::QueryState,
+    pub query_results: Vec<String>,
+    pub state: storage::AppState,
 }
 
 impl App {
     pub fn new() -> Self {
+        let state = storage::AppState::load();
+
+        // Construir sources con recents
+        let mut sources = vec![
+            "Buscar archivo .db".to_string(),
+            "Abrir sakila.db".to_string(),
+            "Favoritos".to_string(),
+        ];
+
+        // Insertar recents al inicio si existen
+        if !state.recents.is_empty() {
+            sources.insert(0, "─ Recientes ─".to_string());
+            for recent in state.recents.iter().rev() {
+                sources.insert(1, recent.clone());
+            }
+        }
+
         Self {
             focus: FocusPanel::Sources,
             should_quit: false,
@@ -91,12 +117,7 @@ impl App {
             source_idx: 0,
             object_idx: 0,
             preview_idx: 0,
-            sources: vec![
-                "Recientes".to_string(),
-                "Buscar archivo .db".to_string(),
-                "Abrir sakila.db".to_string(),
-                "Favoritos".to_string(),
-            ],
+            sources,
             objects: vec![
                 "actor".to_string(),
                 "address".to_string(),
@@ -124,10 +145,21 @@ impl App {
             current_page: 0,
             rows_per_page: 10,
             total_rows: 0,
+            query_state: query::QueryState::Idle,
+            query_results: Vec::new(),
+            state,
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode) {
+    pub fn on_key(&mut self, key: KeyEvent) {
+        let code = key.code;
+        let is_ctrl_q = key.modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('q');
+
+        if is_ctrl_q {
+            self.execute_count_query();
+            return;
+        }
+
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
@@ -227,20 +259,32 @@ impl App {
             return;
         }
 
-        match self.selected_source() {
-            "Abrir sakila.db" => {
-                self.connect_sqlite("sakila.db");
+        let selected = self.selected_source().to_string();
+
+        // Ignorar líneas separadoras
+        if selected == "─ Recientes ─" {
+            return;
+        }
+
+        // 1. Decidimos qué hacer (Préstamo inmutable)
+        let action = match selected.as_str() {
+            "Abrir sakila.db" => EnterAction::Connect("sakila.db".to_string()),
+            "Buscar archivo .db" => EnterAction::UpdateStatus,
+            s if s.starts_with('/')
+                || std::path::Path::new(s)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db")) =>
+            {
+                EnterAction::Connect(s.to_string())
             }
-            "Recientes" => {
-                self.status = "Recientes aun no implementado".to_string();
-            }
-            "Favoritos" => {
-                self.status = "Favoritos aun no implementado".to_string();
-            }
-            "Buscar archivo .db" => {
-                self.status = "Buscador de archivos .db llega en la siguiente seccion".to_string();
-            }
-            _ => {}
+            _ => EnterAction::None, // <-- Esto asegura que siempre haya una respuesta
+        };
+
+        // 2. Ejecutamos la acción (Préstamo mutable)
+        match action {
+            EnterAction::Connect(path) => self.connect_sqlite(&path),
+            EnterAction::UpdateStatus => self.status = "Buscador de archivos...".to_string(),
+            EnterAction::None => {}
         }
     }
 
@@ -250,6 +294,11 @@ impl App {
                 if objects.is_empty() {
                     objects.push("<sin objetos>".to_string());
                 }
+
+                // Agregar a recents y guardar
+                let path_str = path.to_string();
+                self.state.add_recent(path_str);
+                let _ = self.state.save();
 
                 self.db_path = Some(path.to_string());
                 self.objects = objects;
@@ -309,6 +358,45 @@ impl App {
             Err(err) => {
                 self.preview_rows = vec![format!("Error obteniendo filas: {err}")];
                 self.preview_idx = 0;
+            }
+        }
+    }
+
+    fn execute_count_query(&mut self) {
+        let Some(path) = self.db_path.as_deref() else {
+            self.status = "No hay DB conectada".to_string();
+            return;
+        };
+
+        let object = self.selected_object().to_string();
+        if object.is_empty() || object == "-" || object == "<sin objetos>" {
+            self.status = "Selecciona una tabla primero".to_string();
+            return;
+        }
+
+        // Ejecutar COUNT(*) en la tabla
+        let sql = format!("SELECT COUNT(*) FROM \"{}\";", object.replace('"', "\"\""));
+
+        self.query_state = query::QueryState::Running;
+        self.status = "Ejecutando query...".to_string();
+
+        // Nota: Por ahora es bloqueante. En Sección 5 refactorizar a async con canales.
+        // Para hacerlo async sin bloquear la UI necesitaremos tokio::spawn + mpsc::channel
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sqlite3 \"{path}\" \"{sql}\""))
+            .output()
+        {
+            Ok(output) => {
+                let result = String::from_utf8_lossy(&output.stdout);
+                let count: String = result.trim().to_string();
+                self.query_results = vec![format!("COUNT(*) = {count}"), format!("SQL: {sql}")];
+                self.query_state = query::QueryState::Done(self.query_results.clone());
+                self.status = format!("Query completada: {count} filas");
+            }
+            Err(e) => {
+                self.query_state = query::QueryState::Error(e.to_string());
+                self.status = format!("Error ejecutando query: {e}");
             }
         }
     }

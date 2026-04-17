@@ -1,5 +1,7 @@
 mod app;
+mod query;
 mod sqlite;
+mod storage;
 mod ui;
 
 use std::{io, time::Duration};
@@ -12,7 +14,8 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -41,7 +44,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            app.on_key(key.code);
+            app.on_key(key);
         }
     }
 }

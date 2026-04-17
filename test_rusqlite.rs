@@ -1,0 +1,1 @@
+use rusqlite::Connection; fn main() { let conn = Connection::open_in_memory().unwrap(); let stmt = conn.prepare("SELECT 1").unwrap(); let _ = stmt.column_count(); }

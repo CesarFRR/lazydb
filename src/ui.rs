@@ -46,11 +46,19 @@ fn render_header(
     layout_mode: LayoutMode,
     compact_height: bool,
 ) {
+    let query_indicator = match &app.query_state {
+        crate::query::QueryState::Idle => String::new(),
+        crate::query::QueryState::Running => " | [Ejecutando query...]".to_string(),
+        crate::query::QueryState::Done(_) => " | [Query completada]".to_string(),
+        crate::query::QueryState::Error(e) => format!(" | [Error: {e}]"),
+    };
+
     let line1 = format!(
-        "lazydb | foco: {} | layout: {} | refresh: {}",
+        "lazydb | foco: {} | layout: {} | refresh: {}{}",
         app.focus.title(),
         layout_mode.label(),
-        app.refresh_count
+        app.refresh_count,
+        query_indicator
     );
 
     let line2 = format!(
@@ -180,11 +188,14 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let shortcuts = if area.width >= 95 {
         format!(
-            "tab/h/l foco | j/k mover | pgup/pgdn página | enter abrir | 1/2/3 panel | r refresh | q salir | {}",
+            "tab/h/l foco | j/k mover | pgup/pgdn página | ctrl+q query | enter abrir | 1/2/3 panel | r refresh | q salir | {}",
             app.status
         )
     } else {
-        format!("enter abrir | tab foco | pgup/pgdn página | q salir | {}", app.status)
+        format!(
+            "enter abrir | tab foco | ctrl+q query | pgup/pgdn página | q salir | {}",
+            app.status
+        )
     };
     frame.render_widget(Paragraph::new(shortcuts), area);
 }
