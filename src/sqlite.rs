@@ -1,5 +1,70 @@
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
+pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>, String> {
+    let conn = open_read_only(path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = ?1
+             AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .map_err(|err| err.to_string())?;
+
+    let rows = stmt
+        .query_map([object_type], |row| row.get::<_, String>(0))
+        .map_err(|err| err.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|err| err.to_string())?);
+    }
+
+    Ok(out)
+}
+
+pub fn list_advanced_objects(path: &str) -> Result<Vec<String>, String> {
+    let conn = open_read_only(path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name FROM sqlite_master
+             WHERE type IN ('index','trigger')
+             AND name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+        )
+        .map_err(|err| err.to_string())?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let kind: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok(format!("{kind}:{name}"))
+        })
+        .map_err(|err| err.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|err| err.to_string())?);
+    }
+
+    Ok(out)
+}
+
+pub fn object_sql(path: &str, object_name: &str) -> Result<String, String> {
+    let conn = open_read_only(path)?;
+    let escaped = object_name.replace('"', "\"\"");
+    let sql = format!(
+        "SELECT sql FROM sqlite_master WHERE name = \"{escaped}\" ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 WHEN 'trigger' THEN 4 ELSE 9 END LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
+
+    let ddl: Option<String> =
+        stmt.query_row([], |row| row.get(0)).optional().map_err(|err| err.to_string())?;
+
+    Ok(ddl.unwrap_or_else(|| "-- SQL no disponible para este objeto".to_string()))
+}
+
+#[allow(dead_code)]
 pub fn list_objects(path: &str) -> Result<Vec<String>, String> {
     let conn = open_read_only(path)?;
     let mut stmt = conn

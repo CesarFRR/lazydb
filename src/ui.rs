@@ -1,20 +1,23 @@
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 
-use crate::app::{App, FocusPanel, LayoutMode};
+use crate::app::{App, DetailTab, FocusPanel, LayoutMode, ObjectSection};
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
 
-    if area.height < 6 || area.width < 28 {
+    if area.height < 10 || area.width < 40 {
         render_too_small(frame, area);
         return;
     }
 
     let layout_mode = LayoutMode::from_width(area.width);
-    let compact_height = area.height < 11;
+    let compact_height = area.height < 14;
 
     let header_height = if compact_height { 1 } else { 2 };
     let footer_height = 1;
@@ -31,9 +34,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     render_header(frame, vertical[0], app, layout_mode, compact_height);
 
     match layout_mode {
-        LayoutMode::Large => render_large(frame, vertical[1], app),
-        LayoutMode::Medium => render_medium(frame, vertical[1], app),
+        LayoutMode::Large | LayoutMode::Medium => render_two_columns(frame, vertical[1], app),
         LayoutMode::Small => render_small(frame, vertical[1], app),
+    }
+
+    if app.show_actions_menu {
+        render_actions_menu(frame, area, app);
     }
 
     render_footer(frame, vertical[2], app);
@@ -54,18 +60,20 @@ fn render_header(
     };
 
     let line1 = format!(
-        "lazydb | foco: {} | layout: {} | refresh: {}{}",
+        "lazydb | foco: {} | layout: {} | db: {} ({}){}",
         app.focus.title(),
         layout_mode.label(),
-        app.refresh_count,
+        app.db_path_display(),
+        app.db_size_display(),
         query_indicator
     );
 
     let line2 = format!(
-        "source: {} | object: {} | row: {}",
-        app.selected_source(),
-        app.selected_object(),
-        app.selected_preview_row()
+        "src:{} | obj:{} | detail:{} | selected:{}",
+        app.source_tab_label(),
+        app.object_section_label(),
+        app.detail_tab_label(),
+        app.selected_object()
     );
 
     if compact_height {
@@ -77,94 +85,139 @@ fn render_header(
     frame.render_widget(Paragraph::new(header_text), area);
 }
 
-fn render_large(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_two_columns(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
-        ])
+        .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
         .split(area);
 
-    render_sources(frame, cols[0], app, false);
-    render_objects(frame, cols[1], app, false);
-    render_preview(frame, cols[2], app, false);
-}
-
-fn render_medium(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
-
-    render_sources(frame, cols[0], app, false);
-
-    match app.focus {
-        FocusPanel::Sources => render_objects(frame, cols[1], app, false),
-        FocusPanel::Objects | FocusPanel::Preview => render_preview(frame, cols[1], app, false),
-    }
+    render_left_navigation(frame, cols[0], app);
+    render_right_detail(frame, cols[1], app);
 }
 
 fn render_small(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.focus {
-        FocusPanel::Sources => render_sources(frame, area, app, true),
-        FocusPanel::Objects => render_objects(frame, area, app, true),
-        FocusPanel::Preview => render_preview(frame, area, app, true),
+        FocusPanel::Sources | FocusPanel::Objects => render_left_navigation(frame, area, app),
+        FocusPanel::Preview => render_right_detail(frame, area, app),
     }
 }
 
-fn panel_block(title: &str, focused: bool) -> Block<'_> {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+fn render_left_navigation(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
 
-    Block::default().title(title).borders(Borders::ALL).border_style(border_style)
+    render_sources(frame, rows[0], app);
+    render_object_section(frame, rows[1], app, ObjectSection::Tables);
+    render_object_section(frame, rows[2], app, ObjectSection::Views);
+    render_object_section(frame, rows[3], app, ObjectSection::Advanced);
 }
 
-fn render_sources(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
-    let title = if compact { "Sources (solo)" } else { "Sources" };
+fn render_sources(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let tabs = match app.source_tab {
+        crate::app::SourceTab::All => "[Todo] Local Online",
+        crate::app::SourceTab::Local => "Todo [Local] Online",
+        crate::app::SourceTab::Online => "Todo Local [Online]",
+    };
+    let title = format!("Fuentes ({tabs})");
 
     let items: Vec<ListItem<'_>> =
         app.sources.iter().map(|item| ListItem::new(item.as_str())).collect();
+
     let mut state = ListState::default().with_selected(Some(app.source_idx));
     let list = List::new(items)
-        .block(panel_block(title, app.focus == FocusPanel::Sources))
+        .block(panel_block(&title, app.focus == FocusPanel::Sources))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, area, &mut state);
+    render_passive_scrollbar(frame, area, app.sources.len(), app.source_idx);
 }
 
-fn render_objects(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
-    let title = if compact { "Objects (solo)" } else { "Objects" };
+fn render_object_section(frame: &mut Frame<'_>, area: Rect, app: &App, section: ObjectSection) {
+    let (items_vec, title) = match section {
+        ObjectSection::Tables => (&app.tables, "Tablas"),
+        ObjectSection::Views => (&app.views, "Vistas"),
+        ObjectSection::Advanced => (&app.advanced, "Avanzado"),
+    };
 
-    let items: Vec<ListItem<'_>> =
-        app.objects.iter().map(|item| ListItem::new(item.as_str())).collect();
-    let mut state = ListState::default().with_selected(Some(app.object_idx));
+    let items: Vec<ListItem<'_>> = if items_vec.is_empty() {
+        vec![ListItem::new("<sin objetos>")]
+    } else {
+        items_vec.iter().map(|item| ListItem::new(item.as_str())).collect()
+    };
+
+    let selected = if app.object_section == section {
+        Some(app.object_idx.min(items.len().saturating_sub(1)))
+    } else {
+        None
+    };
+
+    let mut state = ListState::default().with_selected(selected);
     let list = List::new(items)
-        .block(panel_block(title, app.focus == FocusPanel::Objects))
+        .block(panel_block(
+            title,
+            app.focus == FocusPanel::Objects && app.object_section == section,
+        ))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, area, &mut state);
+    let selected_for_bar = if app.object_section == section { app.object_idx } else { 0 };
+    render_passive_scrollbar(frame, area, items_vec.len().max(1), selected_for_bar);
 }
 
-fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
-    let total_pages =
-        if app.total_rows == 0 { 1 } else { app.total_rows.div_ceil(app.rows_per_page) };
+fn render_right_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(3)])
+        .split(area);
 
-    let page_info = format!(
-        "Page {}/{} | Row {}/{}",
-        app.current_page + 1,
-        total_pages,
-        app.preview_idx + 1,
-        app.preview_rows.len()
-    );
+    render_detail_tabs(frame, rows[0], app);
+    render_detail_content(frame, rows[1], app);
+}
 
-    let title = if compact { format!("{page_info} | solo") } else { page_info };
+fn render_detail_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let tabs = [DetailTab::Data, DetailTab::Schema, DetailTab::Sql, DetailTab::Meta]
+        .iter()
+        .map(|tab| {
+            if *tab == app.detail_tab {
+                format!("[{}]", tab.label())
+            } else {
+                tab.label().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let title = "Detalle [Datos | Esquema | SQL | Meta] (←/→ cambia)";
+    let paragraph = Paragraph::new(fit_line(&tabs, area.width))
+        .block(panel_block(title, app.focus == FocusPanel::Preview));
+
+    frame.render_widget(paragraph, area);
+}
+
+fn render_detail_content(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let title = if app.detail_tab == DetailTab::Data {
+        let total_pages =
+            if app.total_rows == 0 { 1 } else { app.total_rows.div_ceil(app.rows_per_page) };
+        format!(
+            "{} | Page {}/{} | Row {}/{}",
+            app.detail_tab_label(),
+            app.current_page + 1,
+            total_pages,
+            app.preview_idx + 1,
+            app.preview_rows.len()
+        )
+    } else {
+        app.detail_tab_label().to_string()
+    };
 
     let content = app
         .preview_rows
@@ -185,19 +238,74 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
     frame.render_widget(paragraph, area);
 }
 
+fn panel_block(title: &str, focused: bool) -> Block<'_> {
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    Block::default().title(title).borders(Borders::ALL).border_style(border_style)
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let shortcuts = if area.width >= 95 {
+    let shortcuts = if area.width >= 110 {
         format!(
-            "tab/h/l foco | j/k mover | pgup/pgdn página | ctrl+q query | enter abrir | 1/2/3 panel | r refresh | q salir | {}",
+            "tab: tabs izq | ↑/↓: contenido | ←/→: tabs detalle | rueda: scroll | click: foco/seleccion | x/b: menu acciones | enter abrir | ctrl+q count | ctrl+r cfg | {}",
             app.status
         )
     } else {
-        format!(
-            "enter abrir | tab foco | ctrl+q query | pgup/pgdn página | q salir | {}",
-            app.status
-        )
+        format!("tab tabs izq | ↑↓ mover | ←→ detalle | rueda | x menu | {}", app.status)
     };
     frame.render_widget(Paragraph::new(shortcuts), area);
+}
+
+fn render_actions_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let width = area.width.min(52);
+    let height = area.height.min(10);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, rect);
+
+    let lines = App::actions_menu_items()
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            if idx == app.actions_menu_selected() {
+                format!("> {item}")
+            } else {
+                format!("  {item}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let paragraph = Paragraph::new(lines)
+        .block(panel_block("Acciones (x/b cerrar, Enter ejecutar)", true))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, rect);
+}
+
+fn render_passive_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    content_len: usize,
+    selected_idx: usize,
+) {
+    if area.height < 3 || content_len <= 1 {
+        return;
+    }
+
+    let viewport_len = usize::from(area.height.saturating_sub(2));
+    let mut state = ScrollbarState::new(content_len)
+        .viewport_content_length(viewport_len)
+        .position(selected_idx.min(content_len.saturating_sub(1)));
+
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .symbols(ratatui::symbols::scrollbar::VERTICAL);
+    frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
