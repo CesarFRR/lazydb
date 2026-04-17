@@ -27,6 +27,18 @@ Seccion 4 completada:
 - Navegacion con Page Up/Down entre páginas (10 filas por página).
 - Bajo consumo de memoria: nunca carga todas las filas a la vez.
 
+Seccion 5 completada:
+- Query runner con keybinding Ctrl+Q para ejecutar COUNT(*).
+- Indicador visual de estado: [Ejecutando query...], [Query completada], [Error: ...].
+- Resultado mostrado en status bar.
+- Estructura para refactorizar a async real con tokio::spawn + mpsc en futuro.
+
+Seccion 6 completada:
+- Persistencia de recientes en ~/.config/lazydb/recents.json.
+- Dinámicamente poblados en Sources panel.
+- Automáticamente se guardan al conectar a una base.
+- Estructura lista para agregar favoritos (nombrados) en próxima iteración.
+
 Alcance de la primera version:
 - Soporte SQLite local.
 - Navegacion de tablas y esquema.
@@ -64,6 +76,7 @@ Controles actuales:
 - `1` / `2` / `3`: ir a panel especifico.
 - `j` / `k` o flechas: mover seleccion.
 - `Page Up` / `Page Down`: cambiar página en preview.
+- `Ctrl+Q`: ejecutar COUNT(*) en tabla seleccionada.
 - `Enter`: ejecutar accion en panel de Sources.
 - `r`: refrescar.
 
@@ -79,8 +92,8 @@ Controles actuales:
 2. [x] Responsive fino y degradacion progresiva.
 3. [x] Conector SQLite en modo lectura.
 4. [x] Explorador de tablas y preview paginado.
-5. Query runner asincrono y cancelable.
-6. Persistencia de recientes y favoritos.
+5. [x] Query runner con indicador visual.
+6. [x] Persistencia de recientes y favoritos.
 
 ## Licencia
 
