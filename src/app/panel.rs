@@ -101,6 +101,7 @@ pub enum PanelMode {
 
 impl PanelMode {
     /// Altura mínima que ocupa este panel (bordes incluidos)
+    #[allow(dead_code)]
     pub const fn min_lines(self) -> u16 {
         match self {
             Self::Collapsed => 3,

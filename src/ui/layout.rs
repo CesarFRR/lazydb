@@ -168,25 +168,73 @@ fn narrow_layout(
 // Stack vertical genérico
 // ---------------------------------------------------------------------------
 
+/// Construye un stack vertical de paneles.
+///
+/// Dos modos:
+/// - **Equitativo**: cuando hay altura suficiente, todos los paneles se reparten
+///   el espacio por igual (`total_h` / n). El último toma el resto.
+/// - **Colapso**: cuando falta altura, solo el panel activo + Detalle (si está en
+///   el stack) se expanden; los demás colapsan a 3 líneas.
 fn build_left_stack(
+    top: u16,
+    total_h: u16,
+    width: u16,
+    kinds: &[PanelKind],
+    active: PanelKind,
+    _panel_modes: &[(PanelKind, PanelMode); 5],
+) -> Vec<(PanelKind, Rect)> {
+    #[allow(clippy::cast_possible_truncation)]
+    let n = kinds.len() as u16;
+    let has_detail = kinds.contains(&PanelKind::Detail);
+
+    // Altura mínima para modo equitativo:
+    // — los paneles "normales" necesitan al menos 5 líneas (Expanded)
+    // — el detalle necesita al menos 5 líneas
+    // — los demás colapsados necesitarían 3, pero en modo equitativo todos se expanden
+    let min_equitative = n * 5;
+
+    if total_h >= min_equitative {
+        equitative_stack(top, total_h, width, kinds)
+    } else {
+        collapse_stack(top, total_h, width, kinds, active, has_detail)
+    }
+}
+
+/// Todos los paneles reciben la misma altura. El último toma el sobrante.
+fn equitative_stack(
+    mut top: u16,
+    total_h: u16,
+    width: u16,
+    kinds: &[PanelKind],
+) -> Vec<(PanelKind, Rect)> {
+    #[allow(clippy::cast_possible_truncation)]
+    let n = kinds.len() as u16;
+    let each = total_h / n;
+    let mut rects = Vec::with_capacity(kinds.len());
+
+    for (i, &kind) in kinds.iter().enumerate() {
+        let h = if i == kinds.len() - 1 { total_h.saturating_sub(top) } else { each };
+        rects.push((kind, Rect::new(0, top, width, h)));
+        top += h;
+    }
+
+    rects
+}
+
+/// Solo el panel activo + Detalle se expanden; el resto colapsa a 3 líneas.
+fn collapse_stack(
     mut top: u16,
     total_h: u16,
     width: u16,
     kinds: &[PanelKind],
     active: PanelKind,
-    panel_modes: &[(PanelKind, PanelMode); 5],
+    has_detail: bool,
 ) -> Vec<(PanelKind, Rect)> {
-    // 1. Calcular altura que necesitan los paneles colapsados
-    let collapsed_count: usize =
-        kinds.iter().filter(|k| **k != active && **k != PanelKind::Detail).count();
+    let expandable_count: u16 = if has_detail && active != PanelKind::Detail { 2 } else { 1 };
     #[allow(clippy::cast_possible_truncation)]
-    let collapsed_lines: u16 = collapsed_count as u16 * 3;
-
-    // 2. El espacio restante se reparte entre: activo + Detalle (si Detail está en el stack)
-    let has_detail_in_stack = kinds.contains(&PanelKind::Detail);
-    let expandable_count: u16 =
-        if has_detail_in_stack && active != PanelKind::Detail { 2 } else { 1 };
-
+    let collapsed_count: u16 =
+        kinds.iter().filter(|k| **k != active && **k != PanelKind::Detail).count() as u16;
+    let collapsed_lines = collapsed_count * 3;
     let remaining = total_h.saturating_sub(collapsed_lines);
     let per_expanded = if expandable_count > 0 && remaining > 0 {
         remaining / expandable_count
@@ -198,40 +246,19 @@ fn build_left_stack(
 
     for (i, &kind) in kinds.iter().enumerate() {
         let is_last = i == kinds.len() - 1;
-        let panel_mode = lookup_mode(panel_modes, kind);
 
-        let panel_h = if kind == PanelKind::Detail {
-            // Detalle: siempre el máximo posible
-            if is_last {
-                total_h.saturating_sub(
-                    top.saturating_sub(
-                        kinds.first().map_or(0, |_| {
-                            rects.first().map_or(top, |r: &(PanelKind, Rect)| r.1.y)
-                        }),
-                    ),
-                )
+        let h = if kind == PanelKind::Detail || kind == active {
+            let base = if kind == PanelKind::Detail && is_last {
+                total_h.saturating_sub(top)
             } else {
                 per_expanded
-            }
-        } else if kind == active {
-            per_expanded
+            };
+            base.max(5) // mínimo 5 líneas para expanded
         } else {
-            match panel_mode {
-                PanelMode::Collapsed => 3,
-                PanelMode::Minimal => 5,
-                PanelMode::Expanded => total_h.saturating_sub(collapsed_lines).min(per_expanded),
-                PanelMode::Fixed(h) => h,
-            }
+            3 // colapsado
         };
 
-        let panel_h = panel_h.max(panel_mode.min_lines()).min(total_h.saturating_sub(top));
-        let h = if is_last {
-            // Último panel toma todo el espacio restante
-            (top + total_h).saturating_sub(top)
-        } else {
-            panel_h
-        };
-
+        let h = h.min(total_h.saturating_sub(top));
         rects.push((kind, Rect::new(0, top, width, h)));
         top += h;
 
@@ -246,10 +273,6 @@ fn build_left_stack(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn lookup_mode(modes: &[(PanelKind, PanelMode); 5], kind: PanelKind) -> PanelMode {
-    modes.iter().find(|(k, _)| *k == kind).map_or(PanelMode::Expanded, |(_, m)| *m)
-}
 
 fn find_panel_rect(rects: &[(PanelKind, Rect)], kind: PanelKind) -> (PanelKind, Rect) {
     rects.iter().find(|(k, _)| *k == kind).copied().unwrap_or_else(|| (kind, Rect::default()))
