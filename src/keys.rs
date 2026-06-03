@@ -10,11 +10,26 @@ pub enum AppAction {
     ClearQueryState,
     ReloadRuntimeConfig,
     QuitOrBack,
+    /// Navegar al panel anterior (cicla los 5 paneles)
     FocusPrev,
+    /// Navegar al panel siguiente (cicla los 5 paneles)
     FocusNext,
+    /// Ir directamente a Fuentes
     FocusSources,
+    /// Ir directamente a Tablas
+    FocusTables,
+    /// Ir directamente a Vistas
+    FocusViews,
+    /// Ir directamente a Avanzado
+    FocusAdvanced,
+    /// Ir directamente a Detalle
+    FocusDetail,
+    /// (obsoleto, redirige a `FocusTables` para compatibilidad)
     FocusObjects,
+    /// (obsoleto, redirige a `FocusDetail` para compatibilidad)
     FocusPreview,
+    /// Toggle expandir/colapsar el panel actual
+    ToggleCurrentPanel,
     Refresh,
     FavoriteCurrentDb,
     MoveUp,
@@ -92,28 +107,51 @@ impl Default for Keymap {
     fn default() -> Self {
         let mut bindings = HashMap::new();
 
+        // ── queries ──
         bindings.insert("ctrl+q".to_string(), AppAction::RunCountQuery);
         bindings.insert("ctrl+l".to_string(), AppAction::ClearQueryState);
         bindings.insert("ctrl+r".to_string(), AppAction::ReloadRuntimeConfig);
+
+        // ── navegación global ──
         bindings.insert("esc".to_string(), AppAction::QuitOrBack);
         bindings.insert("q".to_string(), AppAction::QuitOrBack);
-        bindings.insert("tab".to_string(), AppAction::SourceTabNext);
-        bindings.insert("shift+tab".to_string(), AppAction::SourceTabPrev);
         bindings.insert("r".to_string(), AppAction::Refresh);
         bindings.insert("f".to_string(), AppAction::FavoriteCurrentDb);
+
+        // ── foco entre paneles (Tab / Shift+Tab) ──
+        bindings.insert("tab".to_string(), AppAction::FocusNext);
+        bindings.insert("shift+tab".to_string(), AppAction::FocusPrev);
+
+        // ── ir a panel específico (1-5) ──
+        bindings.insert("1".to_string(), AppAction::FocusSources);
+        bindings.insert("2".to_string(), AppAction::FocusTables);
+        bindings.insert("3".to_string(), AppAction::FocusViews);
+        bindings.insert("4".to_string(), AppAction::FocusAdvanced);
+        bindings.insert("5".to_string(), AppAction::FocusDetail);
+
+        // ── toggle panel ──
+        bindings.insert(" ".to_string(), AppAction::ToggleCurrentPanel);
+
+        // ── mover selección ──
         bindings.insert("up".to_string(), AppAction::MoveUp);
         bindings.insert("k".to_string(), AppAction::MoveUp);
         bindings.insert("down".to_string(), AppAction::MoveDown);
         bindings.insert("j".to_string(), AppAction::MoveDown);
+
+        // ── tabs de detalle ──
         bindings.insert("left".to_string(), AppAction::DetailTabPrev);
         bindings.insert("right".to_string(), AppAction::DetailTabNext);
+        bindings.insert("[".to_string(), AppAction::DetailTabPrev);
+        bindings.insert("]".to_string(), AppAction::DetailTabNext);
+
+        // ── paginación ──
         bindings.insert("pgup".to_string(), AppAction::PrevPage);
         bindings.insert("pgdn".to_string(), AppAction::NextPage);
+
+        // ── acciones ──
         bindings.insert("enter".to_string(), AppAction::Enter);
         bindings.insert("x".to_string(), AppAction::ToggleActionsMenu);
         bindings.insert("b".to_string(), AppAction::ToggleActionsMenu);
-        bindings.insert("[".to_string(), AppAction::DetailTabPrev);
-        bindings.insert("]".to_string(), AppAction::DetailTabNext);
 
         Self { bindings }
     }
@@ -156,8 +194,13 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "focus_prev" => Some(AppAction::FocusPrev),
         "focus_next" => Some(AppAction::FocusNext),
         "focus_sources" => Some(AppAction::FocusSources),
+        "focus_tables" => Some(AppAction::FocusTables),
+        "focus_views" => Some(AppAction::FocusViews),
+        "focus_advanced" => Some(AppAction::FocusAdvanced),
+        "focus_detail" => Some(AppAction::FocusDetail),
         "focus_objects" => Some(AppAction::FocusObjects),
         "focus_preview" => Some(AppAction::FocusPreview),
+        "toggle_current_panel" => Some(AppAction::ToggleCurrentPanel),
         "refresh" => Some(AppAction::Refresh),
         "favorite_current_db" => Some(AppAction::FavoriteCurrentDb),
         "move_up" => Some(AppAction::MoveUp),

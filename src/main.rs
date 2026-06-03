@@ -1,8 +1,8 @@
 mod app;
 mod config;
+mod db;
 mod keys;
 mod query;
-mod sqlite;
 mod storage;
 mod ui;
 
@@ -39,6 +39,10 @@ async fn main() -> io::Result<()> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
+        // Calcular layout antes de renderizar
+        let size = terminal.size()?;
+        app.compute_layout(size.width, size.height);
+
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if app.should_quit {
