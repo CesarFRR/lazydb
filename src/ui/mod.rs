@@ -6,7 +6,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::app::controller::{LayoutMode, SourceTab};
 use crate::app::{App, PanelKind};
 
 // ---------------------------------------------------------------------------
@@ -22,7 +21,6 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     }
 
     // El layout ya fue computado en el loop principal
-    render_header(frame, app.layout.header, app);
     render_footer(frame, app.layout.footer, app);
 
     // Renderizar cada panel en su posición
@@ -49,18 +47,9 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
     let items = app.items_for(kind);
     let focused = app.active_panel == kind;
 
-    // Tabs especiales para Sources (All/Local/Online)
-    let adjusted_area = if kind == PanelKind::Sources {
-        let tab_area = Rect { height: 1, ..area };
-        render_source_tabs(frame, tab_area, app);
-        Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area }
-    } else {
-        area
-    };
-
     widgets::panel::render(
         frame,
-        adjusted_area,
+        area,
         kind,
         &title,
         items,
@@ -69,63 +58,6 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
         focused,
         panel.mode,
     );
-}
-
-// ---------------------------------------------------------------------------
-// Source tabs (All / Local / Online)
-// ---------------------------------------------------------------------------
-
-fn render_source_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    if area.width < 20 {
-        return;
-    }
-    let tabs_text = match app.source_tab {
-        SourceTab::All => "[Todo] Local Online",
-        SourceTab::Local => "Todo [Local] Online",
-        SourceTab::Online => "Todo Local [Online]",
-    };
-    let para = Paragraph::new(tabs_text).style(Style::default().fg(Color::Yellow));
-    frame.render_widget(para, area);
-}
-
-// ---------------------------------------------------------------------------
-// Header
-// ---------------------------------------------------------------------------
-
-fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let layout_mode = LayoutMode::from_width(area.width);
-
-    let query_indicator = match &app.query_state {
-        crate::query::QueryState::Idle => String::new(),
-        crate::query::QueryState::Running => " | [Ejecutando query...]".to_string(),
-        crate::query::QueryState::Done(_) => " | [Query completada]".to_string(),
-        crate::query::QueryState::Error(e) => format!(" | [Error: {e}]"),
-    };
-
-    let line1 = format!(
-        "lazydb | foco: {} | layout: {} | db: {} ({}){}",
-        app.active_panel.label(),
-        layout_mode.label(),
-        app.db_path_display(),
-        app.db_size_display(),
-        query_indicator
-    );
-
-    let line2 = format!(
-        "src:{} | obj:{} | detail:{} | selected:{}",
-        app.source_tab_label(),
-        app.object_section_label(),
-        app.detail_tab_label(),
-        app.selected_object()
-    );
-
-    if app.layout.compact_height {
-        frame.render_widget(Paragraph::new(fit_line(&line1, area.width)), area);
-        return;
-    }
-
-    let header_text = format!("{}\n{}", fit_line(&line1, area.width), fit_line(&line2, area.width));
-    frame.render_widget(Paragraph::new(header_text), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,14 +122,5 @@ fn render_actions_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
     let msg = "Terminal pequena: amplia ancho/alto para ver lazydb";
-    frame.render_widget(Paragraph::new(fit_line(msg, area.width)), area);
-}
-
-fn fit_line(input: &str, width: u16) -> String {
-    let max = usize::from(width.saturating_sub(1));
-    if input.chars().count() <= max {
-        return input.to_owned();
-    }
-
-    input.chars().take(max).collect()
+    frame.render_widget(Paragraph::new(msg), area);
 }

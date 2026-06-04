@@ -36,6 +36,7 @@ impl PanelKind {
     }
 
     /// Etiqueta amigable en español
+    #[allow(dead_code)]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Sources => "Fuentes",

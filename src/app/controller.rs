@@ -6,6 +6,7 @@ use crate::app::panel::{Panel, PanelKind, PanelMode};
 use crate::ui::layout::{self, ComputedLayout};
 use crate::{config, db, keys, query, storage};
 
+#[allow(dead_code)]
 const LARGE_WIDTH: u16 = 120;
 const KB_BYTES: u64 = 1024;
 const MB_BYTES: u64 = KB_BYTES * 1024;
@@ -112,6 +113,7 @@ impl DetailTab {
 
 /// Clasificación de layout por ancho (para el header)
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum LayoutMode {
     Large,
     Medium,
@@ -119,6 +121,7 @@ pub enum LayoutMode {
 }
 
 impl LayoutMode {
+    #[allow(dead_code)]
     pub const fn from_width(width: u16) -> Self {
         if width >= LARGE_WIDTH {
             Self::Large
@@ -129,6 +132,7 @@ impl LayoutMode {
         }
     }
 
+    #[allow(dead_code)]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Large => "large",
@@ -567,11 +571,13 @@ impl App {
         items.get(idx).map_or_else(|| "-".to_string(), String::clone)
     }
 
+    #[allow(dead_code)]
     pub fn selected_source(&self) -> &str {
         let idx = self.selected_idx(PanelKind::Sources);
         self.sources.get(idx).map_or("-", String::as_str)
     }
 
+    #[allow(dead_code)]
     pub fn selected_object(&self) -> &str {
         let raw = match self.active_panel {
             PanelKind::Tables => self.tables.get(self.selected_idx(PanelKind::Tables)),
@@ -582,14 +588,17 @@ impl App {
         raw.map_or("-", String::as_str)
     }
 
+    #[allow(dead_code)]
     pub const fn source_tab_label(&self) -> &'static str {
         self.source_tab.label()
     }
 
+    #[allow(dead_code)]
     pub const fn object_section_label(&self) -> &'static str {
         self.object_section.label()
     }
 
+    #[allow(dead_code)]
     pub const fn detail_tab_label(&self) -> &'static str {
         self.detail_tab.label()
     }

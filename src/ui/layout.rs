@@ -11,18 +11,13 @@ use crate::app::{PanelKind, PanelMode};
 /// Umbral para que el Detalle migre al stack vertical
 pub const NARROW_THRESHOLD: u16 = 80;
 
-/// Alto mínimo de terminal para header de 2 líneas
-pub const COMPACT_HEIGHT: u16 = 14;
-
 // ---------------------------------------------------------------------------
 // Layout computado
 // ---------------------------------------------------------------------------
 
-/// Resultado del layout engine: rects para cada panel + cabecera + footer.
+/// Resultado del layout engine: rects para cada panel + footer.
 #[derive(Clone, Debug)]
 pub struct ComputedLayout {
-    /// Rect de la cabecera
-    pub header: Rect,
     /// Rect del footer / status bar
     pub footer: Rect,
     /// Posiciones de cada panel en orden de renderizado
@@ -30,14 +25,11 @@ pub struct ComputedLayout {
     /// ¿Modo angosto (detalle en stack vertical)?
     #[allow(dead_code)]
     pub is_narrow: bool,
-    /// ¿Altura compacta (header de 1 línea)?
-    pub compact_height: bool,
 }
 
 impl Default for ComputedLayout {
     fn default() -> Self {
         Self {
-            header: Rect::default(),
             footer: Rect::default(),
             panels: [
                 (PanelKind::Sources, Rect::default()),
@@ -47,7 +39,6 @@ impl Default for ComputedLayout {
                 (PanelKind::Detail, Rect::default()),
             ],
             is_narrow: false,
-            compact_height: false,
         }
     }
 }
@@ -66,24 +57,15 @@ pub fn compute(
     active: PanelKind,
     panel_modes: &[(PanelKind, PanelMode); 5],
 ) -> ComputedLayout {
-    let compact_height = height < COMPACT_HEIGHT;
     let is_narrow = width < NARROW_THRESHOLD;
 
-    let header_height: u16 = if compact_height { 1 } else { 2 };
     let footer_height: u16 = 1;
 
-    let content_top = header_height;
-    let content_height = height.saturating_sub(header_height + footer_height);
+    let content_top = 0;
+    let content_height = height.saturating_sub(footer_height);
 
     if content_height == 0 {
-        return empty_layout(
-            width,
-            height,
-            header_height,
-            footer_height,
-            is_narrow,
-            compact_height,
-        );
+        return empty_layout(width, height, footer_height, is_narrow);
     }
 
     let panels = if is_narrow {
@@ -93,11 +75,9 @@ pub fn compute(
     };
 
     ComputedLayout {
-        header: Rect::new(0, 0, width, header_height),
         footer: Rect::new(0, height.saturating_sub(footer_height), width, footer_height),
         panels,
         is_narrow,
-        compact_height,
     }
 }
 
@@ -174,7 +154,7 @@ fn narrow_layout(
 /// - **Equitativo**: cuando hay altura suficiente, todos los paneles se reparten
 ///   el espacio por igual (`total_h` / n). El último toma el resto.
 /// - **Colapso**: cuando falta altura, solo el panel activo + Detalle (si está en
-///   el stack) se expanden; los demás colapsan a 3 líneas.
+///   el stack) se expanden; los demás quedan en modo mínimo (5 líneas).
 fn build_left_stack(
     top: u16,
     total_h: u16,
@@ -200,20 +180,25 @@ fn build_left_stack(
     }
 }
 
-/// Todos los paneles reciben la misma altura. El último toma el sobrante.
+/// Todos los paneles reciben altura proporcional.
+/// En modo angosto (5 paneles), Detalle ocupa 2 partes y los demás 1 parte.
 fn equitative_stack(
     mut top: u16,
     total_h: u16,
     width: u16,
     kinds: &[PanelKind],
 ) -> Vec<(PanelKind, Rect)> {
-    #[allow(clippy::cast_possible_truncation)]
-    let n = kinds.len() as u16;
-    let each = total_h / n;
+    // Peso ×2 para Detalle en modo angosto
+    let total_parts: u16 =
+        kinds.iter().map(|k| if *k == PanelKind::Detail { 2u16 } else { 1u16 }).sum();
+
+    let unit = total_h.checked_div(total_parts).unwrap_or(total_h);
+
     let mut rects = Vec::with_capacity(kinds.len());
 
     for (i, &kind) in kinds.iter().enumerate() {
-        let h = if i == kinds.len() - 1 { total_h.saturating_sub(top) } else { each };
+        let weight = if kind == PanelKind::Detail { 2u16 } else { 1u16 };
+        let h = if i == kinds.len() - 1 { total_h.saturating_sub(top) } else { unit * weight };
         rects.push((kind, Rect::new(0, top, width, h)));
         top += h;
     }
@@ -221,7 +206,7 @@ fn equitative_stack(
     rects
 }
 
-/// Solo el panel activo + Detalle se expanden; el resto colapsa a 3 líneas.
+/// Solo el panel activo + Detalle se expanden; el resto queda en modo mínimo (5 líneas).
 fn collapse_stack(
     mut top: u16,
     total_h: u16,
@@ -255,7 +240,7 @@ fn collapse_stack(
             };
             base.max(5) // mínimo 5 líneas para expanded
         } else {
-            3 // colapsado
+            5 // mínimo (Minimal): título + 1 ítem visible
         };
 
         let h = h.min(total_h.saturating_sub(top));
@@ -278,16 +263,8 @@ fn find_panel_rect(rects: &[(PanelKind, Rect)], kind: PanelKind) -> (PanelKind, 
     rects.iter().find(|(k, _)| *k == kind).copied().unwrap_or_else(|| (kind, Rect::default()))
 }
 
-fn empty_layout(
-    width: u16,
-    height: u16,
-    header_h: u16,
-    footer_h: u16,
-    is_narrow: bool,
-    compact_height: bool,
-) -> ComputedLayout {
+fn empty_layout(width: u16, height: u16, footer_h: u16, is_narrow: bool) -> ComputedLayout {
     ComputedLayout {
-        header: Rect::new(0, 0, width, header_h),
         footer: Rect::new(0, height.saturating_sub(footer_h), width, footer_h),
         panels: [(PanelKind::Sources, Rect::default()); 5]
             .into_iter()
@@ -300,6 +277,5 @@ fn empty_layout(
             .try_into()
             .unwrap_or_else(|_: Vec<_>| [(PanelKind::Sources, Rect::default()); 5]),
         is_narrow,
-        compact_height,
     }
 }
