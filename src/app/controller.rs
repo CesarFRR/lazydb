@@ -935,13 +935,53 @@ impl App {
             format!("Config recargada: keys + estado + ui (rows_per_page={})", self.rows_per_page);
     }
 
-    /// Enter: salta a Detail sin colapsar el panel sidebar actual
+    /// Enter: ejecuta acción del panel actual y salta a Detail
     fn jump_to_detail(&mut self) {
         if self.active_panel == PanelKind::Detail {
-            return; // ya en Detail
+            return;
         }
+
+        // Ejecutar la acción del panel antes de saltar
+        match self.active_panel {
+            PanelKind::Sources => self.connect_selected_source(),
+            PanelKind::Tables | PanelKind::Views | PanelKind::Advanced => {
+                self.current_page = 0;
+                self.refresh_preview_from_selected_object();
+            }
+            PanelKind::Detail => {}
+        }
+
         self.last_sidebar_focus = self.active_panel;
         self.active_panel = PanelKind::Detail;
+    }
+
+    /// Conecta a la fuente seleccionada en el panel Sources
+    fn connect_selected_source(&mut self) {
+        let selected = self.selected_source().to_string();
+
+        if selected == "<sin entradas>" {
+            self.status = "No hay elementos en esta sección".to_string();
+            return;
+        }
+
+        match selected.as_str() {
+            "Abrir sakila.db" => self.connect_sqlite("sakila.db"),
+            "Buscar archivo .db" => {
+                self.status = "Buscador de archivos .db no implementado todavia".to_string();
+            }
+            s if s.contains(" => ") => {
+                let path = s.split_once(" => ").map(|(_, p)| p.to_string()).unwrap_or_default();
+                self.connect_sqlite(&path);
+            }
+            s if s.starts_with('/')
+                || std::path::Path::new(s)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db")) =>
+            {
+                self.connect_sqlite(s);
+            }
+            _ => {}
+        }
     }
 
     // ── enter en Sources ──────────────────────────────────────────────
@@ -1166,14 +1206,20 @@ impl App {
                 let p = self.panel_mut(kind);
                 p.selected_idx = index.min(max_idx);
 
-                // Si es un panel de objetos, refrescar preview
-                if kind == PanelKind::Tables
+                // Si es Sources, conectar; si es tabla/vista, refrescar preview
+                if kind == PanelKind::Sources {
+                    self.connect_selected_source();
+                } else if kind == PanelKind::Tables
                     || kind == PanelKind::Views
                     || kind == PanelKind::Advanced
                 {
                     self.current_page = 0;
                     self.refresh_preview_from_selected_object();
                 }
+
+                // Saltar a Detail para ver los datos
+                self.last_sidebar_focus = kind;
+                self.active_panel = PanelKind::Detail;
             }
 
             return;
