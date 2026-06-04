@@ -65,7 +65,7 @@ pub fn render(
     }
 }
 
-/// Línea compacta sin bordes: `──[N]──Título────────────────`
+/// Línea compacta sin bordes: `──[N]──Título────────────────────────` (ancho completo)
 #[allow(clippy::too_many_arguments)]
 fn render_collapsed_line(
     frame: &mut Frame<'_>,
@@ -79,17 +79,20 @@ fn render_collapsed_line(
     }
 
     let fg = if focused { Color::Cyan } else { Color::Gray };
-    let count_str = format!("[{count}]");
-    // Truncar título si es muy largo
+    let prefix = format!("──[{count}]──");
     #[allow(clippy::cast_possible_truncation)]
-    let max_title = area.width.saturating_sub(count_str.len() as u16 + 6).max(1) as usize;
+    let prefix_len = prefix.len() as u16;
+    let max_title = area.width.saturating_sub(prefix_len).max(1) as usize;
     let short_title: String = title.chars().take(max_title).collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let used = prefix_len + short_title.len() as u16;
+    let padding = area.width.saturating_sub(used) as usize;
+    let pad_str = "─".repeat(padding);
 
     let line = RatLine::from(vec![
-        Span::styled("──", Style::default().fg(fg)),
-        Span::styled(&count_str, Style::default().fg(fg)),
-        Span::styled("──", Style::default().fg(fg)),
-        Span::styled(&short_title, Style::default().fg(fg)),
+        Span::styled(prefix, Style::default().fg(fg)),
+        Span::styled(short_title, Style::default().fg(fg)),
+        Span::styled(pad_str, Style::default().fg(fg)),
     ]);
 
     let para = ratatui::widgets::Paragraph::new(line);

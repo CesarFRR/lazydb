@@ -135,8 +135,7 @@ impl Default for Keymap {
         bindings.insert("4".to_string(), AppAction::FocusAdvanced);
         bindings.insert("5".to_string(), AppAction::FocusDetail);
 
-        // ── toggle panel ──
-        bindings.insert(" ".to_string(), AppAction::ToggleCurrentPanel);
+        // ── toggle panel (desactivado por defecto) ──
 
         // ── mover selección ──
         bindings.insert("up".to_string(), AppAction::MoveUp);
