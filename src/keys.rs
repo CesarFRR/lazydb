@@ -14,6 +14,10 @@ pub enum AppAction {
     FocusPrev,
     /// Navegar al panel siguiente (cicla los 5 paneles)
     FocusNext,
+    /// Navegar entre paneles izquierdos (←, cíclico Sources↔Advanced)
+    SidebarFocusPrev,
+    /// Navegar entre paneles izquierdos (→, cíclico Sources↔Tables)
+    SidebarFocusNext,
     /// Ir directamente a Fuentes
     FocusSources,
     /// Ir directamente a Tablas
@@ -138,9 +142,11 @@ impl Default for Keymap {
         bindings.insert("down".to_string(), AppAction::MoveDown);
         bindings.insert("j".to_string(), AppAction::MoveDown);
 
+        // ── mover foco entre sidebar (← →) ──
+        bindings.insert("left".to_string(), AppAction::SidebarFocusPrev);
+        bindings.insert("right".to_string(), AppAction::SidebarFocusNext);
+
         // ── tabs de detalle ──
-        bindings.insert("left".to_string(), AppAction::DetailTabPrev);
-        bindings.insert("right".to_string(), AppAction::DetailTabNext);
         bindings.insert("[".to_string(), AppAction::DetailTabPrev);
         bindings.insert("]".to_string(), AppAction::DetailTabNext);
 
@@ -193,6 +199,8 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "quit_or_back" => Some(AppAction::QuitOrBack),
         "focus_prev" => Some(AppAction::FocusPrev),
         "focus_next" => Some(AppAction::FocusNext),
+        "sidebar_focus_prev" => Some(AppAction::SidebarFocusPrev),
+        "sidebar_focus_next" => Some(AppAction::SidebarFocusNext),
         "focus_sources" => Some(AppAction::FocusSources),
         "focus_tables" => Some(AppAction::FocusTables),
         "focus_views" => Some(AppAction::FocusViews),

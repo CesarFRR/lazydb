@@ -250,6 +250,8 @@ fn collapse_stack(
             remaining.max(5).min(total_h.saturating_sub(top))
         } else if kind == active {
             sidebar_h.min(total_h.saturating_sub(top))
+        } else if kind == PanelKind::Sources {
+            5 // Sources siempre muestra 1 ítem (qué DB está conectada)
         } else {
             3
         };

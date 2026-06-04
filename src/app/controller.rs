@@ -354,6 +354,30 @@ impl App {
         self.set_focus(prev);
     }
 
+    /// → : Sources → Tables → Views → Advanced → Sources (cíclico, solo sidebar)
+    fn sidebar_focus_next(&mut self) {
+        let next = match self.active_panel {
+            PanelKind::Sources => PanelKind::Tables,
+            PanelKind::Tables => PanelKind::Views,
+            PanelKind::Views => PanelKind::Advanced,
+            PanelKind::Advanced => PanelKind::Sources,
+            PanelKind::Detail => self.last_sidebar_focus,
+        };
+        self.set_focus(next);
+    }
+
+    /// ← : Sources → Advanced → Views → Tables → Sources (cíclico, solo sidebar)
+    fn sidebar_focus_prev(&mut self) {
+        let prev = match self.active_panel {
+            PanelKind::Sources => PanelKind::Advanced,
+            PanelKind::Tables => PanelKind::Sources,
+            PanelKind::Views => PanelKind::Tables,
+            PanelKind::Advanced => PanelKind::Views,
+            PanelKind::Detail => self.last_sidebar_focus,
+        };
+        self.set_focus(prev);
+    }
+
     fn toggle_active_panel(&mut self) {
         // El detalle nunca se colapsa
         if self.active_panel == PanelKind::Detail {
@@ -1000,6 +1024,8 @@ impl App {
             }
             keys::AppAction::FocusNext => self.focus_next(),
             keys::AppAction::FocusPrev => self.focus_prev(),
+            keys::AppAction::SidebarFocusNext => self.sidebar_focus_next(),
+            keys::AppAction::SidebarFocusPrev => self.sidebar_focus_prev(),
             keys::AppAction::FocusSources => self.set_focus(PanelKind::Sources),
             keys::AppAction::FocusTables
             | keys::AppAction::FocusObjects

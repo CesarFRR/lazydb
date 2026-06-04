@@ -67,7 +67,7 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width >= 110 {
         let shortcuts = format!(
-            "tab: foco paneles | ↑↓: seleccion | ←→: tabs detalle | space: toggle | 1-5: ir panel | rueda: scroll | click: foco/item | x: menu | ctrl+q: count | {}",
+            "tab: foco paneles | ↑↓: seleccion | ←→: mover sidebar | []: tabs detalle | space: toggle | 1-5: ir panel | rueda: scroll | x: menu | ctrl+q: count | {}",
             app.status
         );
         frame.render_widget(Paragraph::new(shortcuts), area);
