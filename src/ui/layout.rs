@@ -230,7 +230,7 @@ fn collapse_stack(
     let mut fixed_lines: u16 = 0;
     for &k in kinds {
         if k != active && k != PanelKind::Detail {
-            fixed_lines += if k == PanelKind::Sources { 5 } else { 1 };
+            fixed_lines += if k == PanelKind::Sources { 3 } else { 1 };
         }
     }
 
@@ -250,7 +250,7 @@ fn collapse_stack(
         } else if kind == active {
             sidebar_h.min(total_h.saturating_sub(top))
         } else if kind == PanelKind::Sources {
-            5 // Sources siempre visible
+            3 // Sources mínimo: borde + 1 ítem
         } else {
             1 // colapsado: 1 línea
         };
