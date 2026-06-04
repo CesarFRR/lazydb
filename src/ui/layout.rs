@@ -230,12 +230,17 @@ fn collapse_stack(
     let collapsed_count: u16 =
         kinds.iter().filter(|k| **k != active && **k != PanelKind::Detail).count() as u16;
 
-    // Narrow mode: Detail domina — sidebar activo fijo 5, otros 3, Detail el resto.
-    // Wide mode: sidebar activo se expande — otros 3, activo el resto.
-    let remaining = if has_detail {
-        total_h.saturating_sub(collapsed_count * 3 + 5) // activo fijo 5
+    // Narrow: sidebar recordado = 1/4 del alto (igual que en wide equitativo).
+    // Wide: sidebar activo se expande al resto.
+    let (sidebar_h, remaining) = if has_detail {
+        let sh = (total_h / 4).max(5); // mínimo 5 líneas
+        let rem = total_h
+            .saturating_sub(collapsed_count * 3) // colapsados
+            .saturating_sub(sh); // sidebar recordado
+        (sh, rem)
     } else {
-        total_h.saturating_sub(collapsed_count * 3) // activo toma el resto
+        let rem = total_h.saturating_sub(collapsed_count * 3);
+        (rem, rem) // wide: activo toma todo el resto
     };
 
     let mut rects = Vec::with_capacity(kinds.len());
@@ -244,7 +249,7 @@ fn collapse_stack(
         let h = if kind == PanelKind::Detail {
             remaining.max(5).min(total_h.saturating_sub(top))
         } else if kind == active {
-            if has_detail { 5 } else { remaining.max(5) }
+            sidebar_h.min(total_h.saturating_sub(top))
         } else {
             3
         };
