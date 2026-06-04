@@ -4,6 +4,8 @@
 /// con scroll). El modo Minimal está implementado pero no expuesto al usuario.
 use ratatui::{
     prelude::*,
+    text::Line as RatLine,
+    text::Span,
     widgets::{
         Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState,
     },
@@ -41,8 +43,7 @@ pub fn render(
 
     match mode {
         PanelMode::Collapsed => {
-            let block = panel_block(title, focused);
-            frame.render_widget(block, area);
+            render_collapsed_line(frame, area, title, items.len(), focused);
         }
         PanelMode::Minimal | PanelMode::Expanded | PanelMode::Fixed(_) => {
             render_expanded(
@@ -62,6 +63,37 @@ pub fn render(
     if items_for_bar_len > 1 && area.height >= 3 {
         render_scrollbar(frame, area, items_for_bar_len, selected_for_bar);
     }
+}
+
+/// Línea compacta sin bordes: `──[N]──Título────────────────`
+#[allow(clippy::too_many_arguments)]
+fn render_collapsed_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    count: usize,
+    focused: bool,
+) {
+    if area.width < 5 {
+        return;
+    }
+
+    let fg = if focused { Color::Cyan } else { Color::Gray };
+    let count_str = format!("[{count}]");
+    // Truncar título si es muy largo
+    #[allow(clippy::cast_possible_truncation)]
+    let max_title = area.width.saturating_sub(count_str.len() as u16 + 6).max(1) as usize;
+    let short_title: String = title.chars().take(max_title).collect();
+
+    let line = RatLine::from(vec![
+        Span::styled("──", Style::default().fg(fg)),
+        Span::styled(&count_str, Style::default().fg(fg)),
+        Span::styled("──", Style::default().fg(fg)),
+        Span::styled(&short_title, Style::default().fg(fg)),
+    ]);
+
+    let para = ratatui::widgets::Paragraph::new(line);
+    frame.render_widget(para, area);
 }
 
 #[allow(clippy::too_many_arguments)]

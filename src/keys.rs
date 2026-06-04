@@ -34,6 +34,8 @@ pub enum AppAction {
     FocusPreview,
     /// Toggle expandir/colapsar el panel actual
     ToggleCurrentPanel,
+    /// Saltar al panel Detalle sin colapsar el panel sidebar actual
+    JumpToDetail,
     Refresh,
     FavoriteCurrentDb,
     MoveUp,
@@ -155,7 +157,7 @@ impl Default for Keymap {
         bindings.insert("pgdn".to_string(), AppAction::NextPage);
 
         // ── acciones ──
-        bindings.insert("enter".to_string(), AppAction::Enter);
+        bindings.insert("enter".to_string(), AppAction::JumpToDetail);
         bindings.insert("x".to_string(), AppAction::ToggleActionsMenu);
         bindings.insert("b".to_string(), AppAction::ToggleActionsMenu);
 
@@ -209,6 +211,7 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "focus_objects" => Some(AppAction::FocusObjects),
         "focus_preview" => Some(AppAction::FocusPreview),
         "toggle_current_panel" => Some(AppAction::ToggleCurrentPanel),
+        "jump_to_detail" => Some(AppAction::JumpToDetail),
         "refresh" => Some(AppAction::Refresh),
         "favorite_current_db" => Some(AppAction::FavoriteCurrentDb),
         "move_up" => Some(AppAction::MoveUp),

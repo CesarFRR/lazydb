@@ -935,6 +935,15 @@ impl App {
             format!("Config recargada: keys + estado + ui (rows_per_page={})", self.rows_per_page);
     }
 
+    /// Enter: salta a Detail sin colapsar el panel sidebar actual
+    fn jump_to_detail(&mut self) {
+        if self.active_panel == PanelKind::Detail {
+            return; // ya en Detail
+        }
+        self.last_sidebar_focus = self.active_panel;
+        self.active_panel = PanelKind::Detail;
+    }
+
     // ── enter en Sources ──────────────────────────────────────────────
 
     fn handle_enter(&mut self) {
@@ -1056,7 +1065,8 @@ impl App {
                     self.refresh_preview_from_selected_object();
                 }
             }
-            keys::AppAction::Enter => self.handle_enter(),
+            keys::AppAction::JumpToDetail => self.jump_to_detail(),
+            keys::AppAction::Enter => self.handle_enter(), // legacy, sin binding por defecto
             keys::AppAction::SourceTabRecents => self.set_source_tab(SourceTab::All),
             keys::AppAction::SourceTabFavorites => self.set_source_tab(SourceTab::Local),
             keys::AppAction::SourceTabNext => self.set_source_tab(self.source_tab.next()),
