@@ -230,7 +230,7 @@ fn collapse_stack(
     let mut fixed_lines: u16 = 0;
     for &k in kinds {
         if k != active && k != PanelKind::Detail {
-            fixed_lines += if k == PanelKind::Sources { 5 } else { 1 };
+            fixed_lines += if k == PanelKind::Sources { 5 } else { 2 };
         }
     }
 
@@ -252,7 +252,7 @@ fn collapse_stack(
         } else if kind == PanelKind::Sources {
             5 // Sources siempre visible
         } else {
-            1 // colapsado: 1 línea
+            2 // colapsado: 1 línea + 1 de espacio
         };
 
         let h = h.min(total_h.saturating_sub(top));

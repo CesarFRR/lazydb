@@ -79,6 +79,17 @@ impl PanelKind {
     pub const fn is_sidebar(self) -> bool {
         !matches!(self, Self::Detail)
     }
+
+    /// Número de atajo (1-5) para teclas de acceso directo
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::Sources => 1,
+            Self::Tables => 2,
+            Self::Views => 3,
+            Self::Advanced => 4,
+            Self::Detail => 5,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

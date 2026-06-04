@@ -43,7 +43,7 @@ pub fn render(
 
     match mode {
         PanelMode::Collapsed => {
-            render_collapsed_line(frame, area, title, items.len(), focused);
+            render_collapsed_line(frame, area, kind, title, items.len(), focused);
         }
         PanelMode::Minimal | PanelMode::Expanded | PanelMode::Fixed(_) => {
             render_expanded(
@@ -65,13 +65,14 @@ pub fn render(
     }
 }
 
-/// Línea compacta sin bordes: `──[N]──Título────────────────────────` (ancho completo)
+/// Línea compacta sin bordes: `──1──Tablas────────────────────────` (ancho completo)
 #[allow(clippy::too_many_arguments)]
 fn render_collapsed_line(
     frame: &mut Frame<'_>,
     area: Rect,
+    kind: PanelKind,
     title: &str,
-    count: usize,
+    _count: usize,
     focused: bool,
 ) {
     if area.width < 5 {
@@ -79,9 +80,11 @@ fn render_collapsed_line(
     }
 
     let fg = if focused { Color::Cyan } else { Color::Gray };
-    let prefix = format!("──[{count}]──");
+    let num = kind.number();
+    let prefix = format!("──{num}──");
     #[allow(clippy::cast_possible_truncation)]
     let prefix_len = prefix.len() as u16;
+    #[allow(clippy::cast_possible_truncation)]
     let max_title = area.width.saturating_sub(prefix_len).max(1) as usize;
     let short_title: String = title.chars().take(max_title).collect();
     #[allow(clippy::cast_possible_truncation)]
