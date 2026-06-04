@@ -189,6 +189,8 @@ pub struct App {
     // ── sistema de paneles ──
     pub panels: [Panel; 5],
     pub active_panel: PanelKind,
+    /// Último panel de sidebar enfocado (para restaurar al salir de Detalle)
+    pub last_sidebar_focus: PanelKind,
     pub layout: ComputedLayout,
 
     // ── datos de los paneles ──
@@ -248,6 +250,7 @@ impl App {
         Self {
             panels,
             active_panel: PanelKind::Sources,
+            last_sidebar_focus: PanelKind::Sources,
             layout: ComputedLayout::default(),
             sources: Self::build_sources(&state, source_tab),
             source_tab,
@@ -278,7 +281,6 @@ impl App {
 
     pub fn compute_layout(&mut self, width: u16, height: u16) {
         let mode_overrides = self.panels.iter().map(|p| (p.kind, p.mode)).collect::<Vec<_>>();
-        // Convert to array
         let modes: [(PanelKind, PanelMode); 5] = {
             let mut arr = [(PanelKind::Sources, PanelMode::default()); 5];
             for (i, &(k, m)) in mode_overrides.iter().enumerate() {
@@ -289,7 +291,13 @@ impl App {
             arr
         };
 
-        self.layout = layout::compute(width, height, self.active_panel, &modes);
+        let active_sidebar = if self.active_panel.is_sidebar() {
+            self.active_panel
+        } else {
+            self.last_sidebar_focus
+        };
+
+        self.layout = layout::compute(width, height, active_sidebar, self.active_panel, &modes);
     }
 
     // ── helpers de paneles ────────────────────────────────────────────
@@ -317,14 +325,9 @@ impl App {
             return; // ya tiene el foco
         }
 
-        // Colapsar el panel que pierde el foco (si es sidebar)
+        // Recordar último panel sidebar enfocado (para restaurar al salir de Detalle)
         if self.active_panel.is_sidebar() {
-            self.panel_mut(self.active_panel).mode = PanelMode::Collapsed;
-        }
-
-        // Expandir el nuevo panel activo (si es sidebar)
-        if kind.is_sidebar() {
-            self.panel_mut(kind).mode = PanelMode::Expanded;
+            self.last_sidebar_focus = self.active_panel;
         }
 
         // Actualizar object_section si corresponde

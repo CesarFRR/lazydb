@@ -49,14 +49,18 @@ impl Default for ComputedLayout {
 
 /// Calcula el layout completo para la terminal actual.
 ///
-/// `active`: el panel que tiene el foco (se expande).
+/// `active_sidebar`: panel izquierdo que debe mantenerse expandido (siempre sidebar).
+/// `current_focus`: panel que tiene el foco (puede ser Detail).
 /// `panel_modes`: modos de cada panel (Sources..Detail).
 pub fn compute(
     width: u16,
     height: u16,
-    active: PanelKind,
+    active_sidebar: PanelKind,
+    current_focus: PanelKind,
     panel_modes: &[(PanelKind, PanelMode); 5],
 ) -> ComputedLayout {
+    debug_assert!(active_sidebar.is_sidebar());
+
     let is_narrow = width < NARROW_THRESHOLD;
 
     let footer_height: u16 = 1;
@@ -69,9 +73,16 @@ pub fn compute(
     }
 
     let panels = if is_narrow {
-        narrow_layout(content_top, content_height, width, active, panel_modes)
+        narrow_layout(
+            content_top,
+            content_height,
+            width,
+            active_sidebar,
+            current_focus,
+            panel_modes,
+        )
     } else {
-        wide_layout(content_top, content_height, width, active, panel_modes)
+        wide_layout(content_top, content_height, width, active_sidebar, panel_modes)
     };
 
     ComputedLayout {
@@ -89,21 +100,19 @@ fn wide_layout(
     top: u16,
     content_h: u16,
     width: u16,
-    active: PanelKind,
+    active_sidebar: PanelKind,
     panel_modes: &[(PanelKind, PanelMode); 5],
 ) -> [(PanelKind, Rect); 5] {
     let left_width = width.saturating_mul(33) / 100;
     let right_width = width.saturating_sub(left_width);
 
-    // Panel de Detalle siempre a la derecha, altura completa
     let detail_rect = Rect::new(left_width, top, right_width, content_h);
 
-    // 4 paneles izquierdos en columna
     let sidebar_kinds: [PanelKind; 4] =
         [PanelKind::Sources, PanelKind::Tables, PanelKind::Views, PanelKind::Advanced];
 
     let left_rects =
-        build_left_stack(top, content_h, left_width, &sidebar_kinds, active, panel_modes);
+        build_left_stack(top, content_h, left_width, &sidebar_kinds, active_sidebar, panel_modes);
 
     [
         find_panel_rect(&left_rects, PanelKind::Sources),
@@ -122,8 +131,9 @@ fn narrow_layout(
     top: u16,
     content_h: u16,
     width: u16,
-    active: PanelKind,
-    panel_modes: &[(PanelKind, PanelMode); 5],
+    active_sidebar: PanelKind,
+    _current_focus: PanelKind,
+    _panel_modes: &[(PanelKind, PanelMode); 5],
 ) -> [(PanelKind, Rect); 5] {
     let all_kinds: [PanelKind; 5] = [
         PanelKind::Sources,
@@ -133,7 +143,8 @@ fn narrow_layout(
         PanelKind::Detail,
     ];
 
-    let rects = build_left_stack(top, content_h, width, &all_kinds, active, panel_modes);
+    // Narrow mode: Detail takes remaining space, active sidebar gets 5 lines, rest 3 lines
+    let rects = collapse_stack(top, content_h, width, &all_kinds, active_sidebar, true);
 
     [
         find_panel_rect(&rects, PanelKind::Sources),
@@ -154,7 +165,7 @@ fn narrow_layout(
 /// - **Equitativo**: cuando hay altura suficiente, todos los paneles se reparten
 ///   el espacio por igual (`total_h` / n). El último toma el resto.
 /// - **Colapso**: cuando falta altura, solo el panel activo + Detalle (si está en
-///   el stack) se expanden; los demás quedan en modo mínimo (5 líneas).
+///   el stack) se expanden; los demás colapsan a 3 líneas.
 fn build_left_stack(
     top: u16,
     total_h: u16,
@@ -206,7 +217,7 @@ fn equitative_stack(
     rects
 }
 
-/// Solo el panel activo + Detalle se expanden; el resto queda en modo mínimo (5 líneas).
+/// Solo el panel activo + Detalle se expanden; el resto colapsa a 3 líneas.
 fn collapse_stack(
     mut top: u16,
     total_h: u16,
@@ -240,7 +251,7 @@ fn collapse_stack(
             };
             base.max(5) // mínimo 5 líneas para expanded
         } else {
-            5 // mínimo (Minimal): título + 1 ítem visible
+            3 // colapsado (solo título)
         };
 
         let h = h.min(total_h.saturating_sub(top));
