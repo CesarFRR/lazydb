@@ -34,7 +34,7 @@ pub fn render(
     let selected_for_bar = if area.height <= 2 { 0 } else { selected_idx };
 
     if area.height <= 2 {
-        render_collapsed_line(frame, area, kind, title, focused);
+        render_collapsed_line(frame, area, title, focused);
     } else {
         render_expanded(frame, area, kind, title, items, selected_idx, scroll_offset, focused);
     }
@@ -49,7 +49,6 @@ pub fn render(
 fn render_collapsed_line(
     frame: &mut Frame<'_>,
     area: Rect,
-    kind: PanelKind,
     title: &str,
     focused: bool,
 ) {
@@ -58,8 +57,7 @@ fn render_collapsed_line(
     }
 
     let fg = if focused { Color::Cyan } else { Color::Gray };
-    let num = kind.number();
-    let prefix = format!("──[{num}]──");
+    let prefix = "─".to_string();
     #[allow(clippy::cast_possible_truncation)]
     let prefix_cols = prefix.chars().count() as u16;
     let max_title = area.width.saturating_sub(prefix_cols).max(1) as usize;

@@ -103,10 +103,10 @@ impl DetailTab {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Data => "Datos",
-            Self::Schema => "Esquema",
-            Self::Sql => "SQL",
-            Self::Meta => "Meta",
+            Self::Data => " Datos",
+            Self::Schema => " Esquema",
+            Self::Sql => " SQL",
+            Self::Meta => " Meta",
         }
     }
 }
@@ -462,27 +462,27 @@ impl App {
                     SourceTab::Local => "Todo [Local] Online",
                     SourceTab::Online => "Todo Local [Online]",
                 };
-                format!("[{num}]Fuentes ({tabs})")
+                format!("[{num}] Fuentes ({tabs})")
             }
             PanelKind::Tables => {
                 if self.tables.is_empty() {
-                    format!("[{num}]Tablas")
+                    format!("[{num}] Tablas")
                 } else {
-                    format!("[{num}]Tablas ({})", self.tables.len())
+                    format!("[{num}] Tablas ({})", self.tables.len())
                 }
             }
             PanelKind::Views => {
                 if self.views.is_empty() {
-                    format!("[{num}]Vistas")
+                    format!("[{num}] Vistas")
                 } else {
-                    format!("[{num}]Vistas ({})", self.views.len())
+                    format!("[{num}] Vistas ({})", self.views.len())
                 }
             }
             PanelKind::Advanced => {
                 if self.advanced.is_empty() {
-                    format!("[{num}]Avanzado")
+                    format!("[{num}] Avanzado")
                 } else {
-                    format!("[{num}]Avanzado ({})", self.advanced.len())
+                    format!("[{num}] Avanzado ({})", self.advanced.len())
                 }
             }
             PanelKind::Detail => {
@@ -499,7 +499,7 @@ impl App {
                         total_pages
                     )
                 } else {
-                    format!("[{num}]{}", self.detail_tab.label())
+                    format!("[{num}] {}", self.detail_tab.label())
                 }
             }
         }
@@ -1219,7 +1219,9 @@ impl App {
                 }
 
                 // Saltar a Detail para ver los datos
-                self.last_sidebar_focus = kind;
+                if kind.is_sidebar() {
+                    self.last_sidebar_focus = kind;
+                }
                 self.active_panel = PanelKind::Detail;
             }
 
