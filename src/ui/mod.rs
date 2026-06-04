@@ -15,7 +15,7 @@ use crate::app::{App, PanelKind};
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
 
-    if area.height < 3 || area.width < 12 {
+    if area.height < 10 || area.width < 40 {
         render_too_small(frame, area);
         return;
     }
