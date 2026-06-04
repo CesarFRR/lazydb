@@ -15,11 +15,9 @@ use crate::app::{PanelKind, PanelMode};
 
 /// Renderiza un panel completo (borde + título + contenido según modo).
 ///
-/// `items`: lista de strings a mostrar (vacío para Collapsed).
-/// `selected_idx`: índice seleccionado.
-/// `scroll_offset`: primera fila visible.
-/// `focused`: si el panel tiene el foco (borde cyan).
-/// `mode`: modo de renderizado.
+/// Decide el formato por altura disponible, no por `mode`:
+/// - height <= 2: línea colapsada `──[N]──Título────`
+/// - height >= 3: borde + contenido (expanded/minimal)
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame<'_>,
@@ -30,33 +28,24 @@ pub fn render(
     selected_idx: usize,
     scroll_offset: usize,
     focused: bool,
-    mode: PanelMode,
+    _mode: PanelMode,
 ) {
-    let items_for_bar_len = match mode {
-        PanelMode::Collapsed => 0,
-        _ => items.len(),
-    };
-    let selected_for_bar = match mode {
-        PanelMode::Collapsed => 0,
-        _ => selected_idx,
-    };
+    let items_for_bar_len = if area.height <= 2 { 0 } else { items.len() };
+    let selected_for_bar = if area.height <= 2 { 0 } else { selected_idx };
 
-    match mode {
-        PanelMode::Collapsed => {
-            render_collapsed_line(frame, area, kind, title, items.len(), focused);
-        }
-        PanelMode::Minimal | PanelMode::Expanded | PanelMode::Fixed(_) => {
-            render_expanded(
-                frame,
-                area,
-                title,
-                items,
-                selected_idx,
-                scroll_offset,
-                focused,
-                kind == PanelKind::Detail,
-            );
-        }
+    if area.height <= 2 {
+        render_collapsed_line(frame, area, kind, title, focused);
+    } else {
+        render_expanded(
+            frame,
+            area,
+            title,
+            items,
+            selected_idx,
+            scroll_offset,
+            focused,
+            kind == PanelKind::Detail,
+        );
     }
 
     // Scrollbar pasivo para listas que lo necesiten
@@ -65,14 +54,12 @@ pub fn render(
     }
 }
 
-/// Línea compacta sin bordes: `──1──Tablas────────────────────────` (ancho completo)
-#[allow(clippy::too_many_arguments)]
+/// Línea compacta sin bordes: `──[1]──Tablas────────────────────────` (ancho completo)
 fn render_collapsed_line(
     frame: &mut Frame<'_>,
     area: Rect,
     kind: PanelKind,
     title: &str,
-    _count: usize,
     focused: bool,
 ) {
     if area.width < 5 {
@@ -81,7 +68,7 @@ fn render_collapsed_line(
 
     let fg = if focused { Color::Cyan } else { Color::Gray };
     let num = kind.number();
-    let prefix = format!("──{num}──");
+    let prefix = format!("──[{num}]──");
     #[allow(clippy::cast_possible_truncation)]
     let prefix_len = prefix.len() as u16;
     #[allow(clippy::cast_possible_truncation)]
