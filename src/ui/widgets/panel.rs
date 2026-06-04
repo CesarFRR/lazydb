@@ -36,16 +36,7 @@ pub fn render(
     if area.height <= 2 {
         render_collapsed_line(frame, area, kind, title, focused);
     } else {
-        render_expanded(
-            frame,
-            area,
-            title,
-            items,
-            selected_idx,
-            scroll_offset,
-            focused,
-            kind == PanelKind::Detail,
-        );
+        render_expanded(frame, area, kind, title, items, selected_idx, scroll_offset, focused);
     }
 
     // Scrollbar pasivo para listas que lo necesiten
@@ -70,14 +61,13 @@ fn render_collapsed_line(
     let num = kind.number();
     let prefix = format!("──[{num}]──");
     #[allow(clippy::cast_possible_truncation)]
-    let prefix_len = prefix.len() as u16;
-    #[allow(clippy::cast_possible_truncation)]
-    let max_title = area.width.saturating_sub(prefix_len).max(1) as usize;
+    let prefix_cols = prefix.chars().count() as u16;
+    let max_title = area.width.saturating_sub(prefix_cols).max(1) as usize;
     let short_title: String = title.chars().take(max_title).collect();
     #[allow(clippy::cast_possible_truncation)]
-    let used = prefix_len + short_title.len() as u16;
-    let padding = area.width.saturating_sub(used) as usize;
-    let pad_str = "─".repeat(padding);
+    let used_cols = prefix_cols + short_title.chars().count() as u16;
+    let padding_cols = area.width.saturating_sub(used_cols) as usize;
+    let pad_str = "─".repeat(padding_cols);
 
     let line = RatLine::from(vec![
         Span::styled(prefix, Style::default().fg(fg)),
@@ -93,22 +83,25 @@ fn render_collapsed_line(
 fn render_expanded(
     frame: &mut Frame<'_>,
     area: Rect,
+    kind: PanelKind,
     title: &str,
     items: &[String],
     selected_idx: usize,
     scroll_offset: usize,
     focused: bool,
-    _is_detail: bool,
 ) {
     let inner = inner_area_for_iteration(area);
     if inner.height == 0 {
-        // Área demasiado pequeña: solo borde
         let block = panel_block(title, focused);
         frame.render_widget(block, area);
         return;
     }
 
-    let viewport = usize::from(inner.height);
+    // Sources no enfocado: solo 1 ítem visible
+    let max_visible =
+        if kind == PanelKind::Sources && !focused { 1usize } else { usize::from(inner.height) };
+
+    let viewport = max_visible.min(usize::from(inner.height));
     let visible = items.iter().skip(scroll_offset).take(viewport);
 
     let list_items: Vec<ListItem<'_>> = visible
