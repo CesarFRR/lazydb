@@ -165,7 +165,7 @@ fn narrow_layout(
 /// - **Equitativo**: cuando hay altura suficiente, todos los paneles se reparten
 ///   el espacio por igual (`total_h` / n). El último toma el resto.
 /// - **Colapso**: cuando falta altura, solo el panel activo + Detalle (si está en
-///   el stack) se expanden; los demás colapsan a 3 líneas.
+///   el stack) se expanden; los demás colapsan a 1 línea (Sources 5).
 fn build_left_stack(
     top: u16,
     total_h: u16,
@@ -217,7 +217,7 @@ fn equitative_stack(
     rects
 }
 
-/// Solo el panel activo + Detalle se expanden; el resto colapsa a 3 líneas.
+/// Solo el panel activo + Detalle se expanden; colapsados a 1 línea (Sources 5).
 fn collapse_stack(
     mut top: u16,
     total_h: u16,
@@ -226,21 +226,20 @@ fn collapse_stack(
     active: PanelKind,
     has_detail: bool,
 ) -> Vec<(PanelKind, Rect)> {
-    #[allow(clippy::cast_possible_truncation)]
-    let collapsed_count: u16 =
-        kinds.iter().filter(|k| **k != active && **k != PanelKind::Detail).count() as u16;
+    // Calcular altura fija de los paneles colapsados (Sources=5, otros=1)
+    let mut fixed_lines: u16 = 0;
+    for &k in kinds {
+        if k != active && k != PanelKind::Detail {
+            fixed_lines += if k == PanelKind::Sources { 5 } else { 1 };
+        }
+    }
 
-    // Narrow: sidebar recordado = 1/4 del alto (igual que en wide equitativo).
-    // Wide: sidebar activo se expande al resto.
     let (sidebar_h, remaining) = if has_detail {
-        let sh = (total_h / 4).max(5); // mínimo 5 líneas
-        let rem = total_h
-            .saturating_sub(collapsed_count * 3) // colapsados
-            .saturating_sub(sh); // sidebar recordado
-        (sh, rem)
+        let sh = (total_h / 4).max(5); // sidebar recordado = 1/4 del alto
+        (sh, total_h.saturating_sub(fixed_lines).saturating_sub(sh))
     } else {
-        let rem = total_h.saturating_sub(collapsed_count * 3);
-        (rem, rem) // wide: activo toma todo el resto
+        let rem = total_h.saturating_sub(fixed_lines);
+        (rem, rem) // wide: activo toma el resto
     };
 
     let mut rects = Vec::with_capacity(kinds.len());
@@ -251,9 +250,9 @@ fn collapse_stack(
         } else if kind == active {
             sidebar_h.min(total_h.saturating_sub(top))
         } else if kind == PanelKind::Sources {
-            5 // Sources siempre muestra 1 ítem (qué DB está conectada)
+            5 // Sources siempre visible
         } else {
-            3
+            1 // colapsado: 1 línea
         };
 
         let h = h.min(total_h.saturating_sub(top));
