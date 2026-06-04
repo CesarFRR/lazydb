@@ -112,11 +112,8 @@ fn render_expanded(
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let border_style =
+        if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::Gray) };
 
     Block::default().title(title.to_string()).borders(Borders::ALL).border_style(border_style)
 }

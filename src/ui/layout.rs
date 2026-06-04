@@ -226,32 +226,27 @@ fn collapse_stack(
     active: PanelKind,
     has_detail: bool,
 ) -> Vec<(PanelKind, Rect)> {
-    let expandable_count: u16 = if has_detail && active != PanelKind::Detail { 2 } else { 1 };
     #[allow(clippy::cast_possible_truncation)]
     let collapsed_count: u16 =
         kinds.iter().filter(|k| **k != active && **k != PanelKind::Detail).count() as u16;
-    let collapsed_lines = collapsed_count * 3;
-    let remaining = total_h.saturating_sub(collapsed_lines);
-    let per_expanded = if expandable_count > 0 && remaining > 0 {
-        remaining / expandable_count
+
+    // Narrow mode: Detail domina — sidebar activo fijo 5, otros 3, Detail el resto.
+    // Wide mode: sidebar activo se expande — otros 3, activo el resto.
+    let remaining = if has_detail {
+        total_h.saturating_sub(collapsed_count * 3 + 5) // activo fijo 5
     } else {
-        remaining
+        total_h.saturating_sub(collapsed_count * 3) // activo toma el resto
     };
 
     let mut rects = Vec::with_capacity(kinds.len());
 
-    for (i, &kind) in kinds.iter().enumerate() {
-        let is_last = i == kinds.len() - 1;
-
-        let h = if kind == PanelKind::Detail || kind == active {
-            let base = if kind == PanelKind::Detail && is_last {
-                total_h.saturating_sub(top)
-            } else {
-                per_expanded
-            };
-            base.max(5) // mínimo 5 líneas para expanded
+    for &kind in kinds {
+        let h = if kind == PanelKind::Detail {
+            remaining.max(5).min(total_h.saturating_sub(top))
+        } else if kind == active {
+            if has_detail { 5 } else { remaining.max(5) }
         } else {
-            3 // colapsado (solo título)
+            3
         };
 
         let h = h.min(total_h.saturating_sub(top));
