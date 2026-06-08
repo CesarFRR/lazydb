@@ -220,6 +220,7 @@ pub struct App {
     /// Inspector de fila (modal de detalle de registro)
     pub show_row_inspector: bool,
     pub row_inspector_lines: Vec<String>,
+    pub inspector_scroll: crate::ui::widgets::modal::ModalScroll,
 
     /// Sección de objetos activa (derivada de `active_panel`)
     object_section: ObjectSection,
@@ -278,6 +279,7 @@ impl App {
             actions_menu_idx: 0,
             show_row_inspector: false,
             row_inspector_lines: Vec::new(),
+            inspector_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             object_section: ObjectSection::Tables,
         }
     }
@@ -940,13 +942,20 @@ impl App {
 
         let values: Vec<&str> = rows.first().map_or("", String::as_str).split('|').collect();
 
-        let max_key = columns.iter().map(String::len).max().unwrap_or(10).min(25);
+        // Formato vertical: ▸ nombre_columna + valor en línea siguiente
         self.row_inspector_lines = columns
             .iter()
             .zip(values.iter().chain(std::iter::repeat(&"")))
-            .map(|(col, val)| format!("  {col:<max_key$} │ {val}"))
+            .flat_map(|(col, val)| {
+                vec![
+                    format!("▸ {col}"),
+                    format!("  {val}"),
+                    String::new(), // línea vacía
+                ]
+            })
             .collect();
 
+        self.inspector_scroll.reset();
         self.show_row_inspector = true;
     }
 
@@ -1094,6 +1103,8 @@ impl App {
                 | keys::AppAction::ToggleActionsMenu => {
                     self.close_row_inspector();
                 }
+                keys::AppAction::MoveUp => self.inspector_scroll.scroll_up(),
+                keys::AppAction::MoveDown => self.inspector_scroll.scroll_down(),
                 _ => {}
             }
             return;
@@ -1201,6 +1212,15 @@ impl App {
     // ── mouse ─────────────────────────────────────────────────────────
 
     pub fn on_scroll(&mut self, up: bool) {
+        if self.show_row_inspector {
+            if up {
+                self.inspector_scroll.scroll_up();
+            } else {
+                self.inspector_scroll.scroll_down();
+            }
+            return;
+        }
+
         if self.show_actions_menu {
             if up {
                 self.actions_menu_idx = self.actions_menu_idx.saturating_sub(1);

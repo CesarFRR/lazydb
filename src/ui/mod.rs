@@ -36,10 +36,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         widgets::modal::render(
             frame,
             area,
-            &format!("Registro: {}", app.selected_object()),
+            &format!("▸ {}", app.selected_object()),
             &app.row_inspector_lines,
-            60,
-            50,
+            &app.inspector_scroll,
+            70,
+            70,
         );
     }
 
