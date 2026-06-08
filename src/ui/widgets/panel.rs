@@ -30,6 +30,25 @@ pub fn truncate_middle(text: &str, max_w: usize) -> String {
     format!("{left}...{right}")
 }
 
+/// Parte un texto en líneas de hasta `max_w` caracteres de ancho.
+pub fn wrap_text(text: &str, max_w: usize) -> Vec<String> {
+    if max_w == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    while start < chars.len() {
+        let end = (start + max_w).min(chars.len());
+        lines.push(chars[start..end].iter().collect());
+        start = end;
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Renderiza un panel completo (borde + título + contenido según modo).
 ///
 /// Decide el formato por altura disponible, no por `mode`:

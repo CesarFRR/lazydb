@@ -101,9 +101,7 @@ const fn inner_area(area: Rect) -> Rect {
 // Modal con Table (2 columnas: clave | valor)
 // ---------------------------------------------------------------------------
 
-/// Renderiza un modal con una tabla de 2 columnas: clave | valor.
-/// La columna de claves se trunca a `key_width`; la de valores ocupa el resto.
-#[allow(dead_code)]
+/// Renderiza un modal con tabla 2 columnas. Valores largos se parten en múltiples filas.
 pub fn render_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -131,16 +129,18 @@ pub fn render_table(
 
     let header = Row::new(["Columna", "Valor"]).style(Style::default().fg(Color::Cyan)).height(1);
 
-    let rows: Vec<Row<'_>> = pairs
-        .iter()
-        .map(|(k, v)| {
-            Row::new(vec![
-                crate::ui::widgets::panel::truncate_middle(k, key_w as usize),
-                crate::ui::widgets::panel::truncate_middle(v, val_w as usize),
-            ])
-        })
-        .collect();
+    // Expandir pares en filas: valor largo → múltiples filas
+    let mut rows: Vec<Row<'_>> = Vec::new();
+    for (k, v) in pairs {
+        let key = crate::ui::widgets::panel::truncate_middle(k, key_w as usize);
+        let val_lines = crate::ui::widgets::panel::wrap_text(v, val_w as usize);
+        for (i, line) in val_lines.into_iter().enumerate() {
+            let col0 = if i == 0 { key.clone() } else { String::new() };
+            rows.push(Row::new(vec![col0, line]));
+        }
+    }
 
+    let content_len = rows.len().saturating_add(1); // +1 header
     let widths = [Constraint::Length(key_w), Constraint::Length(val_w)];
     let table = Table::new(rows, widths)
         .header(header)
@@ -151,7 +151,6 @@ pub fn render_table(
     frame.render_stateful_widget(table, rect, &mut state);
 
     // Scrollbar
-    let content_len = pairs.len().saturating_add(1);
     let visible = usize::from(inner.height.max(1));
     if content_len > visible {
         let scrollbar_state = ScrollbarState::new(content_len)
