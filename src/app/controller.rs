@@ -585,7 +585,10 @@ impl App {
     // ── objetos ───────────────────────────────────────────────────────
 
     fn selected_object_name(&self) -> String {
-        if self.active_panel == PanelKind::Advanced {
+        // Usar object_section (persiste) en vez de active_panel (cambia con foco)
+        let section = self.object_section;
+
+        if section == ObjectSection::Advanced {
             let items = &self.advanced;
             let idx = self.selected_idx(PanelKind::Advanced);
             let raw = items.get(idx).map_or("-", String::as_str);
@@ -595,12 +598,16 @@ impl App {
             return raw.to_string();
         }
 
-        let items = match self.active_panel {
-            PanelKind::Tables => &self.tables,
-            PanelKind::Views => &self.views,
-            _ => return "-".to_string(),
+        let items = match section {
+            ObjectSection::Tables => &self.tables,
+            ObjectSection::Views => &self.views,
+            ObjectSection::Advanced => &self.advanced,
         };
-        let idx = self.selected_idx(self.active_panel);
+        let idx = match section {
+            ObjectSection::Tables => self.selected_idx(PanelKind::Tables),
+            ObjectSection::Views => self.selected_idx(PanelKind::Views),
+            ObjectSection::Advanced => self.selected_idx(PanelKind::Advanced),
+        };
         items.get(idx).map_or_else(|| "-".to_string(), String::clone)
     }
 
