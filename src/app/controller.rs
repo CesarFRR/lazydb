@@ -760,8 +760,19 @@ impl App {
         match self.detail_tab {
             DetailTab::Data => {
                 if self.object_section == ObjectSection::Advanced {
-                    self.preview_rows =
-                        vec!["No hay preview de datos para indices/triggers".to_string()];
+                    // Para índices/triggers: mostrar el SQL DDL
+                    match db::backends::sqlite::object_sql(path, &object_name) {
+                        Ok(sql) => {
+                            self.preview_rows =
+                                sql.lines().map(ToString::to_string).collect::<Vec<_>>();
+                            if self.preview_rows.is_empty() {
+                                self.preview_rows = vec!["-- SQL vacio --".to_string()];
+                            }
+                        }
+                        Err(err) => {
+                            self.preview_rows = vec![format!("Error SQL: {err}")];
+                        }
+                    }
                     self.total_rows = 0;
                     self.set_selected_idx(PanelKind::Detail, 0);
                     return;
@@ -799,8 +810,19 @@ impl App {
             }
             DetailTab::Schema => {
                 if self.object_section == ObjectSection::Advanced {
-                    self.preview_rows =
-                        vec!["Sin esquema tabular para este tipo de objeto".to_string()];
+                    // Schema de índice/trigger = su SQL DDL
+                    match db::backends::sqlite::object_sql(path, &object_name) {
+                        Ok(sql) => {
+                            self.preview_rows =
+                                sql.lines().map(ToString::to_string).collect::<Vec<_>>();
+                            if self.preview_rows.is_empty() {
+                                self.preview_rows = vec!["-- SQL vacio --".to_string()];
+                            }
+                        }
+                        Err(err) => {
+                            self.preview_rows = vec![format!("Error SQL: {err}")];
+                        }
+                    }
                     self.total_rows = 0;
                     self.set_selected_idx(PanelKind::Detail, 0);
                     return;
