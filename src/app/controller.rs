@@ -476,6 +476,7 @@ impl App {
     }
 
     pub fn title_for(&self, kind: PanelKind) -> String {
+        let num = kind.number();
         match kind {
             PanelKind::Sources => {
                 let tabs = match self.source_tab {
@@ -483,27 +484,27 @@ impl App {
                     SourceTab::Local => "Todo [Local] Online",
                     SourceTab::Online => "Todo Local [Online]",
                 };
-                format!("Fuentes ({tabs})")
+                format!("[{num}]Fuentes ({tabs})")
             }
             PanelKind::Tables => {
                 if self.tables.is_empty() {
-                    "Tablas".to_string()
+                    format!("[{num}]Tablas")
                 } else {
-                    format!("Tablas ({})", self.tables.len())
+                    format!("[{num}]Tablas ({})", self.tables.len())
                 }
             }
             PanelKind::Views => {
                 if self.views.is_empty() {
-                    "Vistas".to_string()
+                    format!("[{num}]Vistas")
                 } else {
-                    format!("Vistas ({})", self.views.len())
+                    format!("[{num}]Vistas ({})", self.views.len())
                 }
             }
             PanelKind::Advanced => {
                 if self.advanced.is_empty() {
-                    "Avanzado".to_string()
+                    format!("[{num}]Avanzado")
                 } else {
-                    format!("Avanzado ({})", self.advanced.len())
+                    format!("[{num}]Avanzado ({})", self.advanced.len())
                 }
             }
             PanelKind::Detail => {
@@ -514,13 +515,13 @@ impl App {
                         self.total_rows.div_ceil(self.rows_per_page)
                     };
                     format!(
-                        "{} | Page {}/{}",
+                        "[{num}]{} | Page {}/{}",
                         self.detail_tab.label(),
                         self.current_page + 1,
                         total_pages
                     )
                 } else {
-                    self.detail_tab.label().to_string()
+                    format!("[{num}]{}", self.detail_tab.label())
                 }
             }
         }

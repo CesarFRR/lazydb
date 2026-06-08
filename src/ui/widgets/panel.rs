@@ -99,10 +99,13 @@ fn render_collapsed_line(
     let fg = if focused { Color::Cyan } else { Color::Gray };
     let num = kind.number();
     let prefix = format!("──[{num}]──");
+    // Quitar [N] del título si viene de title_for (para no duplicar)
+    let clean_title =
+        title.strip_prefix(&format!("[{num}]")).map_or_else(|| title.to_string(), str::to_string);
     #[allow(clippy::cast_possible_truncation)]
     let prefix_cols = prefix.chars().count() as u16;
     let max_title = area.width.saturating_sub(prefix_cols).max(1) as usize;
-    let short_title: String = title.chars().take(max_title).collect();
+    let short_title: String = clean_title.chars().take(max_title).collect();
     #[allow(clippy::cast_possible_truncation)]
     let used_cols = prefix_cols + short_title.chars().count() as u16;
     let padding_cols = area.width.saturating_sub(used_cols) as usize;
