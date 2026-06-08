@@ -476,7 +476,6 @@ impl App {
     }
 
     pub fn title_for(&self, kind: PanelKind) -> String {
-        let num = kind.number();
         match kind {
             PanelKind::Sources => {
                 let tabs = match self.source_tab {
@@ -484,27 +483,27 @@ impl App {
                     SourceTab::Local => "Todo [Local] Online",
                     SourceTab::Online => "Todo Local [Online]",
                 };
-                format!("[{num}] Fuentes ({tabs})")
+                format!("Fuentes ({tabs})")
             }
             PanelKind::Tables => {
                 if self.tables.is_empty() {
-                    format!("[{num}] Tablas")
+                    "Tablas".to_string()
                 } else {
-                    format!("[{num}] Tablas ({})", self.tables.len())
+                    format!("Tablas ({})", self.tables.len())
                 }
             }
             PanelKind::Views => {
                 if self.views.is_empty() {
-                    format!("[{num}] Vistas")
+                    "Vistas".to_string()
                 } else {
-                    format!("[{num}] Vistas ({})", self.views.len())
+                    format!("Vistas ({})", self.views.len())
                 }
             }
             PanelKind::Advanced => {
                 if self.advanced.is_empty() {
-                    format!("[{num}] Avanzado")
+                    "Avanzado".to_string()
                 } else {
-                    format!("[{num}] Avanzado ({})", self.advanced.len())
+                    format!("Avanzado ({})", self.advanced.len())
                 }
             }
             PanelKind::Detail => {
@@ -515,13 +514,13 @@ impl App {
                         self.total_rows.div_ceil(self.rows_per_page)
                     };
                     format!(
-                        "[{num}]{} | Page {}/{}",
+                        "{} | Page {}/{}",
                         self.detail_tab.label(),
                         self.current_page + 1,
                         total_pages
                     )
                 } else {
-                    format!("[{num}] {}", self.detail_tab.label())
+                    self.detail_tab.label().to_string()
                 }
             }
         }
@@ -1329,8 +1328,9 @@ impl App {
             // Click en un ítem de la lista
             if let Some(index) = list_index_from_click(rel_y, rect.height, 0) {
                 let max_idx = self.items_len_for(kind).saturating_sub(1);
+                let scroll = self.panel(kind).scroll_offset.get();
                 let p = self.panel_mut(kind);
-                p.selected_idx = index.min(max_idx);
+                p.selected_idx = (index + scroll).min(max_idx);
 
                 // Doble-click: detectar 2 clicks en < 400ms sobre el mismo panel+ítem
                 let now = now_millis();
