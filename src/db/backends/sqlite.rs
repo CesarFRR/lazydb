@@ -86,6 +86,23 @@ pub fn list_objects(path: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Solo nombres de columna, sin metadatos. Para inspector de fila.
+pub fn column_names(path: &str, table_name: &str) -> Result<Vec<String>, String> {
+    let conn = open_read_only(path)?;
+    let escaped = table_name.replace('"', "\"\"");
+    let sql = format!("PRAGMA table_info(\"{escaped}\")");
+    let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
+
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1)).map_err(|err| err.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|err| err.to_string())?);
+    }
+    Ok(out)
+}
+
+/// Metadata completo (cid, name, type, nullability). Para pestaña Schema.
 #[allow(dead_code)]
 pub fn table_columns(path: &str, table_name: &str) -> Result<Vec<String>, String> {
     let conn = open_read_only(path)?;
@@ -115,6 +132,40 @@ pub fn table_columns(path: &str, table_name: &str) -> Result<Vec<String>, String
     Ok(out)
 }
 
+/// Filas de datos SIN header. Para inspector y preview.
+pub fn table_data_rows(
+    path: &str,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<String>, String> {
+    let conn = open_read_only(path)?;
+    let escaped = table_name.replace('"', "\"\"");
+    let sql = format!("SELECT * FROM \"{escaped}\" LIMIT {limit} OFFSET {offset}");
+    let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
+
+    let col_count = stmt.column_names().len();
+
+    let rows = stmt
+        .query_map([], |row| {
+            let mut values = Vec::new();
+            for i in 0..col_count {
+                let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
+                values.push(val);
+            }
+            Ok(values.join("|"))
+        })
+        .map_err(|err| err.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|err| err.to_string())?);
+    }
+
+    Ok(out)
+}
+
+/// Filas con header incluido (para el preview de datos).
 pub fn table_rows(
     path: &str,
     table_name: &str,
@@ -127,22 +178,19 @@ pub fn table_rows(
     let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
 
     let mut out = Vec::new();
-
-    // Get column names
     let col_names = stmt.column_names().iter().map(ToString::to_string).collect::<Vec<_>>();
 
     if col_names.is_empty() {
         return Ok(out);
     }
 
-    // Add header row
     out.push(col_names.join(" | "));
 
-    // Fetch rows
+    let col_count = col_names.len();
     let rows = stmt
         .query_map([], |row| {
             let mut values = Vec::new();
-            for i in 0..col_names.len() {
+            for i in 0..col_count {
                 let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
                 values.push(val);
             }

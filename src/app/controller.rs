@@ -928,15 +928,15 @@ impl App {
         if object.is_empty() || object == "-" {
             return;
         }
-
-        let Ok(columns) = crate::db::backends::sqlite::table_columns(path, &object) else {
+        let Ok(columns) = crate::db::backends::sqlite::column_names(path, &object) else {
             return;
         };
 
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1); // skip header
         #[allow(clippy::cast_possible_truncation)]
         let offset = self.current_page.saturating_mul(self.rows_per_page) + row_idx as u32;
-        let Ok(rows) = crate::db::backends::sqlite::table_rows(path, &object, 1, offset) else {
+        let Ok(rows) = crate::db::backends::sqlite::table_data_rows(path, &object, 1, offset)
+        else {
             return;
         };
 
