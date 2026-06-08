@@ -972,6 +972,56 @@ impl App {
         self.show_row_inspector = false;
     }
 
+    /// Copia el ítem seleccionado al portapapeles del sistema.
+    fn yank_selected(&mut self) {
+        let items = self.items_for(self.active_panel);
+        let idx = self.selected_idx(self.active_panel);
+        let text = items.get(idx).cloned().unwrap_or_default();
+
+        if text.is_empty() {
+            self.status = "Nada que copiar".to_string();
+            return;
+        }
+
+        let copied = Self::copy_to_clipboard(&text);
+
+        if copied {
+            let preview: String = text.chars().take(50).collect();
+            let more = if text.len() > 50 { "…" } else { "" };
+            self.status = format!("Copiado: {preview}{more}");
+        } else {
+            self.status = "Error: instala wl-clipboard o xclip".to_string();
+        }
+    }
+
+    #[allow(clippy::manual_let_else)]
+    fn copy_to_clipboard(text: &str) -> bool {
+        use std::io::Write;
+
+        let mut child =
+            match std::process::Command::new("wl-copy").stdin(std::process::Stdio::piped()).spawn()
+            {
+                Ok(c) => c,
+                Err(_) => {
+                    return std::process::Command::new("xclip")
+                        .args(["-selection", "clipboard"])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                        .is_ok_and(|mut c| {
+                            if let Some(mut stdin) = c.stdin.take() {
+                                let _ = stdin.write_all(text.as_bytes());
+                            }
+                            c.wait().is_ok_and(|s| s.success())
+                        });
+                }
+            };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        child.wait().is_ok_and(|s| s.success())
+    }
+
     fn execute_menu_action(&mut self) {
         match self.actions_menu_idx {
             0 => self.connect_sqlite("sakila.db"),
@@ -1149,6 +1199,7 @@ impl App {
                 self.actions_menu_idx = 0;
                 self.status = "Menu de acciones abierto".to_string();
             }
+            keys::AppAction::Yank => self.yank_selected(),
             keys::AppAction::ToggleCurrentPanel => self.toggle_active_panel(),
             keys::AppAction::QuitOrBack => {
                 if self.active_panel == PanelKind::Detail {

@@ -57,6 +57,8 @@ pub enum AppAction {
     SourceTabNext,
     SourceTabPrev,
     ToggleActionsMenu,
+    /// Copiar ítem seleccionado al portapapeles
+    Yank,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +161,7 @@ impl Default for Keymap {
         bindings.insert("enter".to_string(), AppAction::JumpToDetail);
         bindings.insert("x".to_string(), AppAction::ToggleActionsMenu);
         bindings.insert("b".to_string(), AppAction::ToggleActionsMenu);
+        bindings.insert("y".to_string(), AppAction::Yank);
 
         Self { bindings }
     }
@@ -232,6 +235,7 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "source_tab_next" => Some(AppAction::SourceTabNext),
         "source_tab_prev" => Some(AppAction::SourceTabPrev),
         "toggle_actions_menu" => Some(AppAction::ToggleActionsMenu),
+        "yank" => Some(AppAction::Yank),
         _ => None,
     }
 }

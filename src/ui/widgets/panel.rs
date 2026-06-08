@@ -98,7 +98,7 @@ fn render_collapsed_line(
 
     let fg = if focused { Color::Cyan } else { Color::Gray };
     let num = kind.number();
-    let prefix = format!("──[{num}]──");
+    let prefix = format!("─[{num}]─");
     // Quitar [N] del título si viene de title_for (para no duplicar)
     let clean_title =
         title.strip_prefix(&format!("[{num}]")).map_or_else(|| title.to_string(), str::to_string);
