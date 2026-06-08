@@ -107,7 +107,7 @@ impl DetailTab {
             Self::Data => " Datos",
             Self::Schema => " Esquema",
             Self::Sql => " SQL",
-            Self::Meta => " Meta",
+            Self::Meta => " Meta ",
         }
     }
 }
@@ -533,7 +533,7 @@ impl App {
 
                 let tab_bar = parts.join(" | ");
 
-                format!("[{num}] {tab_bar}")
+                format!("[{num}] {tab_bar} ")
             }
         }
     }
