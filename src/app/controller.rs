@@ -219,7 +219,7 @@ pub struct App {
     pub actions_menu_idx: usize,
     /// Inspector de fila (modal de detalle de registro)
     pub show_row_inspector: bool,
-    pub row_inspector_lines: Vec<String>,
+    pub row_inspector_pairs: Vec<(String, String)>,
     pub inspector_scroll: crate::ui::widgets::modal::ModalScroll,
 
     /// Sección de objetos activa (derivada de `active_panel`)
@@ -278,7 +278,7 @@ impl App {
             show_actions_menu: false,
             actions_menu_idx: 0,
             show_row_inspector: false,
-            row_inspector_lines: Vec::new(),
+            row_inspector_pairs: Vec::new(),
             inspector_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             object_section: ObjectSection::Tables,
         }
@@ -942,17 +942,11 @@ impl App {
 
         let values: Vec<&str> = rows.first().map_or("", String::as_str).split('|').collect();
 
-        // Formato vertical: ▸ nombre_columna + valor en línea siguiente
-        self.row_inspector_lines = columns
+        // Pares clave-valor para la tabla de 2 columnas
+        self.row_inspector_pairs = columns
             .iter()
             .zip(values.iter().chain(std::iter::repeat(&"")))
-            .flat_map(|(col, val)| {
-                vec![
-                    format!("▸ {col}"),
-                    format!("  {val}"),
-                    String::new(), // línea vacía
-                ]
-            })
+            .map(|(col, val)| (col.clone(), val.to_string()))
             .collect();
 
         self.inspector_scroll.reset();

@@ -8,7 +8,8 @@
 use ratatui::{
     prelude::*,
     widgets::{
-        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+        Block, Borders, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Table, TableState, Wrap,
     },
 };
 
@@ -38,6 +39,7 @@ impl ModalScroll {
 /// Renderiza un modal centrado con scroll vertical.
 ///
 /// Devuelve el inner rect (área de contenido sin bordes) para cálculos futuros.
+#[allow(dead_code)]
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -93,4 +95,72 @@ const fn inner_area(area: Rect) -> Rect {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Modal con Table (2 columnas: clave | valor)
+// ---------------------------------------------------------------------------
+
+/// Renderiza un modal con una tabla de 2 columnas: clave | valor.
+/// La columna de claves se trunca a `key_width`; la de valores ocupa el resto.
+pub fn render_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    pairs: &[(String, String)],
+    scroll: &ModalScroll,
+    width_pct: u16,
+    height_pct: u16,
+) -> Rect {
+    let width = area.width.saturating_mul(width_pct) / 100;
+    let height = area.height.saturating_mul(height_pct) / 100;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, rect);
+
+    let border_style = Style::default().fg(Color::Cyan);
+    let block =
+        Block::default().title(title.to_string()).borders(Borders::ALL).border_style(border_style);
+
+    let inner = inner_area(rect);
+    let key_w = (inner.width.saturating_sub(3) * 40 / 100).max(8);
+    let val_w = inner.width.saturating_sub(key_w).saturating_sub(3);
+
+    let header = Row::new(["Columna", "Valor"]).style(Style::default().fg(Color::Cyan)).height(1);
+
+    let rows: Vec<Row<'_>> = pairs
+        .iter()
+        .map(|(k, v)| {
+            Row::new(vec![
+                crate::ui::widgets::panel::truncate_middle(k, key_w as usize),
+                crate::ui::widgets::panel::truncate_middle(v, val_w as usize),
+            ])
+        })
+        .collect();
+
+    let widths = [Constraint::Length(key_w), Constraint::Length(val_w)];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
+
+    let mut state = TableState::default().with_selected(Some(scroll.offset));
+    frame.render_stateful_widget(table, rect, &mut state);
+
+    // Scrollbar
+    let content_len = pairs.len().saturating_add(1);
+    let visible = usize::from(inner.height.max(1));
+    if content_len > visible {
+        let scrollbar_state = ScrollbarState::new(content_len)
+            .viewport_content_length(visible)
+            .position(scroll.offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .symbols(ratatui::symbols::scrollbar::VERTICAL);
+        let mut s = scrollbar_state;
+        frame.render_stateful_widget(scrollbar, rect, &mut s);
+    }
+
+    inner
 }
