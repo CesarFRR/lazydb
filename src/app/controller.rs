@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crossterm::event::KeyEvent;
+use ratatui::prelude::Rect;
 
 use crate::app::panel::{Panel, PanelKind, PanelMode};
 use crate::ui::layout::{self, ComputedLayout};
@@ -508,20 +509,31 @@ impl App {
                 }
             }
             PanelKind::Detail => {
-                if self.detail_tab == DetailTab::Data {
-                    let total_pages = if self.total_rows == 0 {
-                        1
-                    } else {
-                        self.total_rows.div_ceil(self.rows_per_page)
-                    };
-                    format!(
-                        "[{num}]{} | Page {}/{}",
-                        self.detail_tab.label(),
-                        self.current_page + 1,
-                        total_pages
-                    )
+                let page_info = if self.detail_tab == DetailTab::Data && self.total_rows > 0 {
+                    let total_pages = self.total_rows.div_ceil(self.rows_per_page).max(1);
+                    format!("Page {}/{}", self.current_page + 1, total_pages)
                 } else {
-                    format!("[{num}]{}", self.detail_tab.label())
+                    String::new()
+                };
+
+                // Tabs disponibles (Advanced solo muestra SQL + Meta)
+                let available = self.available_detail_tabs();
+                let tab_labels: Vec<String> = available
+                    .iter()
+                    .map(|t| {
+                        if *t == self.detail_tab {
+                            format!("[{0}]", t.label())
+                        } else {
+                            t.label().to_string()
+                        }
+                    })
+                    .collect();
+                let tab_bar = tab_labels.join(" ");
+
+                if page_info.is_empty() {
+                    format!("[{num}] {tab_bar}")
+                } else {
+                    format!("[{num}] {tab_bar} | {page_info}")
                 }
             }
         }
@@ -653,6 +665,16 @@ impl App {
     #[allow(dead_code)]
     pub const fn object_section_label(&self) -> &'static str {
         self.object_section.label()
+    }
+
+    #[allow(dead_code)]
+    /// Tabs disponibles en Detail según el tipo de objeto seleccionado
+    pub fn available_detail_tabs(&self) -> Vec<DetailTab> {
+        if self.object_section == ObjectSection::Advanced {
+            vec![DetailTab::Sql, DetailTab::Meta]
+        } else {
+            vec![DetailTab::Data, DetailTab::Schema, DetailTab::Sql, DetailTab::Meta]
+        }
     }
 
     #[allow(dead_code)]
@@ -879,7 +901,16 @@ impl App {
     }
 
     fn set_detail_tab(&mut self, tab: DetailTab) {
-        self.detail_tab = tab;
+        // Si el tab no está disponible, buscar el siguiente disponible
+        let available = self.available_detail_tabs();
+        let effective = if available.contains(&tab) {
+            tab
+        } else {
+            // Buscar siguiente disponible (o el primero si no hay)
+            available.iter().find(|t| t.label() > tab.label()).copied().unwrap_or(available[0])
+        };
+
+        self.detail_tab = effective;
         self.set_selected_idx(PanelKind::Detail, 0);
         self.refresh_preview_from_selected_object();
     }
@@ -1344,6 +1375,32 @@ impl App {
         }
     }
 
+    /// Detecta qué tab del título de Detail fue clickeado
+    fn detect_detail_tab_click(&self, cursor_x: u16, rect: Rect) -> Option<DetailTab> {
+        let available = self.available_detail_tabs();
+        let num = PanelKind::Detail.number();
+        // El formato es: "[5] [Datos] Esquema SQL Meta | Page 1/11"
+        // Empezamos después de "[5] " (4 chars + espacio = 5)
+        let prefix = format!("[{num}] ");
+        #[allow(clippy::cast_possible_truncation)]
+        let start_x = rect.x + prefix.len() as u16;
+
+        let mut cursor = start_x;
+        for tab in &available {
+            let label = tab.label();
+            let text =
+                if *tab == self.detail_tab { format!("[{label}]") } else { label.to_string() };
+            #[allow(clippy::cast_possible_truncation)]
+            let text_w = text.len() as u16;
+            if cursor_x >= cursor && cursor_x < cursor + text_w {
+                return Some(*tab);
+            }
+            cursor += text_w + 1; // +1 espacio entre tabs
+        }
+
+        None
+    }
+
     pub fn on_mouse_click(&mut self, x: u16, y: u16, width: u16, height: u16) {
         if width < 40 || height < 10 {
             return;
@@ -1367,6 +1424,10 @@ impl App {
             if rel_y == 0 {
                 // Click en título → focus + toggle (si no es Detail)
                 if kind == PanelKind::Detail {
+                    // Detectar click en tabs del título
+                    if let Some(tab) = self.detect_detail_tab_click(x, rect) {
+                        self.set_detail_tab(tab);
+                    }
                     self.set_focus(PanelKind::Detail);
                 } else {
                     self.set_focus(kind);
