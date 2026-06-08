@@ -1268,10 +1268,10 @@ impl App {
             let items_len = self.items_len_for(target);
             let p = self.panel_mut(target);
             if up {
-                p.scroll_offset = p.scroll_offset.saturating_sub(1);
+                p.scroll_offset.set(p.scroll_offset.get().saturating_sub(1));
                 p.selected_idx = p.selected_idx.saturating_sub(1).min(items_len.saturating_sub(1));
             } else {
-                p.scroll_offset = p.scroll_offset.saturating_add(1);
+                p.scroll_offset.set(p.scroll_offset.get().saturating_add(1));
                 p.selected_idx = (p.selected_idx + 1).min(items_len.saturating_sub(1));
             }
         }

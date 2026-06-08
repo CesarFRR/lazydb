@@ -65,30 +65,40 @@ pub fn render(
     scroll_offset: usize,
     focused: bool,
     _mode: PanelMode,
-) {
+) -> usize {
     let items_for_bar_len = if area.height <= 2 { 0 } else { items.len() };
     let selected_for_bar = if area.height <= 2 { 0 } else { selected_idx };
 
-    if area.height <= 2 {
-        render_collapsed_line(frame, area, title, focused);
+    let scroll = if area.height <= 2 {
+        render_collapsed_line(frame, area, kind, title, focused);
+        scroll_offset
     } else {
-        render_expanded(frame, area, kind, title, items, selected_idx, scroll_offset, focused);
-    }
+        render_expanded(frame, area, kind, title, items, selected_idx, scroll_offset, focused)
+    };
 
     // Scrollbar pasivo para listas que lo necesiten
     if items_for_bar_len > 1 && area.height >= 3 {
         render_scrollbar(frame, area, items_for_bar_len, selected_for_bar);
     }
+
+    scroll
 }
 
 /// Línea compacta sin bordes: `──[1]──Tablas────────────────────────` (ancho completo)
-fn render_collapsed_line(frame: &mut Frame<'_>, area: Rect, title: &str, focused: bool) {
+fn render_collapsed_line(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    kind: PanelKind,
+    title: &str,
+    focused: bool,
+) {
     if area.width < 5 {
         return;
     }
 
     let fg = if focused { Color::Cyan } else { Color::Gray };
-    let prefix = "─".to_string();
+    let num = kind.number();
+    let prefix = format!("──[{num}]──");
     #[allow(clippy::cast_possible_truncation)]
     let prefix_cols = prefix.chars().count() as u16;
     let max_title = area.width.saturating_sub(prefix_cols).max(1) as usize;
@@ -118,12 +128,12 @@ fn render_expanded(
     selected_idx: usize,
     scroll_offset: usize,
     focused: bool,
-) {
+) -> usize {
     let inner = inner_area_for_iteration(area);
     if inner.height == 0 {
         let block = panel_block(title, focused);
         frame.render_widget(block, area);
-        return;
+        return scroll_offset;
     }
 
     let viewport = usize::from(inner.height);
@@ -169,6 +179,8 @@ fn render_expanded(
         Some(selected_idx.saturating_sub(scroll))
     });
     frame.render_stateful_widget(list, area, &mut state);
+
+    scroll
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {

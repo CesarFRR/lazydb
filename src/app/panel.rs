@@ -1,4 +1,4 @@
-/// Sistema de paneles colapsables estilo lazydocker.
+use std::cell::Cell;
 ///
 /// Cada "cuadrito" de la UI (Fuentes, Tablas, Vistas, Avanzado, Detalle)
 /// tiene un modo de renderizado y es tratado como un panel independiente
@@ -148,18 +148,18 @@ pub struct Panel {
     /// Índice del ítem seleccionado (cursor)
     pub selected_idx: usize,
     /// Offset de scroll (primera fila visible)
-    pub scroll_offset: usize,
+    pub scroll_offset: Cell<usize>,
 }
 
 impl Panel {
     pub fn new(kind: PanelKind) -> Self {
-        Self { kind, mode: PanelMode::default(), selected_idx: 0, scroll_offset: 0 }
+        Self { kind, mode: PanelMode::default(), selected_idx: 0, scroll_offset: Cell::new(0) }
     }
 
     /// Paneles izquierdos arrancan expandidos, Detalle también.
     /// En la práctica solo 1 izquierdo estará expandido a la vez (el activo).
     pub fn new_sidebar(kind: PanelKind) -> Self {
         debug_assert!(kind.is_sidebar());
-        Self { kind, mode: PanelMode::Expanded, selected_idx: 0, scroll_offset: 0 }
+        Self { kind, mode: PanelMode::Expanded, selected_idx: 0, scroll_offset: Cell::new(0) }
     }
 }

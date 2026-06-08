@@ -60,17 +60,20 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
     let items = app.items_for(kind);
     let focused = app.active_panel == kind;
 
-    widgets::panel::render(
+    let new_scroll = widgets::panel::render(
         frame,
         area,
         kind,
         &title,
         items,
         panel.selected_idx,
-        panel.scroll_offset,
+        panel.scroll_offset.get(),
         focused,
         panel.mode,
     );
+
+    // Persistir scroll_offset calculado por el widget
+    panel.scroll_offset.set(new_scroll);
 }
 
 // ---------------------------------------------------------------------------
