@@ -1322,7 +1322,9 @@ impl App {
                 p.scroll_offset.set(p.scroll_offset.get().saturating_sub(1));
                 p.selected_idx = p.selected_idx.saturating_sub(1).min(items_len.saturating_sub(1));
             } else {
-                p.scroll_offset.set(p.scroll_offset.get().saturating_add(1));
+                // STOP: no pasar del último ítem
+                let max_scroll = items_len.saturating_sub(1);
+                p.scroll_offset.set(p.scroll_offset.get().saturating_add(1).min(max_scroll));
                 p.selected_idx = (p.selected_idx + 1).min(items_len.saturating_sub(1));
             }
         }
