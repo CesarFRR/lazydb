@@ -59,10 +59,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     app.on_mouse_click(mouse.column, mouse.row, size.width, size.height);
                 }
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
-                    app.on_scroll(true);
+                    app.on_scroll(true, mouse.column, mouse.row);
                 }
                 Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
-                    app.on_scroll(false);
+                    app.on_scroll(false, mouse.column, mouse.row);
                 }
                 _ => {}
             }

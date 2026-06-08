@@ -128,11 +128,15 @@ fn render_expanded(
 
     let viewport = usize::from(inner.height);
 
-    // Auto-scroll: mantener selección visible
-    let scroll = if selected_idx >= scroll_offset + viewport {
-        selected_idx.saturating_sub(viewport.saturating_sub(1))
-    } else if selected_idx < scroll_offset {
-        selected_idx
+    // Auto-scroll solo para panel enfocado; no-enfocado usa scroll_offset directo
+    let scroll = if focused {
+        if selected_idx >= scroll_offset + viewport {
+            selected_idx.saturating_sub(viewport.saturating_sub(1))
+        } else if selected_idx < scroll_offset {
+            selected_idx
+        } else {
+            scroll_offset
+        }
     } else {
         scroll_offset
     };

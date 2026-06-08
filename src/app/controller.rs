@@ -1219,7 +1219,7 @@ impl App {
 
     // ── mouse ─────────────────────────────────────────────────────────
 
-    pub fn on_scroll(&mut self, up: bool) {
+    pub fn on_scroll(&mut self, up: bool, mouse_x: u16, mouse_y: u16) {
         if self.show_row_inspector {
             if up {
                 self.inspector_scroll.scroll_up();
@@ -1239,10 +1239,41 @@ impl App {
             return;
         }
 
-        if up {
-            self.move_selection(-1);
+        // Buscar qué panel está bajo el mouse
+        let hovered = self
+            .layout
+            .panels
+            .iter()
+            .find(|(_, rect)| {
+                mouse_x >= rect.x
+                    && mouse_x < rect.x.saturating_add(rect.width)
+                    && mouse_y >= rect.y
+                    && mouse_y < rect.y.saturating_add(rect.height)
+            })
+            .map(|(k, _)| *k);
+
+        let Some(target) = hovered else {
+            return; // mouse fuera de todos los paneles
+        };
+
+        if target == self.active_panel {
+            // Panel enfocado: mover selección (comportamiento normal)
+            if up {
+                self.move_selection(-1);
+            } else {
+                self.move_selection(1);
+            }
         } else {
-            self.move_selection(1);
+            // Panel NO enfocado: solo desplazar vista sin cambiar foco
+            let items_len = self.items_len_for(target);
+            let p = self.panel_mut(target);
+            if up {
+                p.scroll_offset = p.scroll_offset.saturating_sub(1);
+                p.selected_idx = p.selected_idx.saturating_sub(1).min(items_len.saturating_sub(1));
+            } else {
+                p.scroll_offset = p.scroll_offset.saturating_add(1);
+                p.selected_idx = (p.selected_idx + 1).min(items_len.saturating_sub(1));
+            }
         }
     }
 
