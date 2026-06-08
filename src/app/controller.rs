@@ -509,32 +509,31 @@ impl App {
                 }
             }
             PanelKind::Detail => {
-                let page_info = if self.detail_tab == DetailTab::Data && self.total_rows > 0 {
-                    let total_pages = self.total_rows.div_ceil(self.rows_per_page).max(1);
-                    format!("Page {}/{}", self.current_page + 1, total_pages)
-                } else {
-                    String::new()
-                };
-
-                // Tabs disponibles (Advanced solo muestra SQL + Meta)
                 let available = self.available_detail_tabs();
-                let tab_labels: Vec<String> = available
-                    .iter()
-                    .map(|t| {
-                        if *t == self.detail_tab {
-                            format!("[{0}]", t.label())
-                        } else {
-                            t.label().to_string()
-                        }
-                    })
-                    .collect();
-                let tab_bar = tab_labels.join(" ");
+                let mut parts: Vec<String> = Vec::new();
 
-                if page_info.is_empty() {
-                    format!("[{num}] {tab_bar}")
-                } else {
-                    format!("[{num}] {tab_bar} | {page_info}")
+                for &tab in &available {
+                    let label = tab.label();
+                    if tab == self.detail_tab {
+                        // Tab activo con Page info si es Datos
+                        if tab == DetailTab::Data && self.total_rows > 0 {
+                            let total = self.total_rows.div_ceil(self.rows_per_page).max(1);
+                            parts.push(format!(
+                                "[{label} - Page {}/{}]",
+                                self.current_page + 1,
+                                total
+                            ));
+                        } else {
+                            parts.push(format!("[{label}]"));
+                        }
+                    } else {
+                        parts.push(label.to_string());
+                    }
                 }
+
+                let tab_bar = parts.join(" | ");
+
+                format!("[{num}] {tab_bar}")
             }
         }
     }
@@ -1376,29 +1375,42 @@ impl App {
     }
 
     /// Detecta qué tab del título de Detail fue clickeado
+    /// Detecta qué tab del título de Detail fue clickeado.
+    /// Formato: "[5] Datos - Page 1/11 | Esquema | SQL | Meta"
     fn detect_detail_tab_click(&self, cursor_x: u16, rect: Rect) -> Option<DetailTab> {
         let available = self.available_detail_tabs();
         let num = PanelKind::Detail.number();
-        // El formato es: "[5] [Datos] Esquema SQL Meta | Page 1/11"
-        // Empezamos después de "[5] " (4 chars + espacio = 5)
         let prefix = format!("[{num}] ");
         #[allow(clippy::cast_possible_truncation)]
-        let start_x = rect.x + prefix.len() as u16;
+        let mut cursor = rect.x + prefix.len() as u16;
 
-        let mut cursor = start_x;
-        for tab in &available {
-            let label = tab.label();
-            let text =
-                if *tab == self.detail_tab { format!("[{label}]") } else { label.to_string() };
-            #[allow(clippy::cast_possible_truncation)]
-            let text_w = text.len() as u16;
+        for &tab in &available {
+            let text_w = self.detail_tab_display_width(tab);
             if cursor_x >= cursor && cursor_x < cursor + text_w {
-                return Some(*tab);
+                return Some(tab);
             }
-            cursor += text_w + 1; // +1 espacio entre tabs
+            cursor += text_w + 3; // +3 por " | "
         }
-
         None
+    }
+
+    /// Ancho en columnas que ocupa un tab en el título de Detail.
+    fn detail_tab_display_width(&self, tab: DetailTab) -> u16 {
+        let label = tab.label();
+        let text = if tab == self.detail_tab {
+            if tab == DetailTab::Data && self.total_rows > 0 {
+                let total = self.total_rows.div_ceil(self.rows_per_page).max(1);
+                format!("[{label} - Page {}/{}]", self.current_page + 1, total)
+            } else {
+                format!("[{label}]")
+            }
+        } else {
+            label.to_string()
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            text.len() as u16
+        }
     }
 
     pub fn on_mouse_click(&mut self, x: u16, y: u16, width: u16, height: u16) {
