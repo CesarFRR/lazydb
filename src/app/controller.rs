@@ -217,6 +217,9 @@ pub struct App {
     pub keymap: keys::Keymap,
     pub show_actions_menu: bool,
     pub actions_menu_idx: usize,
+    /// Inspector de fila (modal de detalle de registro)
+    pub show_row_inspector: bool,
+    pub row_inspector_lines: Vec<String>,
 
     /// Sección de objetos activa (derivada de `active_panel`)
     object_section: ObjectSection,
@@ -273,6 +276,8 @@ impl App {
             keymap,
             show_actions_menu: false,
             actions_menu_idx: 0,
+            show_row_inspector: false,
+            row_inspector_lines: Vec::new(),
             object_section: ObjectSection::Tables,
         }
     }
@@ -904,6 +909,45 @@ impl App {
 
     // ── menú de acciones ──────────────────────────────────────────────
 
+    // ── row inspector ─────────────────────────────────────────────────
+
+    fn open_row_inspector(&mut self) {
+        let Some(path) = self.db_path.as_deref() else {
+            return;
+        };
+        let object = self.selected_object_name();
+        if object.is_empty() || object == "-" {
+            return;
+        }
+
+        let Ok(columns) = crate::db::backends::sqlite::table_columns(path, &object) else {
+            return;
+        };
+
+        let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1); // skip header
+        #[allow(clippy::cast_possible_truncation)]
+        let offset = self.current_page.saturating_mul(self.rows_per_page) + row_idx as u32;
+        let Ok(rows) = crate::db::backends::sqlite::table_rows(path, &object, 1, offset) else {
+            return;
+        };
+
+        let values: Vec<&str> = rows.first().map_or("", String::as_str).split('|').collect();
+
+        let max_key = columns.iter().map(String::len).max().unwrap_or(10).min(25);
+        self.row_inspector_lines = columns
+            .iter()
+            .zip(values.iter().chain(std::iter::repeat(&"")))
+            .map(|(col, val)| format!("  {col:<max_key$} │ {val}"))
+            .collect();
+
+        self.show_row_inspector = true;
+    }
+
+    #[allow(clippy::missing_const_for_fn)]
+    fn close_row_inspector(&mut self) {
+        self.show_row_inspector = false;
+    }
+
     fn execute_menu_action(&mut self) {
         match self.actions_menu_idx {
             0 => self.connect_sqlite("sakila.db"),
@@ -936,9 +980,10 @@ impl App {
             format!("Config recargada: keys + estado + ui (rows_per_page={})", self.rows_per_page);
     }
 
-    /// Enter: ejecuta acción del panel actual y salta a Detail
+    // ── menú de acciones ──────────────────────────────────────────────
     fn jump_to_detail(&mut self) {
         if self.active_panel == PanelKind::Detail {
+            self.open_row_inspector();
             return;
         }
 
@@ -1028,10 +1073,24 @@ impl App {
 
     // ── keyboard ──────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     pub fn on_key(&mut self, key: KeyEvent) {
         let Some(action) = keys::map_key(&self.keymap, key) else {
             return;
         };
+
+        // ── row inspector modal ──
+        if self.show_row_inspector {
+            match action {
+                keys::AppAction::QuitOrBack
+                | keys::AppAction::Enter
+                | keys::AppAction::ToggleActionsMenu => {
+                    self.close_row_inspector();
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // ── menú de acciones (modal) ──
         if self.show_actions_menu {
@@ -1219,10 +1278,12 @@ impl App {
                 }
 
                 // Saltar a Detail para ver los datos
-                if kind.is_sidebar() {
+                if kind == PanelKind::Detail {
+                    self.open_row_inspector();
+                } else if kind.is_sidebar() {
                     self.last_sidebar_focus = kind;
+                    self.active_panel = PanelKind::Detail;
                 }
-                self.active_panel = PanelKind::Detail;
             }
 
             return;

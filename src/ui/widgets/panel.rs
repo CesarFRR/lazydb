@@ -13,6 +13,23 @@ use ratatui::{
 
 use crate::app::{PanelKind, PanelMode};
 
+/// Trunca un string con puntos suspensivos en el medio si excede `max_w`.
+/// Ej: "Luis Hernando Garcia..." → "Luis Hernan.....o Garcia"
+#[allow(dead_code)]
+pub fn truncate_middle(text: &str, max_w: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_w {
+        return text.to_string();
+    }
+    if max_w < 5 {
+        return chars.iter().take(max_w).collect::<String>();
+    }
+    let half = (max_w - 3) / 2;
+    let left: String = chars.iter().take(half).collect();
+    let right: String = chars.iter().rev().take(half).collect::<String>().chars().rev().collect(); // revert the reversed collect
+    format!("{left}...{right}")
+}
+
 /// Renderiza un panel completo (borde + título + contenido según modo).
 ///
 /// Decide el formato por altura disponible, no por `mode`:
@@ -46,12 +63,7 @@ pub fn render(
 }
 
 /// Línea compacta sin bordes: `──[1]──Tablas────────────────────────` (ancho completo)
-fn render_collapsed_line(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &str,
-    focused: bool,
-) {
+fn render_collapsed_line(frame: &mut Frame<'_>, area: Rect, title: &str, focused: bool) {
     if area.width < 5 {
         return;
     }

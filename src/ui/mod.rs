@@ -31,6 +31,18 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_panel_at(frame, rect, kind, app);
     }
 
+    // Inspector de fila (modal overlay)
+    if app.show_row_inspector {
+        widgets::modal::render(
+            frame,
+            area,
+            &format!("Registro: {}", app.selected_object()),
+            &app.row_inspector_lines,
+            60,
+            50,
+        );
+    }
+
     // Menú de acciones (modal overlay)
     if app.show_actions_menu {
         render_actions_menu(frame, area, app);
