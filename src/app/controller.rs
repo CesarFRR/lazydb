@@ -104,9 +104,9 @@ impl DetailTab {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Data => " Datos",
-            Self::Schema => " Esquema",
-            Self::Sql => " SQL",
+            Self::Data => " Datos ",
+            Self::Schema => " Esquema ",
+            Self::Sql => " SQL ",
             Self::Meta => " Meta ",
         }
     }
@@ -514,26 +514,30 @@ impl App {
 
                 for &tab in &available {
                     let label = tab.label();
-                    if tab == self.detail_tab {
-                        // Tab activo con Page info si es Datos
-                        if tab == DetailTab::Data && self.total_rows > 0 {
+                    let text = if tab == DetailTab::Data {
+                        // Page info siempre al lado de Datos
+                        if self.total_rows > 0 {
                             let total = self.total_rows.div_ceil(self.rows_per_page).max(1);
-                            parts.push(format!(
-                                "[{label} - Page {}/{}]",
-                                self.current_page + 1,
-                                total
-                            ));
+                            format!("{label} - P{}/{}", self.current_page + 1, total)
                         } else {
-                            parts.push(format!("[{label}]"));
+                            label.to_string()
                         }
                     } else {
-                        parts.push(label.to_string());
-                    }
+                        label.to_string()
+                    };
+
+                    // Tab activo entre corchetes, con padding
+                    let padded = if tab == self.detail_tab {
+                        format!(" [ {text} ] ")
+                    } else {
+                        format!("  {text}  ")
+                    };
+                    parts.push(padded);
                 }
 
-                let tab_bar = parts.join(" | ");
+                let tab_bar = parts.join("|");
 
-                format!("[{num}] {tab_bar} ")
+                format!("[{num}]{tab_bar}| ")
             }
         }
     }
@@ -1375,12 +1379,13 @@ impl App {
     }
 
     /// Detecta qué tab del título de Detail fue clickeado
-    /// Detecta qué tab del título de Detail fue clickeado.
-    /// Formato: "[5] Datos - Page 1/11 | Esquema | SQL | Meta"
+    /// Detección de click en pestañas del título de Detail.
+    /// Formato: "[5] Datos - P1/11 | Esquema | SQL | Meta |"
     fn detect_detail_tab_click(&self, cursor_x: u16, rect: Rect) -> Option<DetailTab> {
         let available = self.available_detail_tabs();
         let num = PanelKind::Detail.number();
-        let prefix = format!("[{num}] ");
+        // Saltar "[5]" (4 chars aprox) + 1 espacio
+        let prefix = format!("[{num}]");
         #[allow(clippy::cast_possible_truncation)]
         let mut cursor = rect.x + prefix.len() as u16;
 
@@ -1389,27 +1394,26 @@ impl App {
             if cursor_x >= cursor && cursor_x < cursor + text_w {
                 return Some(tab);
             }
-            cursor += text_w + 3; // +3 por " | "
+            // " | " = 3 chars
+            cursor += text_w + 3;
         }
         None
     }
 
-    /// Ancho en columnas que ocupa un tab en el título de Detail.
+    /// Ancho en columnas del texto de un tab en el título.
     fn detail_tab_display_width(&self, tab: DetailTab) -> u16 {
         let label = tab.label();
-        let text = if tab == self.detail_tab {
-            if tab == DetailTab::Data && self.total_rows > 0 {
-                let total = self.total_rows.div_ceil(self.rows_per_page).max(1);
-                format!("[{label} - Page {}/{}]", self.current_page + 1, total)
-            } else {
-                format!("[{label}]")
-            }
+        let inner = if tab == DetailTab::Data && self.total_rows > 0 {
+            let total = self.total_rows.div_ceil(self.rows_per_page).max(1);
+            format!("{label} - P{}/{}", self.current_page + 1, total)
         } else {
             label.to_string()
         };
+        let padded =
+            if tab == self.detail_tab { format!(" [ {inner} ] ") } else { format!("  {inner}  ") };
         #[allow(clippy::cast_possible_truncation)]
         {
-            text.len() as u16
+            padded.len() as u16
         }
     }
 
