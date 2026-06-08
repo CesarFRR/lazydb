@@ -782,6 +782,13 @@ impl App {
             return;
         }
 
+        // Siempre refrescar total_rows para tablas/vistas (no Advanced)
+        if self.object_section != ObjectSection::Advanced {
+            if let Ok(count) = db::backends::sqlite::table_row_count(path, &object_name) {
+                self.total_rows = count;
+            }
+        }
+
         match self.detail_tab {
             DetailTab::Data => {
                 if self.object_section == ObjectSection::Advanced {
@@ -804,9 +811,7 @@ impl App {
                 }
 
                 match db::backends::sqlite::table_row_count(path, &object_name) {
-                    Ok(count) => {
-                        self.total_rows = count;
-                    }
+                    Ok(_) => {} // total_rows ya fue actualizado arriba
                     Err(err) => {
                         self.preview_rows = vec![format!("Error contando filas: {err}")];
                         self.total_rows = 0;
