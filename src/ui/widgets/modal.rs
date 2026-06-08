@@ -103,6 +103,7 @@ const fn inner_area(area: Rect) -> Rect {
 
 /// Renderiza un modal con una tabla de 2 columnas: clave | valor.
 /// La columna de claves se trunca a `key_width`; la de valores ocupa el resto.
+#[allow(dead_code)]
 pub fn render_table(
     frame: &mut Frame<'_>,
     area: Rect,

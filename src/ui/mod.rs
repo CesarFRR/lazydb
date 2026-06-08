@@ -31,13 +31,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_panel_at(frame, rect, kind, app);
     }
 
-    // Inspector de fila (modal con tabla 2 columnas)
+    // Inspector de fila (modal vertical con word-wrap)
     if app.show_row_inspector {
-        widgets::modal::render_table(
+        widgets::modal::render(
             frame,
             area,
             &format!("▸ {}", app.selected_object()),
-            &app.row_inspector_pairs,
+            &app.row_inspector_lines,
             &app.inspector_scroll,
             70,
             70,
