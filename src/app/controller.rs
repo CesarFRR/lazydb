@@ -161,6 +161,14 @@ fn list_index_from_click(rel_y: u16, section_height: u16, top_reserved: u16) -> 
     Some(usize::from(rel_y.saturating_sub(inner_top)))
 }
 
+/// Timestamp en milisegundos para detección de doble-click.
+fn now_millis() -> u64 {
+    #[allow(clippy::cast_possible_truncation)]
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 fn is_online_source(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.starts_with("http://")
@@ -221,6 +229,10 @@ pub struct App {
     pub show_row_inspector: bool,
     pub row_inspector_pairs: Vec<(String, String)>,
     pub inspector_scroll: crate::ui::widgets::modal::ModalScroll,
+    /// Doble-click: timestamp del último click (ms) y panel clickeado
+    pub last_click_time: u64,
+    pub last_click_kind: Option<PanelKind>,
+    pub last_click_idx: usize,
 
     /// Sección de objetos activa (derivada de `active_panel`)
     object_section: ObjectSection,
@@ -280,6 +292,9 @@ impl App {
             show_row_inspector: false,
             row_inspector_pairs: Vec::new(),
             inspector_scroll: crate::ui::widgets::modal::ModalScroll::default(),
+            last_click_time: 0,
+            last_click_kind: None,
+            last_click_idx: 0,
             object_section: ObjectSection::Tables,
         }
     }
@@ -1286,7 +1301,21 @@ impl App {
                 let p = self.panel_mut(kind);
                 p.selected_idx = index.min(max_idx);
 
-                // Si es Sources, conectar; si es tabla/vista, refrescar preview
+                // Doble-click: detectar 2 clicks en < 400ms sobre el mismo panel+ítem
+                let now = now_millis();
+                let is_double = self.last_click_kind == Some(kind)
+                    && self.last_click_idx == index
+                    && now.saturating_sub(self.last_click_time) < 400;
+                self.last_click_time = now;
+                self.last_click_kind = Some(kind);
+                self.last_click_idx = index;
+
+                if is_double && kind == PanelKind::Detail {
+                    self.open_row_inspector();
+                    return;
+                }
+
+                // Click simple: ejecutar acción del panel sin saltar a Detail
                 if kind == PanelKind::Sources {
                     self.connect_selected_source();
                 } else if kind == PanelKind::Tables
@@ -1296,14 +1325,7 @@ impl App {
                     self.current_page = 0;
                     self.refresh_preview_from_selected_object();
                 }
-
-                // Saltar a Detail para ver los datos
-                if kind == PanelKind::Detail {
-                    self.open_row_inspector();
-                } else if kind.is_sidebar() {
-                    self.last_sidebar_focus = kind;
-                    self.active_panel = PanelKind::Detail;
-                }
+                // Detail: doble-click ya manejado arriba, click simple no hace nada extra
             }
 
             return;
