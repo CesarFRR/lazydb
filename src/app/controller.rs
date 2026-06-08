@@ -1270,16 +1270,8 @@ impl App {
             keys::AppAction::SourceTabFavorites => self.set_source_tab(SourceTab::Local),
             keys::AppAction::SourceTabNext => self.set_source_tab(self.source_tab.next()),
             keys::AppAction::SourceTabPrev => self.set_source_tab(self.source_tab.prev()),
-            keys::AppAction::DetailTabPrev => {
-                if self.active_panel == PanelKind::Detail {
-                    self.set_detail_tab(self.detail_tab.prev());
-                }
-            }
-            keys::AppAction::DetailTabNext => {
-                if self.active_panel == PanelKind::Detail {
-                    self.set_detail_tab(self.detail_tab.next());
-                }
-            }
+            keys::AppAction::DetailTabPrev => self.set_detail_tab(self.detail_tab.prev()),
+            keys::AppAction::DetailTabNext => self.set_detail_tab(self.detail_tab.next()),
             keys::AppAction::DetailTabData => self.set_detail_tab(DetailTab::Data),
             keys::AppAction::DetailTabSchema => self.set_detail_tab(DetailTab::Schema),
             keys::AppAction::DetailTabSql => self.set_detail_tab(DetailTab::Sql),
