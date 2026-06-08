@@ -126,17 +126,26 @@ fn render_expanded(
         return;
     }
 
-    // Sources no enfocado: solo 1 ítem visible
-    let max_visible =
-        if kind == PanelKind::Sources && !focused { 1usize } else { usize::from(inner.height) };
+    let viewport = usize::from(inner.height);
 
-    let viewport = max_visible.min(usize::from(inner.height));
-    let visible = items.iter().skip(scroll_offset).take(viewport);
+    // Auto-scroll: mantener selección visible
+    let scroll = if selected_idx >= scroll_offset + viewport {
+        selected_idx.saturating_sub(viewport.saturating_sub(1))
+    } else if selected_idx < scroll_offset {
+        selected_idx
+    } else {
+        scroll_offset
+    };
+
+    // Sources no enfocado: solo 1 ítem visible
+    let max_visible = if kind == PanelKind::Sources && !focused { 1usize } else { viewport };
+
+    let visible = items.iter().skip(scroll).take(max_visible);
 
     let list_items: Vec<ListItem<'_>> = visible
         .enumerate()
         .map(|(i, item)| {
-            let global_idx = scroll_offset + i;
+            let global_idx = scroll + i;
             if global_idx == selected_idx {
                 ListItem::new(format!("> {item}"))
             } else {
@@ -153,7 +162,7 @@ fn render_expanded(
     let mut state = ListState::default().with_selected(if items.is_empty() {
         None
     } else {
-        Some(selected_idx.saturating_sub(scroll_offset))
+        Some(selected_idx.saturating_sub(scroll))
     });
     frame.render_stateful_widget(list, area, &mut state);
 }
