@@ -860,12 +860,10 @@ impl App {
                         } else {
                             columns
                         };
-                        self.total_rows = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                     }
                     Err(err) => {
                         self.preview_rows = vec![format!("Error schema: {err}")];
-                        self.total_rows = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                     }
                 }
@@ -876,12 +874,10 @@ impl App {
                     if self.preview_rows.is_empty() {
                         self.preview_rows = vec!["-- SQL vacio --".to_string()];
                     }
-                    self.total_rows = 0;
                     self.set_selected_idx(PanelKind::Detail, 0);
                 }
                 Err(err) => {
                     self.preview_rows = vec![format!("Error SQL: {err}")];
-                    self.total_rows = 0;
                     self.set_selected_idx(PanelKind::Detail, 0);
                 }
             },
@@ -897,7 +893,6 @@ impl App {
                     format!("page: {}", self.current_page + 1),
                     format!("estimated_rows: {}", self.total_rows),
                 ];
-                self.total_rows = 0;
                 self.set_selected_idx(PanelKind::Detail, 0);
             }
         }
