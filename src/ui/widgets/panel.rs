@@ -7,7 +7,8 @@ use ratatui::{
     text::Line as RatLine,
     text::Span,
     widgets::{
-        Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Block, Borders, Cell, List, ListItem, ListState, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, TableState,
     },
 };
 
@@ -80,6 +81,193 @@ pub fn render(
     if items_for_bar_len > 1 && area.height >= 3 {
         render_scrollbar(frame, area, items_for_bar_len, selected_for_bar);
     }
+
+    scroll
+}
+
+/// Renderiza el panel Detail en modo Data como una tabla con columnas reales,
+/// separadores verticales `│` y fila separadora `─┼─`.
+///
+/// `items[0]` = cabecera con nombres separados por ` | `
+/// `items[1..]` = filas de datos separadas por ` | `
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
+pub fn render_data_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    items: &[String],
+    selected_idx: usize,
+    scroll_offset: usize,
+    focused: bool,
+) -> usize {
+    let inner = inner_area_for_iteration(area);
+    if inner.height == 0 || items.is_empty() {
+        let block = panel_block(title, focused);
+        frame.render_widget(block, area);
+        return scroll_offset;
+    }
+
+    let viewport = usize::from(inner.height);
+
+    // Parsear columnas desde la cabecera (items[0])
+    let headers: Vec<&str> = items[0].split(" | ").collect();
+    let col_count = headers.len().max(1);
+
+    if col_count == 1 {
+        // Una sola columna: delegar al List normal (│ no tiene sentido)
+        return render_expanded(frame, area, PanelKind::Detail, title, items, selected_idx, scroll_offset, focused);
+    }
+
+    // Ancho disponible para celdas (inner sin bordes)
+    let inner_w = usize::from(inner.width);
+
+    // Distribuir columnas equitativamente
+    let cell_base = inner_w / col_count;
+    let cell_widths: Vec<usize> = (0..col_count)
+        .map(|i| {
+            if i == col_count.saturating_sub(1) {
+                inner_w.saturating_sub(cell_base * (col_count.saturating_sub(1)))
+            } else {
+                cell_base
+            }
+        })
+        .collect();
+    let widths: Vec<Constraint> =
+        cell_widths.iter().map(|&w| Constraint::Length(w as u16)).collect();
+
+    // ── Auto-scroll sobre datos (items[1..]) ──
+    // Usamos salto directo (no animación lineal) para evitar que N filas nuevas
+    // tarden N frames en mostrarse. Cuando la selección sale del viewport,
+    // el scroll salta inmediatamente a la posición que la mantiene visible.
+    let data_len = items.len().saturating_sub(1);
+    let data_selected = if selected_idx == 0 { 0 } else { selected_idx.saturating_sub(1).min(data_len.saturating_sub(1)) };
+
+    let vp_data = viewport.saturating_sub(3); // filas de datos visibles
+    let max_scroll = data_len.saturating_sub(vp_data);
+
+    let scroll = if focused && data_len > 0 && vp_data > 0 {
+        if data_selected >= scroll_offset.saturating_add(vp_data) {
+            // Selección salió por abajo → mostrar al final del viewport
+            (data_selected.saturating_sub(vp_data).saturating_add(1)).min(max_scroll)
+        } else if data_selected < scroll_offset {
+            // Selección salió por arriba → mostrar al inicio del viewport
+            data_selected
+        } else {
+            scroll_offset
+        }
+    } else {
+        scroll_offset
+    };
+
+    // ── Construir filas ──
+    let mut all_rows: Vec<Row<'_>> = Vec::new();
+
+    // Fila 0: Espaciador entre los tabs (título del borde) y la tabla
+    {
+        let spacer: Vec<Cell<'_>> = cell_widths
+            .iter()
+            .map(|&w| Cell::from(" ".repeat(w)))
+            .collect();
+        all_rows.push(Row::new(spacer).height(1));
+    }
+
+    // Fila 1: Header (Bold + Cyan)
+    let header_cells: Vec<Cell<'_>> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let w = cell_widths[i];
+            let text = if i < col_count.saturating_sub(1) {
+                let iw = w.saturating_sub(3);
+                let val = truncate_middle(h.trim(), iw);
+                format!(" {val:<iw$} │")
+            } else {
+                let iw = w.saturating_sub(1);
+                let val = truncate_middle(h.trim(), iw);
+                format!(" {val:<iw$}")
+            };
+            Cell::from(Span::styled(
+                text,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect::<Vec<Cell<'_>>>();
+    all_rows.push(Row::new(header_cells).height(1));
+
+    // Fila 2: Separador `─┼─` (referencia visual para alinear │)
+    let sep_cells: Vec<Cell<'_>> = cell_widths
+        .iter()
+        .enumerate()
+        .map(|(i, &w)| {
+            let text = if i < col_count.saturating_sub(1) {
+                let iw = w.saturating_sub(2);
+                format!(" {}┼", "─".repeat(iw))
+            } else {
+                format!(" {}", "─".repeat(w.saturating_sub(1)))
+            };
+            Cell::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+        })
+        .collect::<Vec<Cell<'_>>>();
+    all_rows.push(Row::new(sep_cells).height(1));
+
+    // Filas de datos (con scroll)
+    let max_visible = viewport.saturating_sub(3); // spacer + header + separator
+    let visible_data: Vec<&String> = items.iter().skip(1).skip(scroll).take(max_visible).collect();
+    let visible_selected = if selected_idx > 0 {
+        selected_idx.saturating_sub(1).saturating_sub(scroll)
+    } else {
+        usize::MAX // sin selección (header enfocado)
+    };
+
+    for (rel_idx, line) in visible_data.iter().enumerate() {
+        let is_selected = rel_idx == visible_selected;
+        let cells: Vec<&str> = line.split(" | ").collect();
+        let row_cells: Vec<Cell<'_>> = (0..col_count)
+            .map(|i| {
+                let w = cell_widths[i];
+                let val = cells.get(i).map_or("", |s| s.trim());
+                #[allow(clippy::let_and_return)]
+                if i == 0 {
+                    // Primera columna con ▸ para selección
+                    let iw = w.saturating_sub(3);
+                    let truncated = truncate_middle(val, iw);
+                    let prefix = if is_selected { "▸" } else { " " };
+                    let text = format!("{prefix}{truncated:<iw$} │");
+                    if is_selected {
+                        Cell::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+                    } else {
+                        Cell::from(text)
+                    }
+                } else if i < col_count.saturating_sub(1) {
+                    let iw = w.saturating_sub(3);
+                    let truncated = truncate_middle(val, iw);
+                    let text = format!(" {truncated:<iw$} │");
+                    if is_selected {
+                        Cell::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+                    } else {
+                        Cell::from(text)
+                    }
+                } else {
+                    let iw = w.saturating_sub(1);
+                    let truncated = truncate_middle(val, iw);
+                    let text = format!(" {truncated:<iw$}");
+                    if is_selected {
+                        Cell::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+                    } else {
+                        Cell::from(text)
+                    }
+                }
+            })
+            .collect::<Vec<Cell<'_>>>();
+        all_rows.push(Row::new(row_cells));
+    }
+
+    let table = Table::new(all_rows, widths)
+        .block(panel_block(title, focused))
+        .column_spacing(0);
+
+    let mut state = TableState::default().with_selected(None);
+    frame.render_stateful_widget(table, area, &mut state);
 
     scroll
 }
