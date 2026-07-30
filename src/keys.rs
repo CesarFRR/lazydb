@@ -59,6 +59,10 @@ pub enum AppAction {
     ToggleActionsMenu,
     /// Copiar ítem seleccionado al portapapeles
     Yank,
+    /// Exportar tabla actual a CSV
+    ExportCsv,
+    /// Iniciar filtro de búsqueda /
+    StartFilter,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +166,8 @@ impl Default for Keymap {
         bindings.insert("x".to_string(), AppAction::ToggleActionsMenu);
         bindings.insert("b".to_string(), AppAction::ToggleActionsMenu);
         bindings.insert("y".to_string(), AppAction::Yank);
+        bindings.insert("e".to_string(), AppAction::ExportCsv);
+        bindings.insert("/".to_string(), AppAction::StartFilter);
 
         Self { bindings }
     }
@@ -236,6 +242,8 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "source_tab_prev" => Some(AppAction::SourceTabPrev),
         "toggle_actions_menu" => Some(AppAction::ToggleActionsMenu),
         "yank" => Some(AppAction::Yank),
+        "export_csv" => Some(AppAction::ExportCsv),
+        "start_filter" => Some(AppAction::StartFilter),
         _ => None,
     }
 }

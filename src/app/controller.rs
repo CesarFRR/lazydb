@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::Rect;
 
 use crate::app::panel::{Panel, PanelKind, PanelMode};
@@ -73,6 +73,12 @@ impl ObjectSection {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputMode {
+    Normal,
+    Filtering,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -213,6 +219,7 @@ pub struct App {
 
     // ── estado persistente ──
     pub should_quit: bool,
+    pub is_loading: bool,
     pub refresh_count: u32,
     pub db_path: Option<String>,
     pub db_size_bytes: Option<u64>,
@@ -239,6 +246,11 @@ pub struct App {
 
     /// Sección de objetos activa (derivada de `active_panel`)
     object_section: ObjectSection,
+
+    // ── filtro de búsqueda ──
+    pub input_mode: InputMode,
+    pub filter_query: String,
+    pub filtered_items: Vec<String>,
 }
 
 impl App {
@@ -279,6 +291,7 @@ impl App {
             preview_rows: vec!["Sin conexion SQLite".to_string()],
             detail_tab: DetailTab::Data,
             should_quit: false,
+            is_loading: false,
             refresh_count: 0,
             db_path: None,
             db_size_bytes: None,
@@ -300,6 +313,9 @@ impl App {
             last_click_kind: None,
             last_click_idx: 0,
             object_section: ObjectSection::Tables,
+            input_mode: InputMode::Normal,
+            filter_query: String::new(),
+            filtered_items: Vec::new(),
         }
     }
 
@@ -484,6 +500,13 @@ impl App {
     // ── items por panel ───────────────────────────────────────────────
 
     pub fn items_for(&self, kind: PanelKind) -> &[String] {
+        // Si hay filtro activo y es el panel activo, devolver filtrados
+        if !self.filtered_items.is_empty()
+            && self.active_panel == kind
+            && kind.is_sidebar()
+        {
+            return &self.filtered_items;
+        }
         match kind {
             PanelKind::Sources => &self.sources,
             PanelKind::Tables => &self.tables,
@@ -492,6 +515,8 @@ impl App {
             PanelKind::Detail => &self.preview_rows,
         }
     }
+
+    /// Número total de items originales (sin filtro) para el panel dado.
 
     pub fn items_len_for(&self, kind: PanelKind) -> usize {
         self.items_for(kind).len()
@@ -642,11 +667,18 @@ impl App {
 
     fn selected_object_name(&self) -> String {
         // Usar object_section (persiste) en vez de active_panel (cambia con foco)
+        // Usar items_for para respetar filtros activos
         let section = self.object_section;
 
+        let kind = match section {
+            ObjectSection::Tables => PanelKind::Tables,
+            ObjectSection::Views => PanelKind::Views,
+            ObjectSection::Advanced => PanelKind::Advanced,
+        };
+        let items = self.items_for(kind);
+        let idx = self.selected_idx(kind);
+
         if section == ObjectSection::Advanced {
-            let items = &self.advanced;
-            let idx = self.selected_idx(PanelKind::Advanced);
             let raw = items.get(idx).map_or("-", String::as_str);
             if let Some((_, name)) = raw.split_once(':') {
                 return name.to_string();
@@ -654,31 +686,21 @@ impl App {
             return raw.to_string();
         }
 
-        let items = match section {
-            ObjectSection::Tables => &self.tables,
-            ObjectSection::Views => &self.views,
-            ObjectSection::Advanced => &self.advanced,
-        };
-        let idx = match section {
-            ObjectSection::Tables => self.selected_idx(PanelKind::Tables),
-            ObjectSection::Views => self.selected_idx(PanelKind::Views),
-            ObjectSection::Advanced => self.selected_idx(PanelKind::Advanced),
-        };
         items.get(idx).map_or_else(|| "-".to_string(), String::clone)
     }
 
     #[allow(dead_code)]
     pub fn selected_source(&self) -> &str {
         let idx = self.selected_idx(PanelKind::Sources);
-        self.sources.get(idx).map_or("-", String::as_str)
+        self.items_for(PanelKind::Sources).get(idx).map_or("-", String::as_str)
     }
 
     #[allow(dead_code)]
     pub fn selected_object(&self) -> &str {
         let raw = match self.active_panel {
-            PanelKind::Tables => self.tables.get(self.selected_idx(PanelKind::Tables)),
-            PanelKind::Views => self.views.get(self.selected_idx(PanelKind::Views)),
-            PanelKind::Advanced => self.advanced.get(self.selected_idx(PanelKind::Advanced)),
+            kind @ (PanelKind::Tables | PanelKind::Views | PanelKind::Advanced) => {
+                self.items_for(kind).get(self.selected_idx(kind))
+            }
             _ => None,
         };
         raw.map_or("-", String::as_str)
@@ -746,6 +768,8 @@ impl App {
     // ── conexión SQLite ───────────────────────────────────────────────
 
     fn connect_sqlite(&mut self, path: &str) {
+        self.is_loading = true;
+        self.status = format!("Conectando a {path}...");
         let tables = db::backends::sqlite::list_objects_by_type(path, "table");
         let views = db::backends::sqlite::list_objects_by_type(path, "view");
         let advanced = db::backends::sqlite::list_advanced_objects(path);
@@ -780,6 +804,7 @@ impl App {
                 self.set_focus(PanelKind::Tables);
             }
             _ => {
+                self.is_loading = false;
                 self.status = format!("Error al abrir {path}: no se pudo leer sqlite_master");
             }
         }
@@ -826,11 +851,15 @@ impl App {
             return;
         };
 
+        self.is_loading = true;
+        self.status = format!("Cargando {}...", self.detail_tab.label().trim());
+
         let object_name = self.selected_object_name();
         if object_name.is_empty() || object_name == "-" {
             self.preview_rows = vec!["Sin objeto seleccionado".to_string()];
             self.total_rows = 0;
             self.preview_loaded_offset = 0;
+            self.is_loading = false;
             self.set_selected_idx(PanelKind::Detail, 0);
             return;
         }
@@ -860,6 +889,7 @@ impl App {
                     }
                     self.total_rows = 0;
                     self.preview_loaded_offset = 0;
+                    self.is_loading = false;
                     self.set_selected_idx(PanelKind::Detail, 0);
                     return;
                 }
@@ -870,6 +900,7 @@ impl App {
                         self.preview_rows = vec![format!("Error contando filas: {err}")];
                         self.total_rows = 0;
                         self.preview_loaded_offset = 0;
+                        self.is_loading = false;
                         self.set_selected_idx(PanelKind::Detail, 0);
                         return;
                     }
@@ -912,6 +943,7 @@ impl App {
                     }
                     self.total_rows = 0;
                     self.preview_loaded_offset = 0;
+                    self.is_loading = false;
                     self.set_selected_idx(PanelKind::Detail, 0);
                     return;
                 }
@@ -964,6 +996,7 @@ impl App {
                 self.set_selected_idx(PanelKind::Detail, 0);
             }
         }
+        self.is_loading = false;
     }
 
     // ── scroll infinito (append/prepend) ─────────────────────────────
@@ -995,6 +1028,9 @@ impl App {
             return;
         }
 
+        self.is_loading = true;
+        self.status = format!("Cargando más filas (offset {next_offset})...");
+
         #[allow(clippy::cast_possible_truncation)]
         if let Ok(rows) = crate::db::backends::sqlite::table_rows(
             path,
@@ -1005,6 +1041,7 @@ impl App {
             // rows[0] es header (lo descartamos, ya tenemos el nuestro)
             // rows[1..] son las filas de datos nuevas
             if rows.len() <= 1 {
+                self.is_loading = false;
                 return;
             }
             let old_len = self.preview_rows.len();
@@ -1012,6 +1049,7 @@ impl App {
             // La selección va a la primera fila nueva (continuidad: se avanzó 1 paso)
             self.set_selected_idx(PanelKind::Detail, old_len);
         }
+        self.is_loading = false;
     }
 
     /// Carga la página anterior de datos y la antepone a `preview_rows`.
@@ -1037,11 +1075,15 @@ impl App {
             return;
         }
 
+        self.is_loading = true;
+        self.status = format!("Cargando filas anteriores (offset {offset})...");
+
         if let Ok(rows) =
             crate::db::backends::sqlite::table_rows(path, &object, limit, offset)
         {
             // rows[0] es header (lo descartamos), rows[1..] son datos nuevos
             if rows.len() <= 1 {
+                self.is_loading = false;
                 return;
             }
             let n = rows.len() - 1; // cantidad de filas nuevas
@@ -1063,6 +1105,7 @@ impl App {
             // (el ítem justo antes del antiguo primer dato)
             self.set_selected_idx(PanelKind::Detail, n);
         }
+        self.is_loading = false;
     }
 
     fn set_detail_tab(&mut self, tab: DetailTab) {
@@ -1151,6 +1194,72 @@ impl App {
 
     // ── menú de acciones ──────────────────────────────────────────────
 
+    // ── exportar CSV ─────────────────────────────────────────────────
+
+    fn export_csv(&mut self) {
+        let Some(path) = self.db_path.clone() else {
+            self.status = "No hay DB conectada".to_string();
+            return;
+        };
+        let object = self.selected_object_name();
+        if object.is_empty() || object == "-" {
+            self.status = "Selecciona una tabla o vista primero".to_string();
+            return;
+        }
+
+        self.is_loading = true;
+        let safe_name = object.replace([' ', '"', '/', '\\'], "_");
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let filename = format!("{safe_name}_{timestamp}.csv");
+        let sql = format!("SELECT * FROM \"{}\";", object.replace('"', "\"\""));
+
+        self.status = format!("Exportando a {filename}...");
+
+        match std::process::Command::new("sqlite3")
+            .args([
+                "-header",
+                "-csv",
+                &path,
+                &sql,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(output) => {
+                if !output.status.success() {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    self.status = format!("Error exportando: {err}");
+                    self.is_loading = false;
+                    return;
+                }
+                match std::fs::write(&filename, &output.stdout) {
+                    Ok(_) => {
+                        let size = output.stdout.len();
+                        let size_str = if size >= 1024 * 1024 {
+                            format!("{:.1} MiB", size as f64 / (1024.0 * 1024.0))
+                        } else if size >= 1024 {
+                            format!("{:.1} KiB", size as f64 / 1024.0)
+                        } else {
+                            format!("{size} B")
+                        };
+                        self.status = format!("Exportado: {filename} ({size_str})");
+                    }
+                    Err(e) => {
+                        self.status = format!("Error escribiendo {filename}: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                self.status = format!("Error ejecutando sqlite3: {e}");
+            }
+        }
+        self.is_loading = false;
+    }
+
     // ── row inspector ─────────────────────────────────────────────────
 
     fn open_row_inspector(&mut self) {
@@ -1238,6 +1347,88 @@ impl App {
             let _ = stdin.write_all(text.as_bytes());
         }
         child.wait().is_ok_and(|s| s.success())
+    }
+
+    // ── filtro de búsqueda ────────────────────────────────────────────
+
+    /// Inicia el modo de filtrado para el panel activo.
+    fn start_filter(&mut self) {
+        if !self.active_panel.is_sidebar() {
+            // Solo sidebar tiene listas filtrables
+            self.status = "Usa / en un panel lateral (Sources/Tablas/Vistas/Avanzado)".to_string();
+            return;
+        }
+        self.input_mode = InputMode::Filtering;
+        self.filter_query.clear();
+        self.filtered_items.clear();
+        self.status = "Filtrar: ".to_string();
+    }
+
+    /// Aplica el filtro actual y sale del modo de filtrado.
+    fn apply_filter(&mut self) {
+        if self.filter_query.is_empty() {
+            self.filtered_items.clear();
+        } else {
+            let items = self.original_items_for(self.active_panel);
+            let query = self.filter_query.to_ascii_lowercase();
+            let filtered: Vec<String> = items
+                .iter()
+                .filter(|s| s.to_ascii_lowercase().contains(&query))
+                .cloned()
+                .collect();
+            if filtered.is_empty() {
+                self.status = format!("Sin resultados para: {query}");
+                self.filtered_items.clear();
+            } else {
+                self.filtered_items = filtered;
+                self.status = format!("Filtro: {} ({})", self.filter_query, self.filtered_items.len());
+            }
+        }
+        self.input_mode = InputMode::Normal;
+        self.set_selected_idx(self.active_panel, 0);
+    }
+
+    /// Cancela el filtro y vuelve a modo normal.
+    fn cancel_filter(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.filter_query.clear();
+        self.filtered_items.clear();
+        self.status = "Filtro cancelado".to_string();
+    }
+
+    /// Actualiza el filtro en tiempo real (mientras se escribe).
+    fn update_filter(&mut self) {
+        if self.filter_query.is_empty() {
+            self.filtered_items.clear();
+            self.status = "Filtrar: ".to_string();
+            return;
+        }
+        let items = self.original_items_for(self.active_panel);
+        let query = self.filter_query.to_ascii_lowercase();
+        let filtered: Vec<String> = items
+            .iter()
+            .filter(|s| s.to_ascii_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
+            self.filtered_items.clear();
+            self.status = format!("Filtrar: {} (sin resultados)", self.filter_query);
+        } else {
+            self.filtered_items = filtered;
+            self.status = format!("Filtrar: {} ({})", self.filter_query, self.filtered_items.len());
+        }
+        self.set_selected_idx(self.active_panel, 0);
+    }
+
+    /// Items originales del panel activo (sin filtro).
+    fn original_items_for(&self, kind: PanelKind) -> &[String] {
+        match kind {
+            PanelKind::Sources => &self.sources,
+            PanelKind::Tables => &self.tables,
+            PanelKind::Views => &self.views,
+            PanelKind::Advanced => &self.advanced,
+            PanelKind::Detail => &self.preview_rows,
+        }
     }
 
     fn execute_menu_action(&mut self) {
@@ -1367,6 +1558,24 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     pub fn on_key(&mut self, key: KeyEvent) {
+        // ── modo filtro: capturar teclas antes del mapeo de acciones ──
+        if self.input_mode == InputMode::Filtering {
+            match key.code {
+                KeyCode::Esc => self.cancel_filter(),
+                KeyCode::Enter => self.apply_filter(),
+                KeyCode::Backspace => {
+                    self.filter_query.pop();
+                    self.update_filter();
+                }
+                KeyCode::Char(c) => {
+                    self.filter_query.push(c);
+                    self.update_filter();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let Some(action) = keys::map_key(&self.keymap, key) else {
             return;
         };
@@ -1418,6 +1627,8 @@ impl App {
                 self.status = "Menu de acciones abierto".to_string();
             }
             keys::AppAction::Yank => self.yank_selected(),
+            keys::AppAction::ExportCsv => self.export_csv(),
+            keys::AppAction::StartFilter => self.start_filter(),
             keys::AppAction::ToggleCurrentPanel => self.toggle_active_panel(),
             keys::AppAction::QuitOrBack => {
                 if self.active_panel == PanelKind::Detail {
