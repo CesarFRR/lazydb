@@ -601,8 +601,8 @@ pub struct App {
     /// selección por CUALQUIER vía (flechas, click, drag, foco) comparando
     /// este valor, porque la navegación escribe `selected_idx` directo.
     last_probed_idx: usize,
-    /// Fuente con probe en vuelo (evita lanzar dos probes seguidos).
-    probing: Option<String>,
+    /// Paths con probe en vuelo (evita lanzar dos probes seguidos en paralelo).
+    probing: HashSet<String>,
     /// Canal de resultados de probes en segundo plano (tx/rx).
     probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
     probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
@@ -668,7 +668,7 @@ impl App {
             sources: Self::build_sources(&state, source_tab, None, &HashMap::new()),
             source_tab,
             health: HashMap::new(),
-            probing: None,
+            probing: HashSet::new(),
             probe_rx: Some(probe_rx),
             probe_tx: Some(probe_tx),
             // usize::MAX: el primer frame detecta la selección inicial (item 0)
@@ -714,9 +714,6 @@ impl App {
     // ── layout ────────────────────────────────────────────────────────
 
     pub fn compute_layout(&mut self, width: u16, height: u16) {
-        // Aplicar resultados de probes de salud terminados (tick por frame)
-        self.poll_probe_results();
-
         let mode_overrides = self.panels.iter().map(|p| (p.kind, p.mode)).collect::<Vec<_>>();
         let modes: [(PanelKind, PanelMode); 5] = {
             let mut arr = [(PanelKind::Sources, PanelMode::default()); 5];
@@ -735,6 +732,12 @@ impl App {
         };
 
         self.layout = layout::compute(width, height, active_sidebar, self.active_panel, &modes);
+
+        // Aplicar resultados de probes de salud terminados y disparar los
+        // probes que correspondan según el layout del frame actual (tick por
+        // frame). Va después del cálculo para conocer la altura real del
+        // panel de Sources (ventana visible).
+        self.poll_probe_results();
     }
 
     // ── helpers de paneles ────────────────────────────────────────────
@@ -757,47 +760,106 @@ impl App {
 
     // ── probe de salud de fuentes (filosofía culling) ─────────────────
 
-    /// Lanza en segundo plano el probe de la fuente bajo el cursor. Se
-    /// re-verifica en cada selección (click o flechas): si algo cambió en
-    /// el exterior, la marca ✗ aparece al volver a pasar por la fuente.
-    /// Nunca bloquea la UI ni se re-probea por tiempo.
-    fn probe_selected(&mut self) {
-        let Some(selected) =
-            self.items_for(PanelKind::Sources).get(self.selected_idx(PanelKind::Sources))
-        else {
-            return;
-        };
-        // Secciones, placeholder y acciones fijas no son fuentes: no probear.
-        if selected.starts_with('\u{1}') || selected == "<sin entradas>" {
-            return;
+    /// Extrae el path probar de una fila del panel de Fuentes. `None` si la
+    /// fila no es una fuente (sección, placeholder o acción fija).
+    fn source_probe_path(item: &str) -> Option<String> {
+        if item.starts_with('\u{1}') || item == "<sin entradas>" {
+            return None;
         }
-        let path = source_path_of(selected).to_string();
+        let path = source_path_of(item).to_string();
         if path == "Abrir sakila.db" || path == "Buscar archivo .db" {
+            return None;
+        }
+        Some(path)
+    }
+
+    /// Paths a probar de una ventana visible de Fuentes: excluye secciones,
+    /// placeholder, acciones fijas y lo ya comprobado (caché) o en vuelo.
+    /// Pura para poder testear el "solo lo visible" sin App.
+    fn visible_probe_targets(
+        items: &[String],
+        window: std::ops::Range<usize>,
+        health: &HashMap<String, bool>,
+        probing: &HashSet<String>,
+    ) -> Vec<String> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| window.contains(i))
+            .filter_map(|(_, item)| Self::source_probe_path(item))
+            .filter(|p| !health.contains_key(p) && !probing.contains(p))
+            .collect()
+    }
+
+    /// Lanza el probe de un path en segundo plano. `use_cache = true` (probe
+    /// de la ventana visible): solo si nunca se comprobó; `false` (selección
+    /// actual): re-verifica siempre, porque el usuario espera ver en vivo si
+    /// la fuente bajo el cursor cambió.
+    fn probe_path(&mut self, path: String, use_cache: bool) {
+        if self.probing.contains(&path) {
             return;
         }
-        if self.probing.as_deref() == Some(&path) {
+        if use_cache && self.health.contains_key(&path) {
             return;
         }
         let Some(tx) = self.probe_tx.clone() else { return };
-        self.probing = Some(path.clone());
+        self.probing.insert(path.clone());
         tokio::spawn(async move {
             let ok = probe_source(&path);
             let _ = tx.send((path, ok));
         });
     }
 
+    /// Probe de la fuente bajo el cursor. Se re-verifica en cada selección
+    /// (click o flechas): si algo cambió en el exterior, la marca ✗ aparece
+    /// al volver a pasar por la fuente. Nunca bloquea la UI.
+    fn probe_selected(&mut self) {
+        let Some(selected) =
+            self.items_for(PanelKind::Sources).get(self.selected_idx(PanelKind::Sources))
+        else {
+            return;
+        };
+        let Some(path) = Self::source_probe_path(selected) else { return };
+        self.probe_path(path, false);
+    }
+
+    /// Probe de las fuentes SOLO VISIBLES ahora mismo en el panel (ventana
+    /// `scroll_offset..+altura real`): al arrancar se comprueban las pocas
+    /// filas que caben en pantalla, no las 200 de la lista. Cada path se
+    /// verifica a lo sumo una vez por arranque (caché), así no hay bucles de
+    /// re-probe cuando los resultados reordenan la lista.
+    fn probe_visible(&mut self) {
+        let rect = self
+            .layout
+            .panels
+            .iter()
+            .find(|(k, _)| *k == PanelKind::Sources)
+            .map(|(_, r)| *r)
+            .unwrap_or_default();
+        // Interior del panel sin bordes: filas de lista realmente visibles.
+        let inner_h = usize::from(rect.height.saturating_sub(2));
+        if inner_h == 0 {
+            return;
+        }
+        let offset = self.panel(PanelKind::Sources).scroll_offset.get();
+        let items = self.items_for(PanelKind::Sources).to_vec();
+        let window = offset..offset.saturating_add(inner_h);
+        let targets = Self::visible_probe_targets(&items, window, &self.health, &self.probing);
+        for path in targets {
+            self.probe_path(path, true);
+        }
+    }
+
     /// Aplica los resultados de probes terminados (llamado cada frame en
-    /// `compute_layout`) y dispara el probe de la fuente seleccionada si la
-    /// selección cambió por cualquier vía.
+    /// `compute_layout`) y dispara los probes pendientes: la fuente recién
+    /// seleccionada y las nuevas filas visibles de Fuentes.
     fn poll_probe_results(&mut self) {
         let Some(rx) = self.probe_rx.as_mut() else { return };
         while let Ok((path, ok)) = rx.try_recv() {
             // Rebuild solo si el estado cambió (primera verificación o ✗ ↔ ok)
             let changed = self.health.get(&path) != Some(&ok);
             self.health.insert(path.clone(), ok);
-            if self.probing.as_deref() == Some(&path) {
-                self.probing = None;
-            }
+            self.probing.remove(&path);
             if changed {
                 self.sources = Self::build_sources(
                     &self.state,
@@ -808,16 +870,21 @@ impl App {
             }
         }
 
-        // La selección de Sources cambia por vías que no pasan por
-        // `set_selected_idx` (flechas y click escriben `selected_idx`
-        // directo): el tick detecta el cambio y comprueba la fuente recién
-        // seleccionada. Con `last_probed_idx = usize::MAX` al arrancar, el
-        // primer frame también comprueba la selección inicial.
+        // Selección de Sources bajo el cursor: la navegación (flechas, click,
+        // drag) escribe `selected_idx` directo, sin pasar por set_selected_idx;
+        // el tick detecta el cambio y re-verifica la fuente recién seleccionada
+        // (siempre, sin caché). Con `last_probed_idx = usize::MAX` al arrancar,
+        // el primer frame comprueba la selección inicial.
         let idx = self.selected_idx(PanelKind::Sources);
         if idx != self.last_probed_idx {
             self.last_probed_idx = idx;
             self.probe_selected();
         }
+
+        // Ventana visible: si el scroll o la altura del panel cambió, hay filas
+        // nuevas en pantalla que nunca se comprobaron → probearlas (una sola
+        // vez por path gracias a la caché).
+        self.probe_visible();
     }
 
     // ── navegación de foco ────────────────────────────────────────────
@@ -3161,6 +3228,54 @@ mod tests {
             sources_connected.iter().any(|s| s.starts_with(&format!("● ✗ ▣ {canonical_caida}"))),
             "conectada + caída = '● ✗': {sources_connected:?}"
         );
+    }
+
+    #[test]
+    fn source_probe_path_ignora_secciones_placeholder_y_acciones() {
+        assert_eq!(App::source_probe_path("\u{1}RECIENTES"), None, "sección");
+        assert_eq!(App::source_probe_path("<sin entradas>"), None, "placeholder");
+        assert_eq!(App::source_probe_path("Abrir sakila.db"), None, "acción fija");
+        assert_eq!(App::source_probe_path("Buscar archivo .db"), None, "acción fija 2");
+        // Fuentes reales → path limpio (marcas y prefijos fuera)
+        assert_eq!(App::source_probe_path("▣ /tmp/a.db"), Some("/tmp/a.db".to_string()));
+        assert_eq!(
+            App::source_probe_path("M mysql://db.azure.com/prod"),
+            Some("mysql://db.azure.com/prod".to_string())
+        );
+    }
+
+    #[test]
+    fn visible_probe_targets_solo_lo_visible_y_no_comprobado() {
+        let items = vec![
+            source_section("RECIENTES"),
+            "▣ /tmp/one.db".to_string(),
+            "▣ /tmp/two.db".to_string(),
+            "▣ /tmp/three.db".to_string(),
+            "<sin entradas>".to_string(),
+            "Abrir sakila.db".to_string(),
+        ];
+        // one.db ya comprobado (caché), two.db en vuelo
+        let mut health = HashMap::new();
+        health.insert("/tmp/one.db".to_string(), false);
+        let mut probing = HashSet::new();
+        probing.insert("/tmp/two.db".to_string());
+
+        // Ventana completa: solo queda three.db
+        let targets = App::visible_probe_targets(&items, 0..6, &health, &probing);
+        assert_eq!(targets, vec!["/tmp/three.db".to_string()]);
+
+        // Ventana parcial (filas 0..2 = sección + one.db): nada nuevo
+        let targets = App::visible_probe_targets(&items, 0..2, &health, &probing);
+        assert!(targets.is_empty());
+
+        // Ventana 0..3: sección + one.db + two.db → los tres filtrados
+        let targets = App::visible_probe_targets(&items, 0..3, &health, &probing);
+        assert!(targets.is_empty());
+
+        // Ventana desplazada (2..6): two.db (en vuelo), three.db, placeholder,
+        // acción → solo three.db
+        let targets = App::visible_probe_targets(&items, 2..6, &health, &probing);
+        assert_eq!(targets, vec!["/tmp/three.db".to_string()]);
     }
 
     #[test]
