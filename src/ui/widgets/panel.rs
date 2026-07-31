@@ -6,9 +6,7 @@ use ratatui::{
     prelude::*,
     text::Line as RatLine,
     text::Span,
-    widgets::{
-        Block, Borders, Cell, List, ListItem, ListState, Row, Table, TableState,
-    },
+    widgets::{Block, Borders, Cell, List, ListItem, ListState, Row, Table, TableState},
 };
 
 use crate::app::{PanelKind, PanelMode};
@@ -122,7 +120,16 @@ pub fn render_data_table(
 
     if col_count == 1 {
         // Una sola columna: delegar al List normal (│ no tiene sentido)
-        return render_expanded(frame, area, PanelKind::Detail, title, items, selected_idx, scroll_offset, focused);
+        return render_expanded(
+            frame,
+            area,
+            PanelKind::Detail,
+            title,
+            items,
+            selected_idx,
+            scroll_offset,
+            focused,
+        );
     }
 
     // Ancho disponible para celdas (inner sin bordes)
@@ -172,7 +179,11 @@ pub fn render_data_table(
     // tarden N frames en mostrarse. Cuando la selección sale del viewport,
     // el scroll salta inmediatamente a la posición que la mantiene visible.
     let data_len = items.len().saturating_sub(1);
-    let data_selected = if selected_idx == 0 { 0 } else { selected_idx.saturating_sub(1).min(data_len.saturating_sub(1)) };
+    let data_selected = if selected_idx == 0 {
+        0
+    } else {
+        selected_idx.saturating_sub(1).min(data_len.saturating_sub(1))
+    };
 
     let vp_data = viewport.saturating_sub(3); // filas de datos visibles
     let max_scroll = data_len.saturating_sub(vp_data);
@@ -196,10 +207,8 @@ pub fn render_data_table(
 
     // Fila 0: Espaciador entre los tabs (título del borde) y la tabla
     {
-        let spacer: Vec<Cell<'_>> = cell_widths
-            .iter()
-            .map(|&w| Cell::from(" ".repeat(w)))
-            .collect();
+        let spacer: Vec<Cell<'_>> =
+            cell_widths.iter().map(|&w| Cell::from(" ".repeat(w))).collect();
         all_rows.push(Row::new(spacer).height(1));
     }
 
@@ -294,7 +303,10 @@ pub fn render_data_table(
                     let prefix = if is_selected { "▸" } else { " " };
                     let text = format!("{prefix}{truncated:<iw$} │");
                     if is_selected {
-                        Cell::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+                        Cell::from(Span::styled(
+                            text,
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ))
                     } else {
                         Cell::from(text)
                     }
@@ -303,7 +315,10 @@ pub fn render_data_table(
                     let truncated = truncate_middle(val, iw);
                     let text = format!(" {truncated:<iw$} │");
                     if is_selected {
-                        Cell::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+                        Cell::from(Span::styled(
+                            text,
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ))
                     } else {
                         Cell::from(text)
                     }
@@ -312,7 +327,10 @@ pub fn render_data_table(
                     let truncated = truncate_middle(val, iw);
                     let text = format!(" {truncated:<iw$}");
                     if is_selected {
-                        Cell::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+                        Cell::from(Span::styled(
+                            text,
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ))
                     } else {
                         Cell::from(text)
                     }
@@ -322,9 +340,7 @@ pub fn render_data_table(
         all_rows.push(Row::new(row_cells));
     }
 
-    let table = Table::new(all_rows, widths)
-        .block(panel_block(&title, focused))
-        .column_spacing(0);
+    let table = Table::new(all_rows, widths).block(panel_block(&title, focused)).column_spacing(0);
 
     let mut state = TableState::default().with_selected(None);
     frame.render_stateful_widget(table, area, &mut state);
@@ -344,16 +360,12 @@ pub fn render_data_table(
     if has_h_scroll {
         let max_visible = (inner_w / MIN_COL_W).max(1);
         let max_start = col_count.saturating_sub(max_visible);
-        let thumb_w = (inner_w as f32 * max_visible as f32 / col_count as f32)
-            .round()
-            .max(1.0) as usize;
+        let thumb_w =
+            (inner_w as f32 * max_visible as f32 / col_count as f32).round().max(1.0) as usize;
         let track = inner_w.saturating_sub(thumb_w).max(1);
         // División entera: con vis_start == max_start el thumb toca el borde
-        let thumb_start = if max_start > 0 {
-            vis_start.saturating_mul(track) / max_start
-        } else {
-            0
-        };
+        let thumb_start =
+            if max_start > 0 { vis_start.saturating_mul(track) / max_start } else { 0 };
         // Thumb `▀` (mitad SUPERIOR, mismo grosor que ▄): al quedar pegado
         // arriba, la mitad vacía de la celda actúa como GAP sutil entre la
         // barra y los headers de la tabla — así las tres zonas interactivas
@@ -491,12 +503,7 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
 /// - `track = inner_h - thumb_h` y `thumb_start = offset * track / max_scroll`:
 ///   con `offset == max_scroll` el thumb toca el borde inferior (recorre el 100%).
 /// - Símbolos y estilos idénticos a la barra horizontal: `│` DarkGray / `█` Cyan.
-pub fn draw_v_scrollbar(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    content_len: usize,
-    offset: usize,
-) {
+pub fn draw_v_scrollbar(frame: &mut Frame<'_>, area: Rect, content_len: usize, offset: usize) {
     if area.height < 3 || content_len <= 1 {
         return;
     }
@@ -506,9 +513,7 @@ pub fn draw_v_scrollbar(
         return; // sin scrollbar visible
     }
     let max_scroll = content_len.saturating_sub(viewport);
-    let thumb_h = (inner_h as f32 * viewport as f32 / content_len as f32)
-        .round()
-        .max(1.0) as usize;
+    let thumb_h = (inner_h as f32 * viewport as f32 / content_len as f32).round().max(1.0) as usize;
     let track = inner_h.saturating_sub(thumb_h).max(1);
     // División entera: con offset == max_scroll el thumb toca el borde inferior
     let thumb_start = offset.min(max_scroll).saturating_mul(track) / max_scroll;

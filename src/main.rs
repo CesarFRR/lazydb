@@ -11,8 +11,8 @@ use std::{io, time::Duration};
 use app::App;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -66,12 +66,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                             app.on_key(key);
                         }
                     }
-                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    Event::Mouse(mouse)
+                        if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                    {
                         let size = terminal.size()?;
                         // Decide si es click en barra de scroll (drag) o click normal
                         app.on_mouse_down(mouse.column, mouse.row, size.width, size.height);
                     }
-                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::Drag(MouseButton::Left) => {
+                    Event::Mouse(mouse)
+                        if mouse.kind == MouseEventKind::Drag(MouseButton::Left) =>
+                    {
                         // Arrastre de barra de scroll (click + mover)
                         app.on_mouse_drag(mouse.column, mouse.row);
                     }

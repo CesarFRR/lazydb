@@ -185,11 +185,7 @@ fn list_index_from_click(rel_y: u16, section_height: u16, top_reserved: u16) -> 
 /// derecho). Devuelve `(thumb_w, track)`: el tamaño del thumb y el recorrido
 /// efectivo (en celdas) que el mouse debe cubrir para barrer el scroll completo.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn h_scroll_thumb_geometry(
-    inner_w: usize,
-    col_count: usize,
-    max_visible: usize,
-) -> (usize, f32) {
+fn h_scroll_thumb_geometry(inner_w: usize, col_count: usize, max_visible: usize) -> (usize, f32) {
     let thumb_w = (inner_w as f32 * max_visible as f32 / col_count as f32).round() as usize;
     let track = inner_w.saturating_sub(thumb_w).max(1) as f32;
     (thumb_w, track)
@@ -573,10 +569,7 @@ impl App {
 
     pub fn items_for(&self, kind: PanelKind) -> &[String] {
         // Si hay filtro activo y es el panel activo, devolver filtrados
-        if !self.filtered_items.is_empty()
-            && self.active_panel == kind
-            && kind.is_sidebar()
-        {
+        if !self.filtered_items.is_empty() && self.active_panel == kind && kind.is_sidebar() {
             return &self.filtered_items;
         }
         match kind {
@@ -1001,7 +994,10 @@ impl App {
                         self.preview_rows =
                             if rows.is_empty() { vec!["<sin datos>".to_string()] } else { rows };
                         self.preview_loaded_offset = offset;
-                        self.set_selected_idx(PanelKind::Detail, usize::from(self.preview_rows.len() > 1));
+                        self.set_selected_idx(
+                            PanelKind::Detail,
+                            usize::from(self.preview_rows.len() > 1),
+                        );
                     }
                     Err(err) => {
                         self.preview_rows = vec![format!("Error obteniendo filas: {err}")];
@@ -1104,9 +1100,7 @@ impl App {
         }
 
         #[allow(clippy::cast_possible_truncation)]
-        let limit = self
-            .rows_per_page
-            .min(self.total_rows.saturating_sub(next_offset as u32));
+        let limit = self.rows_per_page.min(self.total_rows.saturating_sub(next_offset as u32));
 
         if limit == 0 {
             return;
@@ -1306,12 +1300,7 @@ impl App {
         self.status = format!("Exportando a {filename}...");
 
         match std::process::Command::new("sqlite3")
-            .args([
-                "-header",
-                "-csv",
-                &path,
-                &sql,
-            ])
+            .args(["-header", "-csv", &path, &sql])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -1466,17 +1455,15 @@ impl App {
         } else {
             let items = self.original_items_for(self.active_panel);
             let query = self.filter_query.to_ascii_lowercase();
-            let filtered: Vec<String> = items
-                .iter()
-                .filter(|s| s.to_ascii_lowercase().contains(&query))
-                .cloned()
-                .collect();
+            let filtered: Vec<String> =
+                items.iter().filter(|s| s.to_ascii_lowercase().contains(&query)).cloned().collect();
             if filtered.is_empty() {
                 self.status = format!("Sin resultados para: {query}");
                 self.filtered_items.clear();
             } else {
                 self.filtered_items = filtered;
-                self.status = format!("Filtro: {} ({})", self.filter_query, self.filtered_items.len());
+                self.status =
+                    format!("Filtro: {} ({})", self.filter_query, self.filtered_items.len());
             }
         }
         self.input_mode = InputMode::Normal;
@@ -1500,11 +1487,8 @@ impl App {
         }
         let items = self.original_items_for(self.active_panel);
         let query = self.filter_query.to_ascii_lowercase();
-        let filtered: Vec<String> = items
-            .iter()
-            .filter(|s| s.to_ascii_lowercase().contains(&query))
-            .cloned()
-            .collect();
+        let filtered: Vec<String> =
+            items.iter().filter(|s| s.to_ascii_lowercase().contains(&query)).cloned().collect();
         if filtered.is_empty() {
             self.filtered_items.clear();
             self.status = format!("Filtrar: {} (sin resultados)", self.filter_query);
@@ -1796,9 +1780,8 @@ impl App {
                     let current_row = self.preview_loaded_offset
                         + self.selected_idx(PanelKind::Detail) as u32
                         - 1;
-                    let new_row = (current_row + self.rows_per_page).min(
-                        self.total_rows.saturating_sub(1),
-                    );
+                    let new_row =
+                        (current_row + self.rows_per_page).min(self.total_rows.saturating_sub(1));
                     self.current_page = new_row / self.rows_per_page;
                     self.refresh_preview_from_selected_object();
                 }
@@ -1885,10 +1868,7 @@ impl App {
             } // ── drop `p` ──
 
             // Header bypass para Data tab no enfocado
-            if target == PanelKind::Detail
-                && self.detail_tab == DetailTab::Data
-                && items_len > 1
-            {
+            if target == PanelKind::Detail && self.detail_tab == DetailTab::Data && items_len > 1 {
                 let p = self.panel_mut(target);
                 if p.selected_idx == 0 {
                     p.selected_idx = 1;
@@ -1896,10 +1876,7 @@ impl App {
             }
 
             // Scroll infinito en Data tab no enfocado
-            if target == PanelKind::Detail
-                && self.detail_tab == DetailTab::Data
-                && items_len > 1
-            {
+            if target == PanelKind::Detail && self.detail_tab == DetailTab::Data && items_len > 1 {
                 if !up && old_idx == items_len.saturating_sub(1) {
                     self.scroll_down_infinite();
                 } else if up && old_idx == 1 && self.preview_loaded_offset > 0 {
@@ -1946,11 +1923,9 @@ impl App {
         #[allow(clippy::cast_possible_truncation)]
         let base = i64::from(rect.x) + 1;
 
-        for (tab, word) in [
-            (SourceTab::All, "Todo"),
-            (SourceTab::Local, "Local"),
-            (SourceTab::Online, "Online"),
-        ] {
+        for (tab, word) in
+            [(SourceTab::All, "Todo"), (SourceTab::Local, "Local"), (SourceTab::Online, "Online")]
+        {
             if let Some(pos) = title.find(word) {
                 let start = base + pos as i64;
                 let end = start + word.len() as i64;
@@ -2007,11 +1982,7 @@ impl App {
         }
         let max_visible = (inner_w / MIN_COL_W).max(1);
         let max_start = max_cols.saturating_sub(max_visible);
-        let next = if dir < 0 {
-            current.saturating_sub(1)
-        } else {
-            (current + 1).min(max_start)
-        };
+        let next = if dir < 0 { current.saturating_sub(1) } else { (current + 1).min(max_start) };
         if next != current {
             self.panel_mut(PanelKind::Detail).h_scroll.set(next);
         }
@@ -2120,11 +2091,8 @@ impl App {
         };
         match drag {
             DragState::HScroll => {
-                if let Some(&(_, rect)) = self
-                    .layout
-                    .panels
-                    .iter()
-                    .find(|(k, _)| *k == PanelKind::Detail)
+                if let Some(&(_, rect)) =
+                    self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
                 {
                     let headers: Vec<&str> = self
                         .preview_rows
@@ -2143,9 +2111,7 @@ impl App {
                 }
             }
             DragState::VScroll(kind) => {
-                if let Some(&(_, rect)) =
-                    self.layout.panels.iter().find(|(k, _)| *k == kind)
-                {
+                if let Some(&(_, rect)) = self.layout.panels.iter().find(|(k, _)| *k == kind) {
                     let items_len = self.items_len_for(kind);
                     let viewport = usize::from(rect.height.saturating_sub(2));
                     let max_scroll = items_len.saturating_sub(viewport);
@@ -2174,11 +2140,7 @@ impl App {
         if self.detail_tab != DetailTab::Data {
             return false;
         }
-        let Some(&(_, rect)) = self
-            .layout
-            .panels
-            .iter()
-            .find(|(k, _)| *k == PanelKind::Detail)
+        let Some(&(_, rect)) = self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
         else {
             return false;
         };
@@ -2281,10 +2243,8 @@ impl App {
             let mh = height.saturating_mul(70) / 100;
             let mx = width.saturating_sub(mw) / 2;
             let my = height.saturating_sub(mh) / 2;
-            let inside = x >= mx
-                && x < mx.saturating_add(mw)
-                && y >= my
-                && y < my.saturating_add(mh);
+            let inside =
+                x >= mx && x < mx.saturating_add(mw) && y >= my && y < my.saturating_add(mh);
             if inside {
                 // Click dentro del modal: sin acción
                 return;
@@ -2336,11 +2296,8 @@ impl App {
 
             // Click en un ítem de la lista
             // Para Data tab, las filas de datos empiezan en rel_y=4 (spacer+header+separator)
-            let top_reserved = if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
-                3
-            } else {
-                0
-            };
+            let top_reserved =
+                if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data { 3 } else { 0 };
             if let Some(mut index) = list_index_from_click(rel_y, rect.height, top_reserved) {
                 if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
                     // +1 porque selected_idx=0 salta el header (primera fila de datos es idx=1)
