@@ -597,6 +597,10 @@ pub struct App {
     /// se prueban las fuentes que el usuario selecciona (click o flechas),
     /// nunca toda la lista ni por tiempo.
     pub health: HashMap<String, bool>,
+    /// Índice de Sources probeado por última vez: el tick detecta cambios de
+    /// selección por CUALQUIER vía (flechas, click, drag, foco) comparando
+    /// este valor, porque la navegación escribe `selected_idx` directo.
+    last_probed_idx: usize,
     /// Fuente con probe en vuelo (evita lanzar dos probes seguidos).
     probing: Option<String>,
     /// Canal de resultados de probes en segundo plano (tx/rx).
@@ -667,6 +671,9 @@ impl App {
             probing: None,
             probe_rx: Some(probe_rx),
             probe_tx: Some(probe_tx),
+            // usize::MAX: el primer frame detecta la selección inicial (item 0)
+            // y la comprueba al arrancar.
+            last_probed_idx: usize::MAX,
             tables: vec![],
             views: vec![],
             advanced: vec![],
@@ -746,11 +753,6 @@ impl App {
 
     fn set_selected_idx(&mut self, kind: PanelKind, idx: usize) {
         self.panel_mut(kind).selected_idx = idx;
-        if kind == PanelKind::Sources {
-            // Probe de salud perezoso: al mover el cursor por Fuentes se
-            // comprueba la fuente recién seleccionada (en segundo plano).
-            self.probe_selected();
-        }
     }
 
     // ── probe de salud de fuentes (filosofía culling) ─────────────────
@@ -765,7 +767,14 @@ impl App {
         else {
             return;
         };
+        // Secciones, placeholder y acciones fijas no son fuentes: no probear.
+        if selected.starts_with('\u{1}') || selected == "<sin entradas>" {
+            return;
+        }
         let path = source_path_of(selected).to_string();
+        if path == "Abrir sakila.db" || path == "Buscar archivo .db" {
+            return;
+        }
         if self.probing.as_deref() == Some(&path) {
             return;
         }
@@ -778,7 +787,8 @@ impl App {
     }
 
     /// Aplica los resultados de probes terminados (llamado cada frame en
-    /// `compute_layout`).
+    /// `compute_layout`) y dispara el probe de la fuente seleccionada si la
+    /// selección cambió por cualquier vía.
     fn poll_probe_results(&mut self) {
         let Some(rx) = self.probe_rx.as_mut() else { return };
         while let Ok((path, ok)) = rx.try_recv() {
@@ -796,6 +806,17 @@ impl App {
                     &self.health,
                 );
             }
+        }
+
+        // La selección de Sources cambia por vías que no pasan por
+        // `set_selected_idx` (flechas y click escriben `selected_idx`
+        // directo): el tick detecta el cambio y comprueba la fuente recién
+        // seleccionada. Con `last_probed_idx = usize::MAX` al arrancar, el
+        // primer frame también comprueba la selección inicial.
+        let idx = self.selected_idx(PanelKind::Sources);
+        if idx != self.last_probed_idx {
+            self.last_probed_idx = idx;
+            self.probe_selected();
         }
     }
 
