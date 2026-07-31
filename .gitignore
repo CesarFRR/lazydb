@@ -1,1 +1,9 @@
 /target
+/Ejemplos-proyectos-de-la-comunidad
+
+# Artefactos locales regenerables (no se versionan)
+/graphify-out
+/analisis-comunidad
+
+# Bases de datos de prueba
+*.db
