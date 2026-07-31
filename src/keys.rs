@@ -63,6 +63,10 @@ pub enum AppAction {
     ExportCsv,
     /// Iniciar filtro de búsqueda /
     StartFilter,
+    /// Scroll horizontal de columnas (shift+h)
+    HScrollLeft,
+    /// Scroll horizontal de columnas (shift+l)
+    HScrollRight,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +173,10 @@ impl Default for Keymap {
         bindings.insert("e".to_string(), AppAction::ExportCsv);
         bindings.insert("/".to_string(), AppAction::StartFilter);
 
+        // ── scroll horizontal de columnas (Data tab) ──
+        bindings.insert("shift+h".to_string(), AppAction::HScrollLeft);
+        bindings.insert("shift+l".to_string(), AppAction::HScrollRight);
+
         Self { bindings }
     }
 }
@@ -196,6 +204,11 @@ fn token_from_key(key: KeyEvent) -> Option<String> {
         KeyCode::Right => Some("right".to_string()),
         KeyCode::PageUp => Some("pgup".to_string()),
         KeyCode::PageDown => Some("pgdn".to_string()),
+        // Mayúsculas → "shift+x" (independiente de si el terminal reporta
+        // el modifier SHIFT explícito; Konsole a veces solo envía la letra)
+        KeyCode::Char(ch) if ch.is_uppercase() => {
+            Some(format!("shift+{}", ch.to_ascii_lowercase()))
+        }
         KeyCode::Char(ch) => Some(ch.to_ascii_lowercase().to_string()),
         _ => None,
     }
@@ -244,6 +257,8 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "yank" => Some(AppAction::Yank),
         "export_csv" => Some(AppAction::ExportCsv),
         "start_filter" => Some(AppAction::StartFilter),
+        "h_scroll_left" => Some(AppAction::HScrollLeft),
+        "h_scroll_right" => Some(AppAction::HScrollRight),
         _ => None,
     }
 }

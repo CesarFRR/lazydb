@@ -5,6 +5,7 @@ use ratatui::prelude::Rect;
 
 use crate::app::panel::{Panel, PanelKind, PanelMode};
 use crate::ui::layout::{self, ComputedLayout};
+use crate::ui::widgets::panel::MIN_COL_W;
 use crate::{config, db, keys, query, storage};
 
 #[allow(dead_code)]
@@ -79,6 +80,15 @@ impl ObjectSection {
 pub enum InputMode {
     Normal,
     Filtering,
+}
+
+/// Estado de arrastre del mouse sobre una barra de scroll (click + drag).
+#[derive(Clone, Copy, Debug)]
+enum DragState {
+    /// Arrastrando la barra de scroll horizontal del Data tab
+    HScroll,
+    /// Arrastrando el scrollbar vertical de un panel
+    VScroll(PanelKind),
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -168,6 +178,32 @@ fn list_index_from_click(rel_y: u16, section_height: u16, top_reserved: u16) -> 
     Some(usize::from(rel_y.saturating_sub(inner_top)))
 }
 
+/// Geometría del thumb de la barra de scroll horizontal.
+///
+/// El recorrido real del thumb es `track = inner_w - thumb_w` (el thumb tiene
+/// ancho proporcional a las columnas visibles y por eso nunca llega al borde
+/// derecho). Devuelve `(thumb_w, track)`: el tamaño del thumb y el recorrido
+/// efectivo (en celdas) que el mouse debe cubrir para barrer el scroll completo.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn h_scroll_thumb_geometry(
+    inner_w: usize,
+    col_count: usize,
+    max_visible: usize,
+) -> (usize, f32) {
+    let thumb_w = (inner_w as f32 * max_visible as f32 / col_count as f32).round() as usize;
+    let track = inner_w.saturating_sub(thumb_w).max(1) as f32;
+    (thumb_w, track)
+}
+
+/// Geometría del thumb del scrollbar vertical.
+/// Devuelve `(thumb_h, track)` — análogo a `h_scroll_thumb_geometry`.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn v_scroll_thumb_geometry(panel_h: u16, items_len: usize, viewport: usize) -> (usize, f32) {
+    let thumb_h = (f32::from(panel_h) * viewport as f32 / items_len as f32).round() as usize;
+    let track = usize::from(panel_h).saturating_sub(thumb_h).max(1) as f32;
+    (thumb_h, track)
+}
+
 /// Timestamp en milisegundos para detección de doble-click.
 fn now_millis() -> u64 {
     #[allow(clippy::cast_possible_truncation)]
@@ -188,6 +224,32 @@ fn is_online_source(value: &str) -> bool {
 
 fn is_local_source(value: &str) -> bool {
     !is_online_source(value)
+}
+
+/// Escanea el directorio de trabajo actual (donde se ejecuta `cargo run` /
+/// lazydb) buscando archivos de base de datos SQLite: `*.db`, `*.sqlite` y
+/// `*.sqlite3`. Devuelve los paths completos ordenados alfabéticamente.
+fn scan_cwd_databases() -> Vec<String> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&cwd) else {
+        return Vec::new();
+    };
+    let mut dbs: Vec<String> = entries
+        .flatten()
+        .filter(|e| {
+            let path = e.path();
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| matches!(ext, "db" | "sqlite" | "sqlite3"))
+        })
+        .filter_map(|e| e.path().to_str().map(str::to_string))
+        .collect();
+    dbs.sort();
+    dbs
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +313,13 @@ pub struct App {
     pub input_mode: InputMode,
     pub filter_query: String,
     pub filtered_items: Vec<String>,
+
+    // ── ordenamiento de columnas en Data tab ──
+    pub sort_column: Option<String>,
+    pub sort_asc: bool,
+
+    // ── arrastre de barras de scroll (click + drag con mouse) ──
+    drag: Option<DragState>,
 }
 
 impl App {
@@ -316,6 +385,9 @@ impl App {
             input_mode: InputMode::Normal,
             filter_query: String::new(),
             filtered_items: Vec::new(),
+            sort_column: None,
+            sort_asc: true,
+            drag: None,
         }
     }
 
@@ -617,6 +689,10 @@ impl App {
                 for fav in favorites {
                     push_unique(fav, &mut sources);
                 }
+                // DBs SQLite de la carpeta actual (donde se ejecuta lazydb)
+                for db in scan_cwd_databases() {
+                    push_unique(db, &mut sources);
+                }
             }
             SourceTab::Local => {
                 for recent in &state.recents {
@@ -630,6 +706,10 @@ impl App {
                     if is_local_source(path) {
                         push_unique(format!("{name} => {path}"), &mut sources);
                     }
+                }
+                // DBs SQLite de la carpeta actual (son locales por definición)
+                for db in scan_cwd_databases() {
+                    push_unique(db, &mut sources);
                 }
             }
             SourceTab::Online => {
@@ -847,6 +927,8 @@ impl App {
         self.rows_per_page = self.optimal_rows_per_page();
         // Reset scroll_offset del viewport al recargar completamente los datos
         self.panel_mut(PanelKind::Detail).scroll_offset.set(0);
+        // Reset scroll horizontal: el nuevo objeto puede tener otras columnas
+        self.panel_mut(PanelKind::Detail).h_scroll.set(0);
         let Some(path) = self.db_path.as_deref() else {
             return;
         };
@@ -907,11 +989,13 @@ impl App {
                 }
 
                 let offset = self.current_page.saturating_mul(self.rows_per_page);
-                match db::backends::sqlite::table_rows(
+                let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
+                match db::backends::sqlite::table_rows_sorted(
                     path,
                     &object_name,
                     self.rows_per_page,
                     offset,
+                    order_col,
                 ) {
                     Ok(rows) => {
                         self.preview_rows =
@@ -1031,12 +1115,14 @@ impl App {
         self.is_loading = true;
         self.status = format!("Cargando más filas (offset {next_offset})...");
 
+        let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
         #[allow(clippy::cast_possible_truncation)]
-        if let Ok(rows) = crate::db::backends::sqlite::table_rows(
+        if let Ok(rows) = crate::db::backends::sqlite::table_rows_sorted(
             path,
             &object,
             limit,
             next_offset as u32,
+            order_col,
         ) {
             // rows[0] es header (lo descartamos, ya tenemos el nuestro)
             // rows[1..] son las filas de datos nuevas
@@ -1078,8 +1164,9 @@ impl App {
         self.is_loading = true;
         self.status = format!("Cargando filas anteriores (offset {offset})...");
 
+        let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
         if let Ok(rows) =
-            crate::db::backends::sqlite::table_rows(path, &object, limit, offset)
+            crate::db::backends::sqlite::table_rows_sorted(path, &object, limit, offset, order_col)
         {
             // rows[0] es header (lo descartamos), rows[1..] son datos nuevos
             if rows.len() <= 1 {
@@ -1263,6 +1350,15 @@ impl App {
     // ── row inspector ─────────────────────────────────────────────────
 
     fn open_row_inspector(&mut self) {
+        self.refresh_row_inspector();
+        self.inspector_scroll.reset();
+        self.show_row_inspector = true;
+    }
+
+    /// Recalcula los pares columna→valor del inspector a partir de la fila
+    /// actualmente seleccionada en el Detail. Se puede llamar en caliente
+    /// (mientras el modal está abierto) para seguir la navegación ↑/↓.
+    fn refresh_row_inspector(&mut self) {
         let Some(path) = self.db_path.as_deref() else {
             return;
         };
@@ -1289,9 +1385,8 @@ impl App {
             .zip(values.iter().chain(std::iter::repeat(&"")))
             .map(|(col, val)| (col.clone(), val.to_string()))
             .collect();
-
+        // Al cambiar de fila, empezar el scroll del modal desde arriba
         self.inspector_scroll.reset();
-        self.show_row_inspector = true;
     }
 
     #[allow(clippy::missing_const_for_fn)]
@@ -1557,6 +1652,24 @@ impl App {
     // ── keyboard ──────────────────────────────────────────────────────
 
     #[allow(clippy::too_many_lines)]
+    /// Cierre seguro con Ctrl+C: si hay algo abierto (filtro de búsqueda,
+    /// inspector de fila o menú de acciones) primero se cierra, para que el
+    /// usuario en pánico no pierda estado a medias; solo sale de lazydb
+    /// cuando no queda nada abierto. Un segundo Ctrl+C en estado limpio sale.
+    pub fn on_ctrl_c(&mut self) {
+        if self.input_mode == InputMode::Filtering {
+            self.cancel_filter();
+        } else if self.show_row_inspector {
+            self.close_row_inspector();
+        } else if self.show_actions_menu {
+            self.show_actions_menu = false;
+            self.actions_menu_idx = 0;
+            self.status = "".to_string();
+        } else {
+            self.should_quit = true;
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         // ── modo filtro: capturar teclas antes del mapeo de acciones ──
         if self.input_mode == InputMode::Filtering {
@@ -1588,8 +1701,15 @@ impl App {
                 | keys::AppAction::ToggleActionsMenu => {
                     self.close_row_inspector();
                 }
-                keys::AppAction::MoveUp => self.inspector_scroll.scroll_up(),
-                keys::AppAction::MoveDown => self.inspector_scroll.scroll_down(),
+                // ↑/↓ navegan la tabla de datos y el modal se actualiza en vivo
+                keys::AppAction::MoveUp => {
+                    self.move_selection(-1);
+                    self.refresh_row_inspector();
+                }
+                keys::AppAction::MoveDown => {
+                    self.move_selection(1);
+                    self.refresh_row_inspector();
+                }
                 _ => {}
             }
             return;
@@ -1629,6 +1749,8 @@ impl App {
             keys::AppAction::Yank => self.yank_selected(),
             keys::AppAction::ExportCsv => self.export_csv(),
             keys::AppAction::StartFilter => self.start_filter(),
+            keys::AppAction::HScrollLeft => self.on_h_scroll(-1),
+            keys::AppAction::HScrollRight => self.on_h_scroll(1),
             keys::AppAction::ToggleCurrentPanel => self.toggle_active_panel(),
             keys::AppAction::QuitOrBack => {
                 if self.active_panel == PanelKind::Detail {
@@ -1787,24 +1909,55 @@ impl App {
         }
     }
 
-    /// Detecta qué tab del título de Detail fue clickeado
-    /// Detección de click en pestañas del título de Detail.
-    /// Formato: "[5] Datos - P1/11 | Esquema | SQL | Meta |"
+    /// Detecta qué tab del título de Detail fue clickeado.
+    /// Formato del título: "[5] [ Datos - row 1/300 ] |  Esquema  |  SQL  |  Meta  | "
     fn detect_detail_tab_click(&self, cursor_x: u16, rect: Rect) -> Option<DetailTab> {
         let available = self.available_detail_tabs();
         let num = PanelKind::Detail.number();
-        // Saltar "[5]" (4 chars aprox) + 1 espacio
         let prefix = format!("[{num}]");
+        // El texto del título empieza en rect.x + 1 (después de la esquina ┌
+        // del borde); las pestañas empiezan después del "[N]"
         #[allow(clippy::cast_possible_truncation)]
-        let mut cursor = rect.x + prefix.len() as u16;
+        let mut cursor = rect.x + 1 + prefix.len() as u16;
 
         for &tab in &available {
             let text_w = self.detail_tab_display_width(tab);
             if cursor_x >= cursor && cursor_x < cursor + text_w {
                 return Some(tab);
             }
-            // " | " = 3 chars
-            cursor += text_w + 3;
+            // Separador REAL entre tabs: "|" (1 char, ver title_for → parts.join("|"))
+            cursor += text_w + 1;
+        }
+        None
+    }
+
+    /// Detecta qué tab de Fuentes fue clickeado en el título del panel.
+    /// Título: "[1]Fuentes (Todo [Local] Online)" — los corchetes marcan el
+    /// tab activo. Busca la posición real de cada palabra dentro del string
+    /// del título (que empieza en rect.x + 1, después de la esquina ┌).
+    fn detect_source_tab_click(&self, cursor_x: u16, rect: Rect) -> Option<SourceTab> {
+        let num = PanelKind::Sources.number();
+        let tabs = match self.source_tab {
+            SourceTab::All => "[Todo] Local Online",
+            SourceTab::Local => "Todo [Local] Online",
+            SourceTab::Online => "Todo Local [Online]",
+        };
+        let title = format!("[{num}]Fuentes ({tabs})");
+        #[allow(clippy::cast_possible_truncation)]
+        let base = i64::from(rect.x) + 1;
+
+        for (tab, word) in [
+            (SourceTab::All, "Todo"),
+            (SourceTab::Local, "Local"),
+            (SourceTab::Online, "Online"),
+        ] {
+            if let Some(pos) = title.find(word) {
+                let start = base + pos as i64;
+                let end = start + word.len() as i64;
+                if i64::from(cursor_x) >= start && i64::from(cursor_x) < end {
+                    return Some(tab);
+                }
+            }
         }
         None
     }
@@ -1829,9 +1982,314 @@ impl App {
         }
     }
 
+    /// Desplaza la ventana de columnas visibles del Data tab.
+    /// `dir`: -1 = izquierda, 1 = derecha.
+    pub fn on_h_scroll(&mut self, dir: i32) {
+        let detail = self.panel(PanelKind::Detail);
+        let current = detail.h_scroll.get();
+        let max_cols = {
+            let headers: Vec<&str> =
+                self.preview_rows.first().map_or_else(|| vec![], |r| r.split(" | ").collect());
+            headers.len()
+        };
+        let inner_w = self
+            .layout
+            .panels
+            .iter()
+            .find(|(k, _)| *k == PanelKind::Detail)
+            .map_or(0, |(_, r)| usize::from(r.width.saturating_sub(2)));
+        if max_cols <= 1 || inner_w == 0 {
+            return;
+        }
+        let total_min = max_cols.saturating_mul(MIN_COL_W);
+        if total_min <= inner_w {
+            return; // todas las columnas caben, no hay scroll horizontal
+        }
+        let max_visible = (inner_w / MIN_COL_W).max(1);
+        let max_start = max_cols.saturating_sub(max_visible);
+        let next = if dir < 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(max_start)
+        };
+        if next != current {
+            self.panel_mut(PanelKind::Detail).h_scroll.set(next);
+        }
+    }
+
+    /// Dado un click en el área del panel Detail (Data tab), calcula a qué columna
+    /// corresponde según la posición X y las columnas parseadas del header.
+    fn column_at_x(&self, x: u16, rect: Rect) -> Option<String> {
+        if self.preview_rows.is_empty() {
+            return None;
+        }
+        let headers: Vec<&str> = self.preview_rows[0].split(" | ").collect();
+        let col_count = headers.len();
+        if col_count <= 1 {
+            return None;
+        }
+        let inner_w = usize::from(rect.width.saturating_sub(2));
+        let h_scroll = self.panel(PanelKind::Detail).h_scroll.get();
+
+        // Misma lógica de ventana que render_data_table
+        let total_min = col_count.saturating_mul(MIN_COL_W);
+        let (vis_start, cell_widths) = if total_min <= inner_w {
+            let cell_base = inner_w / col_count;
+            let widths: Vec<usize> = (0..col_count)
+                .map(|i| {
+                    if i == col_count.saturating_sub(1) {
+                        inner_w.saturating_sub(cell_base * (col_count.saturating_sub(1)))
+                    } else {
+                        cell_base
+                    }
+                })
+                .collect();
+            (0, widths)
+        } else {
+            let max_visible = (inner_w / MIN_COL_W).max(1);
+            let vis_start = h_scroll.min(col_count.saturating_sub(max_visible));
+            let mut widths = vec![MIN_COL_W; max_visible];
+            let rem = inner_w.saturating_sub(max_visible.saturating_mul(MIN_COL_W));
+            if let Some(last) = widths.last_mut() {
+                *last += rem;
+            }
+            (vis_start, widths)
+        };
+
+        let rel_x = usize::from(x.saturating_sub(rect.x + 1));
+        let mut cumul = 0usize;
+        for (i, _w) in cell_widths.iter().enumerate() {
+            cumul += cell_widths[i];
+            if rel_x < cumul {
+                let real_idx = vis_start + i;
+                if real_idx < headers.len() {
+                    return Some(headers[real_idx].trim().to_string());
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Toggle orden por columna: si ya está ordenando por `col`, invierte ASC↔DESC;
+    /// si no, ordena ASC. Si hay un filtro activo, se cancela (el click en header
+    /// ordena y limpia el filtro de una vez).
+    /// Ciclo de 3 estados al hacer click en el header de una columna:
+    /// 1er click → ASC (▴), 2º click → DESC (▾), 3er click → desactivar el
+    /// ordenamiento (vuelve al orden por defecto, sin indicador). Es el patrón
+    /// estándar de tablas (VS Code, Excel, file managers).
+    fn toggle_sort(&mut self, col: String) {
+        if !self.filtered_items.is_empty() || self.input_mode == InputMode::Filtering {
+            self.cancel_filter();
+        }
+        if self.sort_column.as_deref() == Some(col.as_str()) {
+            if self.sort_asc {
+                self.sort_asc = false;
+            } else {
+                // 3er click: desactivar ordenamiento
+                self.sort_column = None;
+                self.sort_asc = true;
+            }
+        } else {
+            self.sort_column = Some(col);
+            self.sort_asc = true;
+        }
+        // Recargar datos desde la página actual con el nuevo orden
+        self.current_page = 0;
+        self.preview_loaded_offset = 0;
+        self.refresh_preview_from_selected_object();
+    }
+
+    /// Punto de entrada para clicks de mouse (Down). Decide si el click cae
+    /// sobre una barra de scroll (inicia drag) o se procesa como click normal.
+    pub fn on_mouse_down(&mut self, x: u16, y: u16, width: u16, height: u16) {
+        if self.try_start_h_scroll_drag(x, y, width, height) {
+            return;
+        }
+        if self.try_start_v_scroll_drag(x, y, width, height) {
+            return;
+        }
+        self.on_mouse_click(x, y, width, height);
+    }
+
+    /// Movimiento del mouse con botón presionado (drag): actualiza la barra
+    /// arrastrada. No valida límites del eje para emular scroll de página web.
+    pub fn on_mouse_drag(&mut self, x: u16, y: u16) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        match drag {
+            DragState::HScroll => {
+                if let Some(&(_, rect)) = self
+                    .layout
+                    .panels
+                    .iter()
+                    .find(|(k, _)| *k == PanelKind::Detail)
+                {
+                    let headers: Vec<&str> = self
+                        .preview_rows
+                        .first()
+                        .map_or_else(|| vec![], |r| r.split(" | ").collect());
+                    let col_count = headers.len();
+                    if col_count <= 1 {
+                        return;
+                    }
+                    let inner_w = usize::from(rect.width.saturating_sub(2));
+                    let max_visible = (inner_w / MIN_COL_W).max(1);
+                    let max_start = col_count.saturating_sub(max_visible);
+                    let (_, track) = h_scroll_thumb_geometry(inner_w, col_count, max_visible);
+                    let rel = f32::from(x.saturating_sub(rect.x + 1));
+                    self.apply_h_drag(rel, max_start, track);
+                }
+            }
+            DragState::VScroll(kind) => {
+                if let Some(&(_, rect)) =
+                    self.layout.panels.iter().find(|(k, _)| *k == kind)
+                {
+                    let items_len = self.items_len_for(kind);
+                    let viewport = usize::from(rect.height.saturating_sub(2));
+                    let max_scroll = items_len.saturating_sub(viewport);
+                    let (_, track) = v_scroll_thumb_geometry(rect.height, items_len, viewport);
+                    let rel = f32::from(y.saturating_sub(rect.y));
+                    self.apply_v_drag(rel, kind, max_scroll, track);
+                }
+            }
+        }
+    }
+
+    /// Suelta del botón: termina el arrastre.
+    pub fn on_mouse_up(&mut self) {
+        self.drag = None;
+    }
+
+    /// ¿El click está sobre la barra de scroll horizontal del Data tab?
+    /// Si sí, inicia el arrastre y mueve el thumb a la posición del click.
+    fn try_start_h_scroll_drag(&mut self, x: u16, y: u16, width: u16, height: u16) -> bool {
+        if width < 40 || height < 10 {
+            return false;
+        }
+        if self.show_row_inspector || self.show_actions_menu {
+            return false;
+        }
+        if self.detail_tab != DetailTab::Data {
+            return false;
+        }
+        let Some(&(_, rect)) = self
+            .layout
+            .panels
+            .iter()
+            .find(|(k, _)| *k == PanelKind::Detail)
+        else {
+            return false;
+        };
+        // La barra está en la fila del espaciador (rect.y + 1), dentro del inner
+        if y != rect.y + 1 || x <= rect.x || x >= rect.x + rect.width - 1 {
+            return false;
+        }
+        let headers: Vec<&str> =
+            self.preview_rows.first().map_or_else(|| vec![], |r| r.split(" | ").collect());
+        let col_count = headers.len();
+        if col_count <= 1 {
+            return false;
+        }
+        let inner_w = usize::from(rect.width.saturating_sub(2));
+        let max_visible = (inner_w / MIN_COL_W).max(1);
+        if col_count.saturating_mul(MIN_COL_W) <= inner_w {
+            return false; // sin scroll horizontal → sin barra
+        }
+        let max_start = col_count.saturating_sub(max_visible);
+
+        // Jump-to-position: el thumb salta para quedar CENTRADO bajo el cursor.
+        // Desde ahí el arrastre es 1:1 (cada celda de mouse = su proporción del
+        // track), así el thumb recorre el 100% del recorrido disponible.
+        let (thumb_w, track) = h_scroll_thumb_geometry(inner_w, col_count, max_visible);
+
+        let rel = f32::from(x.saturating_sub(rect.x + 1));
+        self.drag = Some(DragState::HScroll);
+        self.apply_h_drag(rel - thumb_w as f32 / 2.0, max_start, track);
+        true
+    }
+
+    /// Convierte la X del mouse en posición de h_scroll.
+    /// Mapeo 1:1: cada celda del mouse sobre el track equivale a su proporción
+    /// del scroll total (`track` = recorrido efectivo del thumb), así el thumb
+    /// recorre el 100% del recorrido disponible.
+    fn apply_h_drag(&mut self, rel: f32, max_start: usize, track: f32) {
+        let pct = (rel / track.max(1.0)).clamp(0.0, 1.0);
+        #[allow(clippy::cast_possible_truncation)]
+        let new = (pct * max_start as f32).round() as usize;
+        self.panel_mut(PanelKind::Detail).h_scroll.set(new.min(max_start));
+    }
+
+    /// ¿El click está sobre el scrollbar vertical (última columna) de un panel?
+    /// Si sí, inicia el arrastre y mueve el thumb a la posición del click.
+    fn try_start_v_scroll_drag(&mut self, x: u16, y: u16, width: u16, height: u16) -> bool {
+        if width < 40 || height < 10 {
+            return false;
+        }
+        if self.show_row_inspector || self.show_actions_menu {
+            return false;
+        }
+        for &(kind, rect) in &self.layout.panels {
+            if x != rect.x + rect.width - 1 || y < rect.y || y >= rect.y + rect.height {
+                continue;
+            }
+            // Detail + Data tab no tiene scrollbar vertical (usa el horizontal)
+            if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                continue;
+            }
+            let items_len = self.items_len_for(kind);
+            let viewport = usize::from(rect.height.saturating_sub(2));
+            if items_len <= 1 || items_len <= viewport {
+                continue; // sin scrollbar visible
+            }
+            let max_scroll = items_len.saturating_sub(viewport);
+            let (thumb_h, track) = v_scroll_thumb_geometry(rect.height, items_len, viewport);
+
+            // Jump-to-position: thumb centrado bajo el cursor, luego 1:1
+            let rel = f32::from(y.saturating_sub(rect.y));
+            self.drag = Some(DragState::VScroll(kind));
+            self.apply_v_drag(rel - thumb_h as f32 / 2.0, kind, max_scroll, track);
+            return true;
+        }
+        false
+    }
+
+    /// Convierte la Y del mouse en scroll_offset del panel.
+    /// Mapeo 1:1 (ver `apply_h_drag`).
+    fn apply_v_drag(&mut self, rel: f32, kind: PanelKind, max_scroll: usize, track: f32) {
+        let pct = (rel / track.max(1.0)).clamp(0.0, 1.0);
+        #[allow(clippy::cast_possible_truncation)]
+        let new = (pct * max_scroll as f32).round() as usize;
+        let new = new.min(max_scroll);
+        let p = self.panel_mut(kind);
+        p.scroll_offset.set(new);
+        // La selección sigue al scroll para que el scrollbar (posicionado por
+        // selected_idx) muestre el thumb en el lugar correcto
+        p.selected_idx = new;
+    }
+
     pub fn on_mouse_click(&mut self, x: u16, y: u16, width: u16, height: u16) {
         if width < 40 || height < 10 {
             return;
+        }
+
+        // Click fuera del modal de inspector de fila → cerrarlo y continuar
+        // con el procesamiento normal del click (seleccionar el ítem clickeado).
+        if self.show_row_inspector {
+            let mw = width.saturating_mul(70) / 100;
+            let mh = height.saturating_mul(70) / 100;
+            let mx = width.saturating_sub(mw) / 2;
+            let my = height.saturating_sub(mh) / 2;
+            let inside = x >= mx
+                && x < mx.saturating_add(mw)
+                && y >= my
+                && y < my.saturating_add(mh);
+            if inside {
+                // Click dentro del modal: sin acción
+                return;
+            }
+            self.close_row_inspector();
         }
 
         // Encontrar qué panel fue clickeado usando el layout computado
@@ -1850,40 +2308,44 @@ impl App {
 
             // ¿Click en el título (primera línea)?
             if rel_y == 0 {
-                // Click en título → focus + toggle (si no es Detail)
                 if kind == PanelKind::Detail {
                     // Detectar click en tabs del título
                     if let Some(tab) = self.detect_detail_tab_click(x, rect) {
                         self.set_detail_tab(tab);
                     }
-                    self.set_focus(PanelKind::Detail);
-                } else {
-                    self.set_focus(kind);
+                } else if kind == PanelKind::Sources {
+                    // Detectar click en tabs de Fuentes (Todo/Local/Online)
+                    if let Some(tab) = self.detect_source_tab_click(x, rect) {
+                        self.set_source_tab(tab);
+                    }
                 }
+                self.set_focus(kind);
                 return;
             }
 
             // Click en contenido
             self.set_focus(kind);
 
-            // Para Sources, manejar click en tabs (primeras 3 columnas = tabs)
-            if kind == PanelKind::Sources && rel_y == 1 && rect.width >= 3 {
-                let thirds = rect.width.max(3) / 3;
-                let rel_x = x.saturating_sub(rect.x);
-                if rel_x < thirds {
-                    self.set_source_tab(SourceTab::All);
-                    return;
+            // Click en header de Data tab → ordenar por columna
+            if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data && rel_y == 2 {
+                if let Some(col_name) = self.column_at_x(x, rect) {
+                    self.toggle_sort(col_name);
                 }
-                if rel_x < thirds.saturating_mul(2) {
-                    self.set_source_tab(SourceTab::Local);
-                    return;
-                }
-                self.set_source_tab(SourceTab::Online);
                 return;
             }
 
             // Click en un ítem de la lista
-            if let Some(index) = list_index_from_click(rel_y, rect.height, 0) {
+            // Para Data tab, las filas de datos empiezan en rel_y=4 (spacer+header+separator)
+            let top_reserved = if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                3
+            } else {
+                0
+            };
+            if let Some(mut index) = list_index_from_click(rel_y, rect.height, top_reserved) {
+                if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                    // +1 porque selected_idx=0 salta el header (primera fila de datos es idx=1)
+                    index = index.saturating_add(1);
+                }
                 let max_idx = self.items_len_for(kind).saturating_sub(1);
                 let scroll = self.panel(kind).scroll_offset.get();
                 let p = self.panel_mut(kind);

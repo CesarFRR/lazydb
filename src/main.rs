@@ -11,8 +11,8 @@ use std::{io, time::Duration};
 use app::App;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -49,22 +49,65 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
             return Ok(());
         }
 
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    app.on_key(key);
+        // Esperar eventos con timeout corto (respuesta fluida del mouse).
+        // Una vez que llega el primero, se procesan TODOS los pendientes
+        // (drain) antes de redibujar, para que el drag no se sienta pesado.
+        if event::poll(Duration::from_millis(50))? {
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // Ctrl+C = cierre seguro: primero cierra filtro/menús/
+                        // modales abiertos, y solo sale si no queda nada abierto
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c')
+                        {
+                            app.on_ctrl_c();
+                        } else {
+                            app.on_key(key);
+                        }
+                    }
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                        let size = terminal.size()?;
+                        // Decide si es click en barra de scroll (drag) o click normal
+                        app.on_mouse_down(mouse.column, mouse.row, size.width, size.height);
+                    }
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::Drag(MouseButton::Left) => {
+                        // Arrastre de barra de scroll (click + mover)
+                        app.on_mouse_drag(mouse.column, mouse.row);
+                    }
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::Up(MouseButton::Left) => {
+                        // Soltar botón → terminar arrastre
+                        app.on_mouse_up();
+                    }
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+                        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                            // shift+rueda arriba → columnas a la izquierda
+                            app.on_h_scroll(-1);
+                        } else {
+                            app.on_scroll(true, mouse.column, mouse.row);
+                        }
+                    }
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+                        if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                            // shift+rueda abajo → columnas a la derecha
+                            app.on_h_scroll(1);
+                        } else {
+                            app.on_scroll(false, mouse.column, mouse.row);
+                        }
+                    }
+                    // shift+rueda (terminales que emiten ScrollLeft/ScrollRight)
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollLeft => {
+                        app.on_h_scroll(-1);
+                    }
+                    Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollRight => {
+                        app.on_h_scroll(1);
+                    }
+                    _ => {}
                 }
-                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-                    let size = terminal.size()?;
-                    app.on_mouse_click(mouse.column, mouse.row, size.width, size.height);
+                // Salir del drain cuando no queden eventos encolados
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
-                Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
-                    app.on_scroll(true, mouse.column, mouse.row);
-                }
-                Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
-                    app.on_scroll(false, mouse.column, mouse.row);
-                }
-                _ => {}
             }
         }
     }

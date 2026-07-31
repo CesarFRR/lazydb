@@ -205,6 +205,49 @@ pub fn table_rows(
     Ok(out)
 }
 
+/// Filas con header, con ORDER BY opcional.
+pub fn table_rows_sorted(
+    path: &str,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+    order_col: Option<(&str, bool)>, // (column_name, asc)
+) -> Result<Vec<String>, String> {
+    let conn = open_read_only(path)?;
+    let escaped = table_name.replace('"', "\"\"");
+    let order_clause = if let Some((col, asc)) = order_col {
+        let col_esc = col.replace('"', "\"\"");
+        let dir = if asc { "ASC" } else { "DESC" };
+        format!(" ORDER BY \"{col_esc}\" {dir}")
+    } else {
+        String::new()
+    };
+    let sql = format!("SELECT * FROM \"{escaped}\"{order_clause} LIMIT {limit} OFFSET {offset}");
+
+    let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
+    let mut out = Vec::new();
+    let col_names = stmt.column_names().iter().map(ToString::to_string).collect::<Vec<_>>();
+    if col_names.is_empty() {
+        return Ok(out);
+    }
+    out.push(col_names.join(" | "));
+    let col_count = col_names.len();
+    let rows = stmt
+        .query_map([], |row| {
+            let mut values = Vec::new();
+            for i in 0..col_count {
+                let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
+                values.push(val);
+            }
+            Ok(values.join(" | "))
+        })
+        .map_err(|err| err.to_string())?;
+    for row in rows {
+        out.push(row.map_err(|err| err.to_string())?);
+    }
+    Ok(out)
+}
+
 pub fn table_row_count(path: &str, table_name: &str) -> Result<u32, String> {
     let conn = open_read_only(path)?;
     let escaped = table_name.replace('"', "\"\"");

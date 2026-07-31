@@ -147,19 +147,33 @@ pub struct Panel {
     pub mode: PanelMode,
     /// Índice del ítem seleccionado (cursor)
     pub selected_idx: usize,
-    /// Offset de scroll (primera fila visible)
+    /// Offset de scroll vertical (primera fila visible)
     pub scroll_offset: Cell<usize>,
+    /// Offset de scroll horizontal (primera columna visible en Data tab)
+    pub h_scroll: Cell<usize>,
 }
 
 impl Panel {
     pub fn new(kind: PanelKind) -> Self {
-        Self { kind, mode: PanelMode::default(), selected_idx: 0, scroll_offset: Cell::new(0) }
+        Self {
+            kind,
+            mode: PanelMode::default(),
+            selected_idx: 0,
+            scroll_offset: Cell::new(0),
+            h_scroll: Cell::new(0),
+        }
     }
 
     /// Paneles izquierdos arrancan expandidos, Detalle también.
     /// En la práctica solo 1 izquierdo estará expandido a la vez (el activo).
     pub fn new_sidebar(kind: PanelKind) -> Self {
         debug_assert!(kind.is_sidebar());
-        Self { kind, mode: PanelMode::Expanded, selected_idx: 0, scroll_offset: Cell::new(0) }
+        Self {
+            kind,
+            mode: PanelMode::Expanded,
+            selected_idx: 0,
+            scroll_offset: Cell::new(0),
+            h_scroll: Cell::new(0),
+        }
     }
 }

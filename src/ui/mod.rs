@@ -70,7 +70,10 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
             items,
             panel.selected_idx,
             panel.scroll_offset.get(),
+            panel.h_scroll.get(),
             focused,
+            app.sort_column.as_deref(),
+            app.sort_asc,
         )
     } else {
         widgets::panel::render(
@@ -97,13 +100,13 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width >= 110 {
         let shortcuts = format!(
-            "tab: foco paneles | ↑↓: seleccion | ←→: mover sidebar | []: tabs detalle | space: toggle | 1-5: ir panel | rueda: scroll | x: menu | ctrl+q: count | {}",
+            "tab: foco | ↑↓: seleccion | ←→: sidebar | []: tabs | space: toggle | 1-5: panel | rueda: scroll | shift+rueda: cols | x: menu | {}",
             app.status
         );
         frame.render_widget(Paragraph::new(shortcuts), area);
     } else {
         let shortcuts = format!(
-            "tab foco | ↑↓ mover | ←→ detalle | space toggle | rueda | x menu | {}",
+            "tab foco | ↑↓ mover | ←→ detalle | space toggle | rueda | shift+rueda cols | {}",
             app.status
         );
         frame.render_widget(Paragraph::new(shortcuts), area);

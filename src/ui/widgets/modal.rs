@@ -7,10 +7,7 @@
 /// - Futuros diálogos (confirmaciones, inputs, etc.)
 use ratatui::{
     prelude::*,
-    widgets::{
-        Block, Borders, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Table, TableState, Wrap,
-    },
+    widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
 /// Scroll state externo: el caller lo mantiene y lo pasa cada frame.
@@ -73,15 +70,10 @@ pub fn render(
     let paragraph = Paragraph::new(content).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, rect);
 
-    // Scrollbar
+    // Scrollbar manual (misma lógica/estilo que los paneles: thumb de largo
+    // fijo que recorre el 100% del track)
     if lines.len() > visible {
-        let scrollbar_state = ScrollbarState::new(lines.len())
-            .viewport_content_length(visible)
-            .position(scroll.offset);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .symbols(ratatui::symbols::scrollbar::VERTICAL);
-        let mut state = scrollbar_state;
-        frame.render_stateful_widget(scrollbar, rect, &mut state);
+        crate::ui::widgets::panel::draw_v_scrollbar(frame, rect, lines.len(), scroll.offset);
     }
 
     inner
@@ -150,16 +142,11 @@ pub fn render_table(
     let mut state = TableState::default().with_selected(Some(scroll.offset));
     frame.render_stateful_widget(table, rect, &mut state);
 
-    // Scrollbar
+    // Scrollbar manual (misma lógica/estilo que los paneles: thumb de largo
+    // fijo que recorre el 100% del track)
     let visible = usize::from(inner.height.max(1));
     if content_len > visible {
-        let scrollbar_state = ScrollbarState::new(content_len)
-            .viewport_content_length(visible)
-            .position(scroll.offset);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .symbols(ratatui::symbols::scrollbar::VERTICAL);
-        let mut s = scrollbar_state;
-        frame.render_stateful_widget(scrollbar, rect, &mut s);
+        crate::ui::widgets::panel::draw_v_scrollbar(frame, rect, content_len, scroll.offset);
     }
 
     inner
