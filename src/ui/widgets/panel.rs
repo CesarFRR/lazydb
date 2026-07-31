@@ -93,6 +93,7 @@ pub fn render(
 pub const MIN_COL_W: usize = 12;
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
 pub fn render_data_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -221,31 +222,14 @@ pub fn render_data_table(
             let h_trimmed = headers[i].trim();
             let has_indicator = sort_column == Some(h_trimmed);
             let is_last = i == vis_end.saturating_sub(1);
-            let text = if !is_last {
-                let iw = w.saturating_sub(3);
-                let val = truncate_middle(h_trimmed, iw);
-                // El ▴/▾ reemplaza el último espacio del padding antes de " │"
-                let padded = format!("{val:<iw$}");
-                if has_indicator {
-                    let ch = if sort_asc { '▴' } else { '▾' };
-                    // Reemplazar el último espacio (o último char si no hay espacio)
-                    let last_space = padded.rfind(' ').unwrap_or(iw.saturating_sub(1));
-                    let mut chars: Vec<char> = padded.chars().collect();
-                    if last_space < chars.len() {
-                        chars[last_space] = ch;
-                    }
-                    format!(" {} │", chars.iter().collect::<String>())
-                } else {
-                    format!(" {padded} │")
-                }
-            } else {
+            let text = if is_last {
                 let iw = w.saturating_sub(1);
                 let val = truncate_middle(h_trimmed, iw);
                 // Última columna visible: sin separador │, el indicador va pegado al nombre
                 if has_indicator {
                     let ch = if sort_asc { '▴' } else { '▾' };
                     let padded = format!("{val:<iw$}");
-                    let last_space = padded.rfind(' ').unwrap_or(iw.saturating_sub(1));
+                    let last_space = padded.rfind(' ').unwrap_or_else(|| iw.saturating_sub(1));
                     let mut chars: Vec<char> = padded.chars().collect();
                     if last_space < chars.len() {
                         chars[last_space] = ch;
@@ -253,6 +237,23 @@ pub fn render_data_table(
                     format!(" {}", chars.iter().collect::<String>())
                 } else {
                     format!(" {val:<iw$}")
+                }
+            } else {
+                let iw = w.saturating_sub(3);
+                let val = truncate_middle(h_trimmed, iw);
+                // El ▴/▾ reemplaza el último espacio del padding antes de " │"
+                let padded = format!("{val:<iw$}");
+                if has_indicator {
+                    let ch = if sort_asc { '▴' } else { '▾' };
+                    // Reemplazar el último espacio (o último char si no hay espacio)
+                    let last_space = padded.rfind(' ').unwrap_or_else(|| iw.saturating_sub(1));
+                    let mut chars: Vec<char> = padded.chars().collect();
+                    if last_space < chars.len() {
+                        chars[last_space] = ch;
+                    }
+                    format!(" {} │", chars.iter().collect::<String>())
+                } else {
+                    format!(" {padded} │")
                 }
             };
             Cell::from(Span::styled(
@@ -364,8 +365,7 @@ pub fn render_data_table(
             (inner_w as f32 * max_visible as f32 / col_count as f32).round().max(1.0) as usize;
         let track = inner_w.saturating_sub(thumb_w).max(1);
         // División entera: con vis_start == max_start el thumb toca el borde
-        let thumb_start =
-            if max_start > 0 { vis_start.saturating_mul(track) / max_start } else { 0 };
+        let thumb_start = vis_start.saturating_mul(track).checked_div(max_start).unwrap_or(0);
         // Thumb `▀` (mitad SUPERIOR, mismo grosor que ▄): al quedar pegado
         // arriba, la mitad vacía de la celda actúa como GAP sutil entre la
         // barra y los headers de la tabla — así las tres zonas interactivas
@@ -461,13 +461,12 @@ fn render_expanded(
     let visible = items.iter().skip(scroll).take(max_visible);
 
     let list_items: Vec<ListItem<'_>> = visible
-        .enumerate()
-        .map(|(_, item)| {
+        .map(|item| {
             // SIN prefijos hardcodeados: ratatui reserva la primera columna
             // para el highlight_symbol "▸ " (o su espacio en blanco) en TODAS
             // las filas, y pinta "▸" solo en la seleccionada. Así el texto de
             // todos los items queda alineado y el ▸ no empuja nada.
-            ListItem::new(item.to_string())
+            ListItem::new(item.clone())
         })
         .collect();
 
@@ -502,7 +501,8 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
 ///   de inicio/fin y parecía un gusano viviente).
 /// - `track = inner_h - thumb_h` y `thumb_start = offset * track / max_scroll`:
 ///   con `offset == max_scroll` el thumb toca el borde inferior (recorre el 100%).
-/// - Símbolos y estilos idénticos a la barra horizontal: `│` DarkGray / `█` Cyan.
+/// - Símbolos y estilos idénticos a la barra horizontal: `│` `DarkGray` / `█` `Cyan`.
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 pub fn draw_v_scrollbar(frame: &mut Frame<'_>, area: Rect, content_len: usize, offset: usize) {
     if area.height < 3 || content_len <= 1 {
         return;

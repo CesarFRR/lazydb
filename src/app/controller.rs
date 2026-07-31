@@ -184,7 +184,7 @@ fn list_index_from_click(rel_y: u16, section_height: u16, top_reserved: u16) -> 
 /// ancho proporcional a las columnas visibles y por eso nunca llega al borde
 /// derecho). Devuelve `(thumb_w, track)`: el tamaño del thumb y el recorrido
 /// efectivo (en celdas) que el mouse debe cubrir para barrer el scroll completo.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn h_scroll_thumb_geometry(inner_w: usize, col_count: usize, max_visible: usize) -> (usize, f32) {
     let thumb_w = (inner_w as f32 * max_visible as f32 / col_count as f32).round() as usize;
     let track = inner_w.saturating_sub(thumb_w).max(1) as f32;
@@ -193,7 +193,7 @@ fn h_scroll_thumb_geometry(inner_w: usize, col_count: usize, max_visible: usize)
 
 /// Geometría del thumb del scrollbar vertical.
 /// Devuelve `(thumb_h, track)` — análogo a `h_scroll_thumb_geometry`.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn v_scroll_thumb_geometry(panel_h: u16, items_len: usize, viewport: usize) -> (usize, f32) {
     let thumb_h = (f32::from(panel_h) * viewport as f32 / items_len as f32).round() as usize;
     let track = usize::from(panel_h).saturating_sub(thumb_h).max(1) as f32;
@@ -223,7 +223,7 @@ fn is_local_source(value: &str) -> bool {
 }
 
 /// Escanea el directorio de trabajo actual (donde se ejecuta `cargo run` /
-/// lazydb) buscando archivos de base de datos SQLite: `*.db`, `*.sqlite` y
+/// lazydb) buscando archivos de base de datos `SQLite`: `*.db`, `*.sqlite` y
 /// `*.sqlite3`. Devuelve los paths completos ordenados alfabéticamente.
 fn scan_cwd_databases() -> Vec<String> {
     let Ok(cwd) = std::env::current_dir() else {
@@ -258,6 +258,7 @@ enum EnterAction {
     None,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     // ── sistema de paneles ──
     pub panels: [Panel; 5],
@@ -582,11 +583,11 @@ impl App {
     }
 
     /// Número total de items originales (sin filtro) para el panel dado.
-
     pub fn items_len_for(&self, kind: PanelKind) -> usize {
         self.items_for(kind).len()
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn title_for(&self, kind: PanelKind) -> String {
         let num = kind.number();
         match kind {
@@ -847,39 +848,36 @@ impl App {
         let views = db::backends::sqlite::list_objects_by_type(path, "view");
         let advanced = db::backends::sqlite::list_advanced_objects(path);
 
-        match (tables, views, advanced) {
-            (Ok(tables), Ok(views), Ok(advanced)) => {
-                let path_str = path.to_string();
-                self.state.add_recent(path_str);
-                let _ = self.state.save();
-                self.sources = Self::build_sources(&self.state, self.source_tab);
+        if let (Ok(tables), Ok(views), Ok(advanced)) = (tables, views, advanced) {
+            let path_str = path.to_string();
+            self.state.add_recent(path_str);
+            let _ = self.state.save();
+            self.sources = Self::build_sources(&self.state, self.source_tab);
 
-                self.db_path = Some(path.to_string());
-                self.db_size_bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
-                self.tables = tables;
-                self.views = views;
-                self.advanced = advanced;
-                self.object_section = ObjectSection::Tables;
+            self.db_path = Some(path.to_string());
+            self.db_size_bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
+            self.tables = tables;
+            self.views = views;
+            self.advanced = advanced;
+            self.object_section = ObjectSection::Tables;
 
-                // Resetear índices
-                self.set_selected_idx(PanelKind::Tables, 0);
-                self.set_selected_idx(PanelKind::Views, 0);
-                self.set_selected_idx(PanelKind::Advanced, 0);
-                self.set_selected_idx(PanelKind::Detail, 0);
-                self.current_page = 0;
-                self.preview_loaded_offset = 0;
-                self.detail_tab = DetailTab::Data;
+            // Resetear índices
+            self.set_selected_idx(PanelKind::Tables, 0);
+            self.set_selected_idx(PanelKind::Views, 0);
+            self.set_selected_idx(PanelKind::Advanced, 0);
+            self.set_selected_idx(PanelKind::Detail, 0);
+            self.current_page = 0;
+            self.preview_loaded_offset = 0;
+            self.detail_tab = DetailTab::Data;
 
-                self.refresh_preview_from_selected_object();
-                self.status = format!("Conectado en modo read-only: {path}");
+            self.refresh_preview_from_selected_object();
+            self.status = format!("Conectado en modo read-only: {path}");
 
-                // Mover foco a Tablas
-                self.set_focus(PanelKind::Tables);
-            }
-            _ => {
-                self.is_loading = false;
-                self.status = format!("Error al abrir {path}: no se pudo leer sqlite_master");
-            }
+            // Mover foco a Tablas
+            self.set_focus(PanelKind::Tables);
+        } else {
+            self.is_loading = false;
+            self.status = format!("Error al abrir {path}: no se pudo leer sqlite_master");
         }
     }
 
@@ -1082,7 +1080,7 @@ impl App {
     // ── scroll infinito (append/prepend) ─────────────────────────────
 
     /// Carga la siguiente página de datos y la agrega a `preview_rows`.
-    /// Solo para tabla de datos (DetailTab::Data). Actualiza la selección
+    /// Solo para tabla de datos (`DetailTab::Data`). Actualiza la selección
     /// para que apunte a la primera fila recién cargada (continuidad hacia abajo).
     fn scroll_down_infinite(&mut self) {
         let data_len = self.preview_rows.len().saturating_sub(1);
@@ -1133,7 +1131,7 @@ impl App {
     }
 
     /// Carga la página anterior de datos y la antepone a `preview_rows`.
-    /// Solo para tabla de datos (DetailTab::Data). Actualiza `preview_loaded_offset`
+    /// Solo para tabla de datos (`DetailTab::Data`). Actualiza `preview_loaded_offset`
     /// y la selección para que apunte a la última fila recién cargada
     /// (continuidad hacia arriba).
     fn scroll_up_infinite(&mut self) {
@@ -1277,6 +1275,7 @@ impl App {
 
     // ── exportar CSV ─────────────────────────────────────────────────
 
+    #[allow(clippy::cast_precision_loss)]
     fn export_csv(&mut self) {
         let Some(path) = self.db_path.clone() else {
             self.status = "No hay DB conectada".to_string();
@@ -1292,8 +1291,7 @@ impl App {
         let safe_name = object.replace([' ', '"', '/', '\\'], "_");
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let filename = format!("{safe_name}_{timestamp}.csv");
         let sql = format!("SELECT * FROM \"{}\";", object.replace('"', "\"\""));
 
@@ -1313,7 +1311,7 @@ impl App {
                     return;
                 }
                 match std::fs::write(&filename, &output.stdout) {
-                    Ok(_) => {
+                    Ok(()) => {
                         let size = output.stdout.len();
                         let size_str = if size >= 1024 * 1024 {
                             format!("{:.1} MiB", size as f64 / (1024.0 * 1024.0))
@@ -1648,7 +1646,7 @@ impl App {
         } else if self.show_actions_menu {
             self.show_actions_menu = false;
             self.actions_menu_idx = 0;
-            self.status = "".to_string();
+            self.status = String::new();
         } else {
             self.should_quit = true;
         }
@@ -1657,19 +1655,7 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
         // ── modo filtro: capturar teclas antes del mapeo de acciones ──
         if self.input_mode == InputMode::Filtering {
-            match key.code {
-                KeyCode::Esc => self.cancel_filter(),
-                KeyCode::Enter => self.apply_filter(),
-                KeyCode::Backspace => {
-                    self.filter_query.pop();
-                    self.update_filter();
-                }
-                KeyCode::Char(c) => {
-                    self.filter_query.push(c);
-                    self.update_filter();
-                }
-                _ => {}
-            }
+            self.handle_filter_key(key);
             return;
         }
 
@@ -1679,48 +1665,78 @@ impl App {
 
         // ── row inspector modal ──
         if self.show_row_inspector {
-            match action {
-                keys::AppAction::QuitOrBack
-                | keys::AppAction::Enter
-                | keys::AppAction::ToggleActionsMenu => {
-                    self.close_row_inspector();
-                }
-                // ↑/↓ navegan la tabla de datos y el modal se actualiza en vivo
-                keys::AppAction::MoveUp => {
-                    self.move_selection(-1);
-                    self.refresh_row_inspector();
-                }
-                keys::AppAction::MoveDown => {
-                    self.move_selection(1);
-                    self.refresh_row_inspector();
-                }
-                _ => {}
-            }
+            self.handle_row_inspector_key(action);
             return;
         }
 
         // ── menú de acciones (modal) ──
         if self.show_actions_menu {
-            match action {
-                keys::AppAction::ToggleActionsMenu | keys::AppAction::QuitOrBack => {
-                    self.show_actions_menu = false;
-                }
-                keys::AppAction::MoveUp => {
-                    self.actions_menu_idx = self.actions_menu_idx.saturating_sub(1);
-                }
-                keys::AppAction::MoveDown => {
-                    let last = Self::ACTION_ITEMS.len().saturating_sub(1);
-                    self.actions_menu_idx = (self.actions_menu_idx + 1).min(last);
-                }
-                keys::AppAction::Enter => {
-                    self.execute_menu_action();
-                }
-                _ => {}
-            }
+            self.handle_actions_menu_key(action);
             return;
         }
 
-        // ── acciones normales ──
+        self.dispatch_action(action);
+    }
+
+    fn handle_filter_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.cancel_filter(),
+            KeyCode::Enter => self.apply_filter(),
+            KeyCode::Backspace => {
+                self.filter_query.pop();
+                self.update_filter();
+            }
+            KeyCode::Char(c) => {
+                self.filter_query.push(c);
+                self.update_filter();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_row_inspector_key(&mut self, action: keys::AppAction) {
+        match action {
+            keys::AppAction::QuitOrBack
+            | keys::AppAction::Enter
+            | keys::AppAction::ToggleActionsMenu => {
+                self.close_row_inspector();
+            }
+            // ↑/↓ navegan la tabla de datos y el modal se actualiza en vivo
+            keys::AppAction::MoveUp => {
+                self.move_selection(-1);
+                self.refresh_row_inspector();
+            }
+            keys::AppAction::MoveDown => {
+                self.move_selection(1);
+                self.refresh_row_inspector();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_actions_menu_key(&mut self, action: keys::AppAction) {
+        match action {
+            keys::AppAction::ToggleActionsMenu | keys::AppAction::QuitOrBack => {
+                self.show_actions_menu = false;
+            }
+            keys::AppAction::MoveUp => {
+                self.actions_menu_idx = self.actions_menu_idx.saturating_sub(1);
+            }
+            keys::AppAction::MoveDown => {
+                let last = Self::ACTION_ITEMS.len().saturating_sub(1);
+                self.actions_menu_idx = (self.actions_menu_idx + 1).min(last);
+            }
+            keys::AppAction::Enter => {
+                self.execute_menu_action();
+            }
+            _ => {}
+        }
+    }
+
+    // Dispatch de ~50 acciones: se permite `too_many_lines` (un match plano
+    // por cada acción es más legible que despiezarlo en N métodos).
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    fn dispatch_action(&mut self, action: keys::AppAction) {
         match action {
             keys::AppAction::RunCountQuery => self.execute_count_query(),
             keys::AppAction::ClearQueryState => self.clear_query_state(),
@@ -1920,16 +1936,16 @@ impl App {
             SourceTab::Online => "Todo Local [Online]",
         };
         let title = format!("[{num}]Fuentes ({tabs})");
-        #[allow(clippy::cast_possible_truncation)]
-        let base = i64::from(rect.x) + 1;
+        let base = usize::from(rect.x) + 1;
+        let cursor = usize::from(cursor_x);
 
         for (tab, word) in
             [(SourceTab::All, "Todo"), (SourceTab::Local, "Local"), (SourceTab::Online, "Online")]
         {
             if let Some(pos) = title.find(word) {
-                let start = base + pos as i64;
-                let end = start + word.len() as i64;
-                if i64::from(cursor_x) >= start && i64::from(cursor_x) < end {
+                let start = base + pos;
+                let end = start + word.len();
+                if cursor >= start && cursor < end {
                     return Some(tab);
                 }
             }
@@ -1938,6 +1954,7 @@ impl App {
     }
 
     /// Ancho en columnas del texto de un tab en el título.
+    #[allow(clippy::cast_possible_truncation)]
     fn detail_tab_display_width(&self, tab: DetailTab) -> u16 {
         let label = tab.label();
         let inner = if tab == DetailTab::Data && self.total_rows > 0 {
@@ -1964,7 +1981,7 @@ impl App {
         let current = detail.h_scroll.get();
         let max_cols = {
             let headers: Vec<&str> =
-                self.preview_rows.first().map_or_else(|| vec![], |r| r.split(" | ").collect());
+                self.preview_rows.first().map_or_else(Vec::new, |r| r.split(" | ").collect());
             headers.len()
         };
         let inner_w = self
@@ -2097,7 +2114,7 @@ impl App {
                     let headers: Vec<&str> = self
                         .preview_rows
                         .first()
-                        .map_or_else(|| vec![], |r| r.split(" | ").collect());
+                        .map_or_else(Vec::new, |r| r.split(" | ").collect());
                     let col_count = headers.len();
                     if col_count <= 1 {
                         return;
@@ -2124,12 +2141,13 @@ impl App {
     }
 
     /// Suelta del botón: termina el arrastre.
-    pub fn on_mouse_up(&mut self) {
+    pub const fn on_mouse_up(&mut self) {
         self.drag = None;
     }
 
     /// ¿El click está sobre la barra de scroll horizontal del Data tab?
     /// Si sí, inicia el arrastre y mueve el thumb a la posición del click.
+    #[allow(clippy::cast_precision_loss)]
     fn try_start_h_scroll_drag(&mut self, x: u16, y: u16, width: u16, height: u16) -> bool {
         if width < 40 || height < 10 {
             return false;
@@ -2149,7 +2167,7 @@ impl App {
             return false;
         }
         let headers: Vec<&str> =
-            self.preview_rows.first().map_or_else(|| vec![], |r| r.split(" | ").collect());
+            self.preview_rows.first().map_or_else(Vec::new, |r| r.split(" | ").collect());
         let col_count = headers.len();
         if col_count <= 1 {
             return false;
@@ -2172,19 +2190,24 @@ impl App {
         true
     }
 
-    /// Convierte la X del mouse en posición de h_scroll.
+    /// Convierte la X del mouse en posición de `h_scroll`.
     /// Mapeo 1:1: cada celda del mouse sobre el track equivale a su proporción
     /// del scroll total (`track` = recorrido efectivo del thumb), así el thumb
     /// recorre el 100% del recorrido disponible.
     fn apply_h_drag(&mut self, rel: f32, max_start: usize, track: f32) {
         let pct = (rel / track.max(1.0)).clamp(0.0, 1.0);
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
         let new = (pct * max_start as f32).round() as usize;
         self.panel_mut(PanelKind::Detail).h_scroll.set(new.min(max_start));
     }
 
     /// ¿El click está sobre el scrollbar vertical (última columna) de un panel?
     /// Si sí, inicia el arrastre y mueve el thumb a la posición del click.
+    #[allow(clippy::cast_precision_loss)]
     fn try_start_v_scroll_drag(&mut self, x: u16, y: u16, width: u16, height: u16) -> bool {
         if width < 40 || height < 10 {
             return false;
@@ -2217,11 +2240,15 @@ impl App {
         false
     }
 
-    /// Convierte la Y del mouse en scroll_offset del panel.
+    /// Convierte la Y del mouse en `scroll_offset` del panel.
     /// Mapeo 1:1 (ver `apply_h_drag`).
     fn apply_v_drag(&mut self, rel: f32, kind: PanelKind, max_scroll: usize, track: f32) {
         let pct = (rel / track.max(1.0)).clamp(0.0, 1.0);
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
         let new = (pct * max_scroll as f32).round() as usize;
         let new = new.min(max_scroll);
         let p = self.panel_mut(kind);
