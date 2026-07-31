@@ -253,8 +253,8 @@ fn url_host(url: &str) -> Option<&str> {
 }
 
 /// Host y puerto de una URL de conexión: `mysql://user:pass@db:3306/x` →
-/// `("db", 3306)`. Puertos por defecto: MySQL 3306, PostgreSQL 5432,
-/// http 80, https 443. Tolera IPv6 entre corchetes.
+/// `("db", 3306)`. Puertos por defecto: `MySQL` 3306, `PostgreSQL` 5432,
+/// `http` 80, `https` 443. Tolera IPv6 entre corchetes.
 fn source_host_port(url: &str) -> Option<(String, u16)> {
     let lower = url.to_ascii_lowercase();
     let default_port = if lower.starts_with("mysql://") {
@@ -273,14 +273,12 @@ fn source_host_port(url: &str) -> Option<(String, u16)> {
     let before_slash = rest.split('/').next()?;
     let host_port = before_slash.rsplit('@').next()?;
 
-    let (host, port) = if let Some(colon) = host_port.rfind(':') {
-        match host_port[colon + 1..].parse::<u16>() {
-            Ok(p) => (&host_port[..colon], p),
-            Err(_) => (host_port, default_port), // "host:no-numérico" → default
-        }
-    } else {
-        (host_port, default_port)
-    };
+    let (host, port) = host_port.rfind(':').map_or((host_port, default_port), |colon| {
+        // "host:no-numérico" → puerto por defecto
+        host_port[colon + 1..]
+            .parse::<u16>()
+            .map_or((host_port, default_port), |p| (&host_port[..colon], p))
+    });
     Some((host.trim_matches(['[', ']']).to_string(), port))
 }
 
@@ -294,23 +292,21 @@ fn probe_source(path: &str) -> bool {
     match source_kind(path) {
         SourceKind::File => {
             let file = path.strip_prefix("sqlite://").unwrap_or(path);
-            std::fs::metadata(file).map(|meta| meta.is_file()).unwrap_or(false)
+            std::fs::metadata(file).is_ok_and(|meta| meta.is_file())
         }
         SourceKind::Localhost | SourceKind::Online => {
             let Some((host, port)) = source_host_port(path) else {
                 return false;
             };
-            let addr: Option<std::net::SocketAddr> = match host.parse::<std::net::IpAddr>() {
-                Ok(ip) => Some(std::net::SocketAddr::new(ip, port)),
-                Err(_) => {
-                    // Hostname: resolución DNS bloqueante (aceptable: va en spawn_blocking)
+            // Hostname → resolución DNS bloqueante (aceptable: va en spawn_blocking)
+            let addr: Option<std::net::SocketAddr> = host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .ok()
+                .or_else(|| {
                     use std::net::ToSocketAddrs;
-                    match (host.as_str(), port).to_socket_addrs() {
-                        Ok(mut addrs) => addrs.next(),
-                        Err(_) => None,
-                    }
-                }
-            };
+                    (host.as_str(), port).to_socket_addrs().ok()?.next()
+                });
             let Some(addr) = addr else { return false };
             std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
         }
