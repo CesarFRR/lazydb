@@ -76,7 +76,9 @@ pub fn render(
     // ítem SELECCIONADO dentro de la lista, no la del viewport — así al
     // arrastrar la barra hasta el fondo el último ítem queda seleccionado
     // (y el drag con mouse ya sincroniza selected_idx = scroll).
-    if items.len() > 1 && area.height >= 3 {
+    // No aplica al colapso de Sources (altura 3): ahí va el resumen, no la
+    // lista completa.
+    if items.len() > 1 && area.height >= 3 && !(kind == PanelKind::Sources && area.height == 3) {
         draw_v_scrollbar(frame, area, items.len(), selected_idx);
     }
 
@@ -489,11 +491,13 @@ fn render_expanded(
         scroll_offset
     };
 
-    // Fuentes no enfocado: en vez del ítem del scroll (que suele ser una
-    // sección "── FAVORITOS ────" vacía de contenido útil), se muestra el
-    // resumen significativo — la DB conectada, la fuente seleccionada o el
-    // primer entry — como lazydocker con el contenedor seleccionado.
-    let visible: Vec<&str> = if kind == PanelKind::Sources && !focused {
+    // Colapso responsive (layout: "Sources mínimo: borde + 1 ítem", altura 3,
+    // cuando la terminal se achica): se muestra un único ítem de resumen — la
+    // DB conectada, la fuente seleccionada o el primer entry — como lazydocker
+    // con el contenedor seleccionado. Expandido, la lista completa se muestra
+    // SIEMPRE, enfocado o no.
+    let collapsed = area.height == 3;
+    let visible: Vec<&str> = if kind == PanelKind::Sources && collapsed {
         crate::app::controller::source_summary(items, selected_idx)
     } else {
         items.iter().skip(scroll).take(viewport).map(String::as_str).collect()
@@ -522,7 +526,7 @@ fn render_expanded(
     // En el resumen colapsado no se pinta cursor (el ▸ apuntaría a un ítem
     // que no es necesariamente el seleccionado).
     let mut state = ListState::default().with_selected(
-        if items.is_empty() || (kind == PanelKind::Sources && !focused) {
+        if items.is_empty() || (kind == PanelKind::Sources && collapsed) {
             None
         } else {
             Some(selected_idx.saturating_sub(scroll))
