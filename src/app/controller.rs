@@ -246,16 +246,15 @@ fn url_host(url: &str) -> Option<&str> {
     let rest = url.split("://").nth(1)?;
     let before_slash = rest.split('/').next()?;
     let host_port = before_slash.rsplit('@').next()?;
-    if let Some(bracket_end) = host_port.find(']') {
-        Some(&host_port[..=bracket_end])
-    } else {
-        Some(host_port.split(':').next().unwrap_or(host_port))
-    }
+    host_port.find(']').map_or_else(
+        || Some(host_port.split(':').next().unwrap_or(host_port)),
+        |bracket_end| Some(&host_port[..=bracket_end]),
+    )
 }
 
 /// Marca de tipo de base de datos para el panel Fuentes (1 carácter).
-/// - `▣` SQLite (incluye URLs `sqlite://`) · `D` DuckDB · `M` MySQL ·
-///   `P` PostgreSQL · `⊙` endpoint genérico (http/https/ssh)
+/// - `▣` `SQLite` (incluye URLs `sqlite://`) · `D` `DuckDB` · `M` `MySQL` ·
+///   `P` `PostgreSQL` · `⊙` endpoint genérico (`http`/`https`/`ssh`)
 fn db_type_mark(value: &str) -> char {
     let lower = value.to_ascii_lowercase();
     if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
@@ -267,10 +266,12 @@ fn db_type_mark(value: &str) -> char {
         || lower.starts_with("ssh://")
     {
         '⊙'
-    } else if lower.ends_with(".duckdb") || lower.ends_with(".ddb") {
-        'D'
     } else {
-        '▣'
+        let ext = std::path::Path::new(value).extension().and_then(|e| e.to_str()).unwrap_or("");
+        match ext.to_ascii_lowercase().as_str() {
+            "duckdb" | "ddb" => 'D',
+            _ => '▣',
+        }
     }
 }
 
