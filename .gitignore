@@ -5,5 +5,8 @@
 /graphify-out
 /analisis-comunidad
 
+# Artefactos IA (plugin graphify de opencode)
+.opencode/
+
 # Bases de datos de prueba
 *.db

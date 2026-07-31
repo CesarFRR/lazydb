@@ -311,6 +311,38 @@ fn strip_source_marks(mut item: &str) -> &str {
     }
 }
 
+/// Item "resumen" del panel Fuentes cuando NO está enfocado (filosofía lazy,
+/// como lazydocker muestra el contenedor seleccionado). Prioridad:
+/// 1. La DB conectada (item con `● `) — el dato más útil del panel.
+/// 2. La fuente bajo el cursor (si es un entry real).
+/// 3. El primer entry de la lista.
+///
+/// Devuelve como máximo 1 item; vacío si no hay nada que resumir. Nunca
+/// devuelve secciones (`\u{1}...`), placeholders ni acciones fijas.
+pub fn source_summary(items: &[String], selected_idx: usize) -> Vec<&str> {
+    let is_action = |s: &str| s == "Abrir sakila.db" || s == "Buscar archivo .db";
+
+    // 1. DB conectada
+    if let Some(connected) = items.iter().find(|s| s.starts_with("● ")) {
+        return vec![connected];
+    }
+    // 2. Fuente bajo el cursor
+    if let Some(sel) = items.get(selected_idx)
+        && !is_source_section(sel)
+        && *sel != "<sin entradas>"
+        && !is_action(sel)
+    {
+        return vec![sel];
+    }
+    // 3. Primer entry real de la lista
+    for item in items {
+        if !is_source_section(item) && *item != "<sin entradas>" && !is_action(item) {
+            return vec![item];
+        }
+    }
+    Vec::new()
+}
+
 /// Extrae el path real de un item de Fuentes (con o sin marcas).
 fn source_path_of(item: &str) -> &str {
     let clean = strip_source_marks(item);
@@ -2853,6 +2885,46 @@ mod tests {
         assert!(sources.iter().any(|s| s.starts_with("D ")), "DuckDB debe marcarse D");
         assert!(sources.iter().any(|s| s.starts_with("M ")), "MySQL debe marcarse M");
         assert!(sources.iter().any(|s| s.starts_with("P ")), "Postgres debe marcarse P");
+    }
+
+    // ── resumen del panel colapsado (no enfocado) ──────────────────────
+
+    #[test]
+    fn summary_prioriza_la_db_conectada() {
+        let items = vec![
+            source_section("FAVORITOS"),
+            "★ one => /a/one.db".to_string(),
+            source_section("RECIENTES"),
+            "● ▣ /tmp/x.db".to_string(),
+            "Abrir sakila.db".to_string(),
+        ];
+        assert_eq!(source_summary(&items, 0), vec!["● ▣ /tmp/x.db"]);
+        // Aunque el cursor esté en otro lado, la conectada manda
+        assert_eq!(source_summary(&items, 4), vec!["● ▣ /tmp/x.db"]);
+    }
+
+    #[test]
+    fn summary_sin_conectada_muestra_la_seleccionada() {
+        let items = vec![
+            source_section("FAVORITOS"),
+            "★ one => /a/one.db".to_string(),
+            "Abrir sakila.db".to_string(),
+        ];
+        assert_eq!(source_summary(&items, 1), vec!["★ one => /a/one.db"]);
+        // Cursor sobre una sección o acción fija → primer entry real
+        assert_eq!(source_summary(&items, 0), vec!["★ one => /a/one.db"]);
+        assert_eq!(source_summary(&items, 2), vec!["★ one => /a/one.db"]);
+        // Índice fuera de rango → primer entry real
+        assert_eq!(source_summary(&items, 99), vec!["★ one => /a/one.db"]);
+    }
+
+    #[test]
+    fn summary_solo_secciones_o_vacio_devuelve_nada() {
+        assert_eq!(source_summary(&[], 0), Vec::<&str>::new());
+        let items = vec![source_section("FAVORITOS"), "<sin entradas>".to_string()];
+        assert_eq!(source_summary(&items, 0), Vec::<&str>::new());
+        let items = vec!["Abrir sakila.db".to_string()];
+        assert_eq!(source_summary(&items, 0), Vec::<&str>::new());
     }
 
     #[test]

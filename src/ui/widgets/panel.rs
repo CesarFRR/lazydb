@@ -489,12 +489,18 @@ fn render_expanded(
         scroll_offset
     };
 
-    // Sources no enfocado: solo 1 ítem visible
-    let max_visible = if kind == PanelKind::Sources && !focused { 1usize } else { viewport };
-
-    let visible = items.iter().skip(scroll).take(max_visible);
+    // Fuentes no enfocado: en vez del ítem del scroll (que suele ser una
+    // sección "── FAVORITOS ────" vacía de contenido útil), se muestra el
+    // resumen significativo — la DB conectada, la fuente seleccionada o el
+    // primer entry — como lazydocker con el contenedor seleccionado.
+    let visible: Vec<&str> = if kind == PanelKind::Sources && !focused {
+        crate::app::controller::source_summary(items, selected_idx)
+    } else {
+        items.iter().skip(scroll).take(viewport).map(String::as_str).collect()
+    };
 
     let list_items: Vec<ListItem<'_>> = visible
+        .iter()
         .map(|item| {
             if kind == PanelKind::Sources {
                 ListItem::new(source_line(item, inner.width))
@@ -503,7 +509,7 @@ fn render_expanded(
                 // para el highlight_symbol "▸ " (o su espacio en blanco) en TODAS
                 // las filas, y pinta "▸" solo en la seleccionada. Así el texto de
                 // todos los items queda alineado y el ▸ no empuja nada.
-                ListItem::new(item.clone())
+                ListItem::new(*item)
             }
         })
         .collect();
@@ -513,11 +519,15 @@ fn render_expanded(
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .highlight_symbol("▸ ");
 
-    let mut state = ListState::default().with_selected(if items.is_empty() {
-        None
-    } else {
-        Some(selected_idx.saturating_sub(scroll))
-    });
+    // En el resumen colapsado no se pinta cursor (el ▸ apuntaría a un ítem
+    // que no es necesariamente el seleccionado).
+    let mut state = ListState::default().with_selected(
+        if items.is_empty() || (kind == PanelKind::Sources && !focused) {
+            None
+        } else {
+            Some(selected_idx.saturating_sub(scroll))
+        },
+    );
     frame.render_stateful_widget(list, area, &mut state);
 
     scroll
