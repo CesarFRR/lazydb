@@ -13,6 +13,11 @@ const LARGE_WIDTH: u16 = 120;
 const KB_BYTES: u64 = 1024;
 const MB_BYTES: u64 = KB_BYTES * 1024;
 
+/// TTL del caché de salud de fuentes: pasado este tiempo, la fuente
+/// seleccionada se re-verifica (el archivo/servicio pudo cambiar sin que
+/// lazydb se entere: renombrados, servicios caídos, etc.).
+const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
 // ---------------------------------------------------------------------------
 // Enums de UI (transición: algunos se moverán a panel.rs en el futuro)
 // ---------------------------------------------------------------------------
@@ -434,7 +439,7 @@ impl SourceFilter {
 struct SourceList<'a> {
     state: &'a storage::AppState,
     connected: Option<&'a str>,
-    health: &'a HashMap<String, bool>,
+    health: &'a HashMap<String, (bool, std::time::Instant)>,
     out: Vec<String>,
     seen: HashSet<String>,
     sections: HashSet<String>,
@@ -460,8 +465,8 @@ impl SourceList<'_> {
         let prefix = if is_fav { "★ ".to_string() } else { format!("{} ", db_type_mark(&path)) };
         // Salud: ✓ accesible / ✗ con problemas / sin marca = no verificado
         let health_mark = match self.health.get(&path) {
-            Some(true) => "✓ ",
-            Some(false) => "✗ ",
+            Some((true, _)) => "✓ ",
+            Some((false, _)) => "✗ ",
             None => "",
         };
         let mark = format!(
@@ -598,9 +603,10 @@ pub struct App {
     pub state: storage::AppState,
 
     // ── probe de salud de fuentes (filosofía culling) ──
-    /// Caché de salud por fuente (path → accesible). Solo se prueban las
-    /// fuentes que el usuario va seleccionando, nunca toda la lista.
-    pub health: HashMap<String, bool>,
+    /// Caché de salud por fuente (path → accesible + momento del probe).
+    /// Solo se prueban las fuentes que el usuario va seleccionando, nunca
+    /// toda la lista; el TTL (3s) permite detectar cambios externos en vivo.
+    pub health: HashMap<String, (bool, std::time::Instant)>,
     /// Fuente con probe en vuelo (evita lanzar dos probes seguidos).
     probing: Option<String>,
     /// Canal de resultados de probes en segundo plano (tx/rx).
@@ -759,8 +765,24 @@ impl App {
 
     // ── probe de salud de fuentes (filosofía culling) ─────────────────
 
+    /// ¿Hay que (re)verificar esta fuente? `false` si está en vuelo o si el
+    /// caché es más fresco que el TTL. Función pura, testeable.
+    fn should_probe(
+        health: &HashMap<String, (bool, std::time::Instant)>,
+        path: &str,
+        probing: Option<&str>,
+    ) -> bool {
+        if probing == Some(path) {
+            return false;
+        }
+        match health.get(path) {
+            None => true,
+            Some((_, at)) => at.elapsed() >= PROBE_TTL,
+        }
+    }
+
     /// Lanza en segundo plano el probe de la fuente bajo el cursor, si no
-    /// está cacheada ni en vuelo. Nunca bloquea la UI.
+    /// está en vuelo y el caché expiró (TTL). Nunca bloquea la UI.
     fn probe_selected(&mut self) {
         let Some(selected) =
             self.items_for(PanelKind::Sources).get(self.selected_idx(PanelKind::Sources))
@@ -768,7 +790,7 @@ impl App {
             return;
         };
         let path = source_path_of(selected).to_string();
-        if self.health.contains_key(&path) || self.probing.as_deref() == Some(&path) {
+        if !Self::should_probe(&self.health, &path, self.probing.as_deref()) {
             return;
         }
         let Some(tx) = self.probe_tx.clone() else { return };
@@ -779,21 +801,30 @@ impl App {
         });
     }
 
-    /// Aplica los resultados de probes terminados (llamado cada frame).
+    /// Aplica los resultados de probes terminados y re-verifica en vivo la
+    /// fuente seleccionada (llamado cada frame en `compute_layout`).
     fn poll_probe_results(&mut self) {
         let Some(rx) = self.probe_rx.as_mut() else { return };
         while let Ok((path, ok)) = rx.try_recv() {
-            self.health.insert(path.clone(), ok);
+            // Rebuild solo si el estado cambió (✓ → ✗ o primera verificación)
+            let changed = self.health.get(&path).map(|(old, _)| *old) != Some(ok);
+            self.health.insert(path.clone(), (ok, std::time::Instant::now()));
             if self.probing.as_deref() == Some(&path) {
                 self.probing = None;
             }
-            self.sources = Self::build_sources(
-                &self.state,
-                self.source_tab,
-                self.db_path.as_deref(),
-                &self.health,
-            );
+            if changed {
+                self.sources = Self::build_sources(
+                    &self.state,
+                    self.source_tab,
+                    self.db_path.as_deref(),
+                    &self.health,
+                );
+            }
         }
+        // Re-verificación en vivo: aunque el usuario no mueva el cursor, la
+        // fuente seleccionada se re-probea al expirar el TTL (archivo
+        // renombrado, servicio que se cae, etc.).
+        self.probe_selected();
     }
 
     // ── navegación de foco ────────────────────────────────────────────
@@ -1057,7 +1088,7 @@ impl App {
         state: &storage::AppState,
         source_tab: SourceTab,
         connected: Option<&str>,
-        health: &HashMap<String, bool>,
+        health: &HashMap<String, (bool, std::time::Instant)>,
     ) -> Vec<String> {
         let mut list = SourceList {
             state,
@@ -3092,8 +3123,8 @@ mod tests {
         let canonical_caida = crate::paths::normalize_path("caida.db");
 
         let mut health = HashMap::new();
-        health.insert(canonical_ok.clone(), true);
-        health.insert(canonical_caida.clone(), false);
+        health.insert(canonical_ok.clone(), (true, std::time::Instant::now()));
+        health.insert(canonical_caida.clone(), (false, std::time::Instant::now()));
 
         let sources = App::build_sources(&state, SourceTab::All, None, &health);
         assert!(
@@ -3111,6 +3142,34 @@ mod tests {
             sources_connected.iter().any(|s| s.starts_with(&format!("● ✓ ▣ {canonical_ok}"))),
             "conectada + sana = '● ✓': {sources_connected:?}"
         );
+    }
+
+    #[test]
+    fn should_probe_respeta_ttl_y_probing() {
+        use std::time::Instant;
+
+        let empty = HashMap::new();
+        // Sin caché ni probe en vuelo → hay que verificar
+        assert!(App::should_probe(&empty, "x.db", None));
+
+        // En vuelo → no
+        assert!(!App::should_probe(&empty, "x.db", Some("x.db")));
+
+        // Caché fresco (recién insertado) → no re-verificar
+        let mut fresh = HashMap::new();
+        fresh.insert("x.db".to_string(), (true, Instant::now()));
+        assert!(!App::should_probe(&fresh, "x.db", None));
+
+        // Caché vencido (> TTL) → re-verificar (el archivo pudo cambiar)
+        let mut stale = HashMap::new();
+        stale.insert(
+            "x.db".to_string(),
+            (true, Instant::now().checked_sub(PROBE_TTL).expect("reloj estable")),
+        );
+        assert!(App::should_probe(&stale, "x.db", None));
+
+        // Vencido pero en vuelo → no duplicar
+        assert!(!App::should_probe(&stale, "x.db", Some("x.db")));
     }
 
     #[test]
