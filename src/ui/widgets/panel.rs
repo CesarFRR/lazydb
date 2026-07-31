@@ -443,6 +443,8 @@ fn source_line(item: &str, width: u16) -> RatLine<'_> {
     for (mark, color) in [
         ("● ", Color::Cyan),
         ("★ ", Color::Yellow),
+        ("✓ ", Color::Green),
+        ("✗ ", Color::Red),
         ("▣ ", Color::Blue),
         ("D ", Color::Green),
         ("M ", Color::Red),

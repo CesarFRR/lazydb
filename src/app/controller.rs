@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::Rect;
@@ -252,6 +252,71 @@ fn url_host(url: &str) -> Option<&str> {
     )
 }
 
+/// Host y puerto de una URL de conexión: `mysql://user:pass@db:3306/x` →
+/// `("db", 3306)`. Puertos por defecto: MySQL 3306, PostgreSQL 5432,
+/// http 80, https 443. Tolera IPv6 entre corchetes.
+fn source_host_port(url: &str) -> Option<(String, u16)> {
+    let lower = url.to_ascii_lowercase();
+    let default_port = if lower.starts_with("mysql://") {
+        3306
+    } else if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+        5432
+    } else if lower.starts_with("http://") {
+        80
+    } else if lower.starts_with("https://") {
+        443
+    } else {
+        return None;
+    };
+
+    let rest = url.split("://").nth(1)?;
+    let before_slash = rest.split('/').next()?;
+    let host_port = before_slash.rsplit('@').next()?;
+
+    let (host, port) = if let Some(colon) = host_port.rfind(':') {
+        match host_port[colon + 1..].parse::<u16>() {
+            Ok(p) => (&host_port[..colon], p),
+            Err(_) => (host_port, default_port), // "host:no-numérico" → default
+        }
+    } else {
+        (host_port, default_port)
+    };
+    Some((host.trim_matches(['[', ']']).to_string(), port))
+}
+
+/// Probe de salud de una fuente (filosofía culling: se invoca solo sobre la
+/// fuente seleccionada, en segundo plano, y el resultado se cachea):
+/// - URLs (`mysql://`, `postgres://`, `http(s)://`…): conexión TCP al
+///   host:puerto con timeout de 2s (el servicio existe aunque luego falle la
+///   autenticación).
+/// - Archivos: comprobación de que existen y son legibles (no se abre la DB).
+fn probe_source(path: &str) -> bool {
+    match source_kind(path) {
+        SourceKind::File => {
+            let file = path.strip_prefix("sqlite://").unwrap_or(path);
+            std::fs::metadata(file).map(|meta| meta.is_file()).unwrap_or(false)
+        }
+        SourceKind::Localhost | SourceKind::Online => {
+            let Some((host, port)) = source_host_port(path) else {
+                return false;
+            };
+            let addr: Option<std::net::SocketAddr> = match host.parse::<std::net::IpAddr>() {
+                Ok(ip) => Some(std::net::SocketAddr::new(ip, port)),
+                Err(_) => {
+                    // Hostname: resolución DNS bloqueante (aceptable: va en spawn_blocking)
+                    use std::net::ToSocketAddrs;
+                    match (host.as_str(), port).to_socket_addrs() {
+                        Ok(mut addrs) => addrs.next(),
+                        Err(_) => None,
+                    }
+                }
+            };
+            let Some(addr) = addr else { return false };
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
+        }
+    }
+}
+
 /// Marca de tipo de base de datos para el panel Fuentes (1 carácter).
 /// - `▣` `SQLite` (incluye URLs `sqlite://`) · `D` `DuckDB` · `M` `MySQL` ·
 ///   `P` `PostgreSQL` · `⊙` endpoint genérico (`http`/`https`/`ssh`)
@@ -299,7 +364,7 @@ fn is_source_section(item: &str) -> bool {
 fn strip_source_marks(mut item: &str) -> &str {
     loop {
         let mut stripped = false;
-        for mark in ["● ", "★ ", "▣ ", "D ", "M ", "P ", "⊙ "] {
+        for mark in ["● ", "★ ", "✓ ", "✗ ", "▣ ", "D ", "M ", "P ", "⊙ "] {
             if let Some(rest) = item.strip_prefix(mark) {
                 item = rest;
                 stripped = true;
@@ -369,10 +434,11 @@ impl SourceFilter {
 }
 
 /// Construye la lista del panel Fuentes por secciones: FAVORITOS, RECIENTES
-/// y LOCAL DETECTADO (./), con marcas de tipo y de DB conectada.
+/// y ARCHIVOS (./), con marcas de tipo, de salud y de DB conectada.
 struct SourceList<'a> {
     state: &'a storage::AppState,
     connected: Option<&'a str>,
+    health: &'a HashMap<String, bool>,
     out: Vec<String>,
     seen: HashSet<String>,
     sections: HashSet<String>,
@@ -396,7 +462,17 @@ impl SourceList<'_> {
         }
         let is_fav = self.state.favorites.values().any(|v| v == &path);
         let prefix = if is_fav { "★ ".to_string() } else { format!("{} ", db_type_mark(&path)) };
-        let mark = if self.connected == Some(path.as_str()) { "● " } else { "" };
+        // Salud: ✓ accesible / ✗ con problemas / sin marca = no verificado
+        let health_mark = match self.health.get(&path) {
+            Some(true) => "✓ ",
+            Some(false) => "✗ ",
+            None => "",
+        };
+        let mark = format!(
+            "{}{}",
+            if self.connected == Some(path.as_str()) { "● " } else { "" },
+            health_mark
+        );
         match display {
             Some(name) => self.out.push(format!("{mark}{prefix}{name} => {path}")),
             None => self.out.push(format!("{mark}{prefix}{path}")),
@@ -524,6 +600,16 @@ pub struct App {
     pub query_state: query::QueryState,
     pub query_results: Vec<String>,
     pub state: storage::AppState,
+
+    // ── probe de salud de fuentes (filosofía culling) ──
+    /// Caché de salud por fuente (path → accesible). Solo se prueban las
+    /// fuentes que el usuario va seleccionando, nunca toda la lista.
+    pub health: HashMap<String, bool>,
+    /// Fuente con probe en vuelo (evita lanzar dos probes seguidos).
+    probing: Option<String>,
+    /// Canal de resultados de probes en segundo plano (tx/rx).
+    probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
+    probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
     pub keymap: keys::Keymap,
     pub show_actions_menu: bool,
     pub actions_menu_idx: usize,
@@ -568,6 +654,7 @@ impl App {
         let keymap = keys::Keymap::load();
         let ui_config = config::load_ui_config();
         let source_tab = SourceTab::All;
+        let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let panels = [
             Panel::new_sidebar(PanelKind::Sources),
@@ -582,8 +669,12 @@ impl App {
             active_panel: PanelKind::Sources,
             last_sidebar_focus: PanelKind::Sources,
             layout: ComputedLayout::default(),
-            sources: Self::build_sources(&state, source_tab, None),
+            sources: Self::build_sources(&state, source_tab, None, &HashMap::new()),
             source_tab,
+            health: HashMap::new(),
+            probing: None,
+            probe_rx: Some(probe_rx),
+            probe_tx: Some(probe_tx),
             tables: vec![],
             views: vec![],
             advanced: vec![],
@@ -624,6 +715,9 @@ impl App {
     // ── layout ────────────────────────────────────────────────────────
 
     pub fn compute_layout(&mut self, width: u16, height: u16) {
+        // Aplicar resultados de probes de salud terminados (tick por frame)
+        self.poll_probe_results();
+
         let mode_overrides = self.panels.iter().map(|p| (p.kind, p.mode)).collect::<Vec<_>>();
         let modes: [(PanelKind, PanelMode); 5] = {
             let mut arr = [(PanelKind::Sources, PanelMode::default()); 5];
@@ -660,6 +754,50 @@ impl App {
 
     fn set_selected_idx(&mut self, kind: PanelKind, idx: usize) {
         self.panel_mut(kind).selected_idx = idx;
+        if kind == PanelKind::Sources {
+            // Probe de salud perezoso: al mover el cursor por Fuentes se
+            // comprueba la fuente recién seleccionada (en segundo plano).
+            self.probe_selected();
+        }
+    }
+
+    // ── probe de salud de fuentes (filosofía culling) ─────────────────
+
+    /// Lanza en segundo plano el probe de la fuente bajo el cursor, si no
+    /// está cacheada ni en vuelo. Nunca bloquea la UI.
+    fn probe_selected(&mut self) {
+        let Some(selected) =
+            self.items_for(PanelKind::Sources).get(self.selected_idx(PanelKind::Sources))
+        else {
+            return;
+        };
+        let path = source_path_of(selected).to_string();
+        if self.health.contains_key(&path) || self.probing.as_deref() == Some(&path) {
+            return;
+        }
+        let Some(tx) = self.probe_tx.clone() else { return };
+        self.probing = Some(path.clone());
+        tokio::spawn(async move {
+            let ok = probe_source(&path);
+            let _ = tx.send((path, ok));
+        });
+    }
+
+    /// Aplica los resultados de probes terminados (llamado cada frame).
+    fn poll_probe_results(&mut self) {
+        let Some(rx) = self.probe_rx.as_mut() else { return };
+        while let Ok((path, ok)) = rx.try_recv() {
+            self.health.insert(path.clone(), ok);
+            if self.probing.as_deref() == Some(&path) {
+                self.probing = None;
+            }
+            self.sources = Self::build_sources(
+                &self.state,
+                self.source_tab,
+                self.db_path.as_deref(),
+                &self.health,
+            );
+        }
     }
 
     // ── navegación de foco ────────────────────────────────────────────
@@ -923,10 +1061,12 @@ impl App {
         state: &storage::AppState,
         source_tab: SourceTab,
         connected: Option<&str>,
+        health: &HashMap<String, bool>,
     ) -> Vec<String> {
         let mut list = SourceList {
             state,
             connected,
+            health,
             out: Vec::new(),
             seen: HashSet::new(),
             sections: HashSet::new(),
@@ -954,7 +1094,12 @@ impl App {
 
     fn set_source_tab(&mut self, tab: SourceTab) {
         self.source_tab = tab;
-        self.sources = Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
+        self.sources = Self::build_sources(
+            &self.state,
+            self.source_tab,
+            self.db_path.as_deref(),
+            &self.health,
+        );
         self.set_selected_idx(PanelKind::Sources, 0);
     }
 
@@ -1078,7 +1223,8 @@ impl App {
             let path_str = path.clone();
             self.state.add_recent(path_str);
             let _ = self.state.save();
-            self.sources = Self::build_sources(&self.state, self.source_tab, Some(&path));
+            self.sources =
+                Self::build_sources(&self.state, self.source_tab, Some(&path), &self.health);
 
             self.db_path = Some(path.clone());
             self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
@@ -1493,7 +1639,12 @@ impl App {
 
         self.state.add_favorite(favorite_name.clone(), path.to_string());
         let _ = self.state.save();
-        self.sources = Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
+        self.sources = Self::build_sources(
+            &self.state,
+            self.source_tab,
+            self.db_path.as_deref(),
+            &self.health,
+        );
         self.status = format!("Favorito guardado: {favorite_name}");
     }
 
@@ -1526,7 +1677,12 @@ impl App {
         }
 
         let _ = self.state.save();
-        self.sources = Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
+        self.sources = Self::build_sources(
+            &self.state,
+            self.source_tab,
+            self.db_path.as_deref(),
+            &self.health,
+        );
     }
 
     /// `d` en el panel Fuentes: olvida la fuente bajo el cursor (la quita de
@@ -1560,8 +1716,12 @@ impl App {
         if self.db_path.as_deref() == Some(canonical.as_str()) {
             self.disconnect_db();
         } else {
-            self.sources =
-                Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
+            self.sources = Self::build_sources(
+                &self.state,
+                self.source_tab,
+                self.db_path.as_deref(),
+                &self.health,
+            );
             self.status = format!("Fuente olvidada: {path}");
         }
     }
@@ -1580,7 +1740,7 @@ impl App {
         self.detail_tab = DetailTab::Data;
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
-        self.sources = Self::build_sources(&self.state, self.source_tab, None);
+        self.sources = Self::build_sources(&self.state, self.source_tab, None, &self.health);
         self.set_focus(PanelKind::Sources);
         self.set_selected_idx(PanelKind::Sources, 0);
         self.status = "Base de datos cerrada".to_string();
@@ -1845,7 +2005,12 @@ impl App {
     fn reload_runtime_config(&mut self) {
         self.keymap = keys::Keymap::load();
         self.state = storage::AppState::load();
-        self.sources = Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
+        self.sources = Self::build_sources(
+            &self.state,
+            self.source_tab,
+            self.db_path.as_deref(),
+            &self.health,
+        );
 
         let ui_config = config::load_ui_config();
         self.rows_per_page = ui_config.rows_per_page;
@@ -2732,7 +2897,7 @@ mod tests {
     fn build_sources_online_agrupa_favoritos_y_recents() {
         let mut state = state_de_prueba();
         state.favorites.insert("remote".to_string(), "https://remote.example/db".to_string());
-        let sources = App::build_sources(&state, SourceTab::Online, None);
+        let sources = App::build_sources(&state, SourceTab::Online, None, &HashMap::new());
 
         assert!(sources.iter().any(|s| s == &source_section("FAVORITOS")));
         assert!(sources.iter().any(|s| s.starts_with("★ remote => https://remote.example/db")));
@@ -2746,7 +2911,8 @@ mod tests {
     #[test]
     fn build_sources_marca_la_conectada() {
         let state = state_de_prueba();
-        let sources = App::build_sources(&state, SourceTab::All, Some("/a/one.db"));
+        let sources =
+            App::build_sources(&state, SourceTab::All, Some("/a/one.db"), &HashMap::new());
         assert!(sources.iter().any(|s| s.starts_with("● ★ one => /a/one.db")));
     }
 
@@ -2759,7 +2925,7 @@ mod tests {
         // colapsar en UNA sola entrada: el `seen` compara rutas canónicas.
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string(), "https://remote.example/db".to_string()];
-        let sources = App::build_sources(&state, SourceTab::All, None);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
 
         let matches = sources
             .iter()
@@ -2778,7 +2944,7 @@ mod tests {
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string()];
         let connected = crate::paths::normalize_path("one.db");
-        let sources = App::build_sources(&state, SourceTab::All, Some(&connected));
+        let sources = App::build_sources(&state, SourceTab::All, Some(&connected), &HashMap::new());
         assert!(
             sources.iter().any(|s| s.starts_with(&format!("● ▣ {connected}"))),
             "la entrada absoluta debe llevar ●: {sources:?}"
@@ -2790,7 +2956,7 @@ mod tests {
         // El reciente relativo "one.db" debe mostrarse en su forma canónica.
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string()];
-        let sources = App::build_sources(&state, SourceTab::All, None);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
         let shown = sources.iter().find_map(|s| {
             let p = source_path_of(s);
             (!is_source_section(s) && p != "Abrir sakila.db" && p != "Buscar archivo .db")
@@ -2845,7 +3011,7 @@ mod tests {
             "one.db".to_string(),
             "https://remote.example/db".to_string(),
         ];
-        let local = App::build_sources(&state, SourceTab::Local, None);
+        let local = App::build_sources(&state, SourceTab::Local, None, &HashMap::new());
         assert!(
             local.iter().any(|s| s.starts_with("M mysql://127.0.0.1:3306/lazy")),
             "mysql de localhost debe estar en el tab Local: {local:?}"
@@ -2856,13 +3022,99 @@ mod tests {
             "lo online NO debe filtrarse al tab Local"
         );
 
-        let online = App::build_sources(&state, SourceTab::Online, None);
+        let online = App::build_sources(&state, SourceTab::Online, None, &HashMap::new());
         assert!(
             online.iter().any(|s| s.starts_with("⊙ https://remote.example/db")),
             "lo online debe estar en el tab Online: {online:?}"
         );
         assert!(!online.iter().any(|s| source_path_of(s).ends_with("one.db")));
         assert!(!online.iter().any(|s| s.contains("mysql://127.0.0.1")));
+    }
+
+    // ── probe de salud (filosofía culling) ────────────────────────────
+
+    #[test]
+    fn source_host_port_extrae_host_y_puerto() {
+        assert_eq!(
+            source_host_port("mysql://localhost:3306/lazy"),
+            Some(("localhost".into(), 3306))
+        );
+        assert_eq!(
+            source_host_port("postgres://user@db.azure.com:5432/prod"),
+            Some(("db.azure.com".into(), 5432))
+        );
+        // Sin puerto → default del esquema
+        assert_eq!(source_host_port("mysql://localhost/lazy"), Some(("localhost".into(), 3306)));
+        assert_eq!(
+            source_host_port("https://api.example.com/x"),
+            Some(("api.example.com".into(), 443))
+        );
+        // IPv6 entre corchetes
+        assert_eq!(source_host_port("postgres://[::1]:5432/x"), Some(("::1".into(), 5432)));
+        // No es URL de conexión
+        assert_eq!(source_host_port("sakila.db"), None);
+        assert_eq!(source_host_port("sqlite:///tmp/x.db"), None);
+    }
+
+    #[test]
+    fn probe_source_detecta_archivos() {
+        let dir = std::env::temp_dir().join(format!("lazydb-probe-{}", std::process::id()));
+        let db_file = dir.join("x.db");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(&db_file, b"sqlite").expect("escribir archivo de prueba");
+
+        assert!(probe_source(&db_file.to_string_lossy()), "archivo existente debe dar ✓");
+        assert!(
+            probe_source(&format!("sqlite://{}", db_file.to_string_lossy())),
+            "URL sqlite:// del mismo archivo debe dar ✓"
+        );
+        let missing = dir.join("no-existe.db");
+        assert!(!probe_source(&missing.to_string_lossy()), "archivo inexistente debe dar ✗");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_source_verifica_tcp() {
+        // Servidor real: el probe debe dar ✓
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind en tests");
+        let port = listener.local_addr().expect("puerto local").port();
+        let url = format!("mysql://127.0.0.1:{port}/lazy");
+        assert!(probe_source(&url), "servicio escuchando debe dar ✓: {url}");
+        drop(listener);
+
+        // Puerto cerrado: debe dar ✗ (refused es inmediato)
+        let url_closed = format!("mysql://127.0.0.1:{port}/lazy");
+        assert!(!probe_source(&url_closed), "puerto cerrado debe dar ✗: {url_closed}");
+    }
+
+    #[test]
+    fn build_sources_marca_salud() {
+        let mut state = storage::AppState::new();
+        state.recents = vec!["ok.db".to_string(), "caida.db".to_string()];
+        let canonical_ok = crate::paths::normalize_path("ok.db");
+        let canonical_caida = crate::paths::normalize_path("caida.db");
+
+        let mut health = HashMap::new();
+        health.insert(canonical_ok.clone(), true);
+        health.insert(canonical_caida.clone(), false);
+
+        let sources = App::build_sources(&state, SourceTab::All, None, &health);
+        assert!(
+            sources.iter().any(|s| s.starts_with(&format!("✓ ▣ {canonical_ok}"))),
+            "fuente sana debe llevar ✓: {sources:?}"
+        );
+        assert!(
+            sources.iter().any(|s| s.starts_with(&format!("✗ ▣ {canonical_caida}"))),
+            "fuente caída debe llevar ✗: {sources:?}"
+        );
+        // La conectada combina ● + ✓
+        let sources_connected =
+            App::build_sources(&state, SourceTab::All, Some(&canonical_ok), &health);
+        assert!(
+            sources_connected.iter().any(|s| s.starts_with(&format!("● ✓ ▣ {canonical_ok}"))),
+            "conectada + sana = '● ✓': {sources_connected:?}"
+        );
     }
 
     #[test]
@@ -2873,7 +3125,7 @@ mod tests {
             "mysql://localhost/lazy".to_string(),
             "postgres://db.azure.com/prod".to_string(),
         ];
-        let sources = App::build_sources(&state, SourceTab::All, None);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
         assert!(sources.iter().any(|s| s.starts_with("D ")), "DuckDB debe marcarse D");
         assert!(sources.iter().any(|s| s.starts_with("M ")), "MySQL debe marcarse M");
         assert!(sources.iter().any(|s| s.starts_with("P ")), "Postgres debe marcarse P");
