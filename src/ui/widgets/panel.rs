@@ -425,9 +425,9 @@ fn render_collapsed_line(
 
 /// Línea de un item del panel Fuentes con sus marcas coloreadas:
 /// - sección `\u{1}LABEL` → subtítulo `── LABEL ────` en `DarkGray` (dim)
-/// - entry `[● ]<★|▣|⊙ >texto` → prefijo coloreado + texto normal
+/// - entry `[● ]<★|▣|D|M|P|⊙ >texto` → prefijo coloreado + texto normal
 ///
-/// Los prefijos siguen el orden real del item ("● " puede combinar con ★/▣/⊙).
+/// Los prefijos siguen el orden real del item ("● " puede combinar con el resto).
 fn source_line(item: &str, width: u16) -> RatLine<'_> {
     if let Some(label) = item.strip_prefix(SOURCE_SECTION_MARK) {
         let prefix = format!("── {label}");
@@ -438,9 +438,15 @@ fn source_line(item: &str, width: u16) -> RatLine<'_> {
 
     let mut spans = Vec::new();
     let mut rest = item;
-    for (mark, color) in
-        [("● ", Color::Cyan), ("★ ", Color::Yellow), ("▣ ", Color::Blue), ("⊙ ", Color::Magenta)]
-    {
+    for (mark, color) in [
+        ("● ", Color::Cyan),
+        ("★ ", Color::Yellow),
+        ("▣ ", Color::Blue),
+        ("D ", Color::Green),
+        ("M ", Color::Red),
+        ("P ", Color::Magenta),
+        ("⊙ ", Color::Magenta),
+    ] {
         if let Some(after) = rest.strip_prefix(mark) {
             spans.push(Span::styled(mark, Style::default().fg(color)));
             rest = after;

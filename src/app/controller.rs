@@ -208,25 +208,78 @@ fn now_millis() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn is_online_source(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("ssh://")
-        || lower.starts_with("postgres://")
-        || lower.starts_with("mysql://")
-        || lower.starts_with("sqlite://")
+/// Clasificación tipada de una fuente, reemplaza la heurística de strings
+/// (`is_online_source`), que confundía `sqlite://` con online y ocultaba las
+/// URLs de localhost del tab Local.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SourceKind {
+    /// Archivo local: `.db`, `.sqlite`, `.duckdb` o URL `sqlite://`.
+    File,
+    /// Servicio en la propia máquina: `mysql://localhost/...`, `[::1]`, etc.
+    Localhost,
+    /// Servicio remoto: `http(s)://`, `ssh://` o DB URL con host no local.
+    Online,
 }
 
-fn is_local_source(value: &str) -> bool {
-    !is_online_source(value)
+fn source_kind(value: &str) -> SourceKind {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("ssh://")
+    {
+        return SourceKind::Online;
+    }
+    if lower.starts_with("mysql://")
+        || lower.starts_with("postgres://")
+        || lower.starts_with("postgresql://")
+    {
+        let host = url_host(&lower);
+        let is_local =
+            host.is_none_or(|h| h == "localhost" || h == "127.0.0.1" || h == "[::1]" || h == "::1");
+        return if is_local { SourceKind::Localhost } else { SourceKind::Online };
+    }
+    // `sqlite://`, rutas relativas/absolutas y todo lo demás: archivo local
+    SourceKind::File
+}
+
+/// Host de una URL de conexión: `mysql://user:pass@127.0.0.1:3306/db` →
+/// `127.0.0.1`. Tolera IPv6 entre corchetes (`[::1]`).
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split("://").nth(1)?;
+    let before_slash = rest.split('/').next()?;
+    let host_port = before_slash.rsplit('@').next()?;
+    if let Some(bracket_end) = host_port.find(']') {
+        Some(&host_port[..=bracket_end])
+    } else {
+        Some(host_port.split(':').next().unwrap_or(host_port))
+    }
+}
+
+/// Marca de tipo de base de datos para el panel Fuentes (1 carácter).
+/// - `▣` SQLite (incluye URLs `sqlite://`) · `D` DuckDB · `M` MySQL ·
+///   `P` PostgreSQL · `⊙` endpoint genérico (http/https/ssh)
+fn db_type_mark(value: &str) -> char {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+        'P'
+    } else if lower.starts_with("mysql://") {
+        'M'
+    } else if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ssh://")
+    {
+        '⊙'
+    } else if lower.ends_with(".duckdb") || lower.ends_with(".ddb") {
+        'D'
+    } else {
+        '▣'
+    }
 }
 
 // ── formato de items del panel Fuentes ─────────────────────────────────
 // Cada item es un string plano con marcas que el render colorea:
 //   sección:   "\u{1}LABEL"          (marcador interno, no visible)
-//   entry:     [● ]<★|▣|⊙ ><texto>   (● = conectada, ★ = favorito,
-//                                     ▣ = sqlite local, ⊙ = online)
+//   entry:     [● ]<★|▣|D|M|P|⊙ ><texto>   (● = conectada, ★ = favorito,
+//                                     ▣ = sqlite, D = duckdb, M = mysql,
+//                                     P = postgres, ⊙ = endpoint genérico)
 // Los favoritos usan "name => path"; el resto muestra el path directo.
 
 /// Marcador interno de sección (SOH): nunca se renderiza tal cual.
@@ -245,7 +298,7 @@ fn is_source_section(item: &str) -> bool {
 fn strip_source_marks(mut item: &str) -> &str {
     loop {
         let mut stripped = false;
-        for mark in ["● ", "★ ", "▣ ", "⊙ "] {
+        for mark in ["● ", "★ ", "▣ ", "D ", "M ", "P ", "⊙ "] {
             if let Some(rest) = item.strip_prefix(mark) {
                 item = rest;
                 stripped = true;
@@ -275,8 +328,9 @@ impl SourceFilter {
     fn passes(self, path: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Local => is_local_source(path),
-            Self::Online => is_online_source(path),
+            // Local = archivos + servicios de localhost (mysql://localhost…)
+            Self::Local => matches!(source_kind(path), SourceKind::File | SourceKind::Localhost),
+            Self::Online => source_kind(path) == SourceKind::Online,
         }
     }
 }
@@ -308,13 +362,7 @@ impl SourceList<'_> {
             return;
         }
         let is_fav = self.state.favorites.values().any(|v| v == &path);
-        let prefix = if is_fav {
-            "★ "
-        } else if is_online_source(&path) {
-            "⊙ "
-        } else {
-            "▣ "
-        };
+        let prefix = if is_fav { "★ ".to_string() } else { format!("{} ", db_type_mark(&path)) };
         let mark = if self.connected == Some(path.as_str()) { "● " } else { "" };
         match display {
             Some(name) => self.out.push(format!("{mark}{prefix}{name} => {path}")),
@@ -361,7 +409,7 @@ impl SourceList<'_> {
         if fresh.is_empty() {
             return;
         }
-        self.section("LOCAL DETECTADO (./)");
+        self.section("ARCHIVOS (./)");
         for db in &fresh {
             self.entry(db, None);
         }
@@ -776,7 +824,15 @@ impl App {
                     SourceTab::Local => "Todo [Local] Online",
                     SourceTab::Online => "Todo Local [Online]",
                 };
-                format!("[{num}]Fuentes ({tabs})")
+                // DB conectada (nombre corto + ●) si hay conexión activa
+                let conn = self.db_path.as_deref().map_or(String::new(), |path| {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(path);
+                    format!(" · {name} ●")
+                });
+                format!("[{num}]Fuentes{conn} ({tabs})")
             }
             PanelKind::Tables => {
                 if self.tables.is_empty() {
@@ -2617,10 +2673,17 @@ mod tests {
     fn strip_marks_quita_prefijos_decorativos() {
         assert_eq!(strip_source_marks("▣ /tmp/x.db"), "/tmp/x.db");
         assert_eq!(strip_source_marks("⊙ https://api.x/db"), "https://api.x/db");
+        assert_eq!(strip_source_marks("M mysql://127.0.0.1/lazy"), "mysql://127.0.0.1/lazy");
+        assert_eq!(
+            strip_source_marks("P postgres://db.azure.com/prod"),
+            "postgres://db.azure.com/prod"
+        );
+        assert_eq!(strip_source_marks("D base.duckdb"), "base.duckdb");
         assert_eq!(strip_source_marks("★ one => /a/one.db"), "one => /a/one.db");
         assert_eq!(strip_source_marks("Abrir sakila.db"), "Abrir sakila.db");
         // Marcas combinables (conectada + tipo)
         assert_eq!(strip_source_marks("● ▣ /tmp/x.db"), "/tmp/x.db");
+        assert_eq!(strip_source_marks("● M mysql://127.0.0.1/lazy"), "mysql://127.0.0.1/lazy");
         assert_eq!(strip_source_marks("● ★ one => /a/one.db"), "one => /a/one.db");
     }
 
@@ -2710,6 +2773,85 @@ mod tests {
         });
         let canonical = crate::paths::normalize_path("one.db");
         assert_eq!(shown, Some(canonical.as_str()));
+    }
+
+    // ── rediseño: SourceKind + marcas por tipo de DB ───────────────────
+
+    #[test]
+    fn source_kind_clasifica_fuentes() {
+        assert_eq!(source_kind("mysql://localhost:3306/lazy"), SourceKind::Localhost);
+        assert_eq!(source_kind("mysql://127.0.0.1:3306/lazy"), SourceKind::Localhost);
+        assert_eq!(source_kind("postgres://[::1]:5432/prod"), SourceKind::Localhost);
+        assert_eq!(source_kind("postgres://db.azure.com:5432/prod"), SourceKind::Online);
+        assert_eq!(source_kind("https://api.example.com/db"), SourceKind::Online);
+        assert_eq!(source_kind("ssh://host/db"), SourceKind::Online);
+        // sqlite:// y rutas de archivo SIEMPRE son File (antes se confundían)
+        assert_eq!(source_kind("sqlite:///tmp/x.db"), SourceKind::File);
+        assert_eq!(source_kind("sakila.db"), SourceKind::File);
+        assert_eq!(source_kind("/abs/base.duckdb"), SourceKind::File);
+    }
+
+    #[test]
+    fn url_host_extrae_el_host_real() {
+        assert_eq!(url_host("mysql://user:pass@127.0.0.1:3306/lazy"), Some("127.0.0.1"));
+        assert_eq!(url_host("mysql://localhost/db"), Some("localhost"));
+        assert_eq!(url_host("postgres://[::1]:5432/x"), Some("[::1]"));
+        assert_eq!(url_host("postgres://db.azure.com:5432/prod"), Some("db.azure.com"));
+        assert_eq!(url_host("sqlite:///tmp/x.db"), Some(""));
+    }
+
+    #[test]
+    fn db_type_mark_segun_tipo() {
+        assert_eq!(db_type_mark("postgres://db.azure.com/prod"), 'P');
+        assert_eq!(db_type_mark("postgresql://127.0.0.1/lazy"), 'P');
+        assert_eq!(db_type_mark("mysql://localhost/lazy"), 'M');
+        assert_eq!(db_type_mark("https://api.x/db"), '⊙');
+        assert_eq!(db_type_mark("base.duckdb"), 'D');
+        assert_eq!(db_type_mark("otra.ddb"), 'D');
+        assert_eq!(db_type_mark("sakila.db"), '▣');
+        assert_eq!(db_type_mark("sqlite:///tmp/x.db"), '▣');
+    }
+
+    #[test]
+    fn tab_local_muestra_localhost_y_oculta_online() {
+        let mut state = storage::AppState::new();
+        state.recents = vec![
+            "mysql://127.0.0.1:3306/lazy".to_string(),
+            "one.db".to_string(),
+            "https://remote.example/db".to_string(),
+        ];
+        let local = App::build_sources(&state, SourceTab::Local, None);
+        assert!(
+            local.iter().any(|s| s.starts_with("M mysql://127.0.0.1:3306/lazy")),
+            "mysql de localhost debe estar en el tab Local: {local:?}"
+        );
+        assert!(local.iter().any(|s| source_path_of(s).ends_with("one.db")));
+        assert!(
+            !local.iter().any(|s| s.contains("https://remote.example/db")),
+            "lo online NO debe filtrarse al tab Local"
+        );
+
+        let online = App::build_sources(&state, SourceTab::Online, None);
+        assert!(
+            online.iter().any(|s| s.starts_with("⊙ https://remote.example/db")),
+            "lo online debe estar en el tab Online: {online:?}"
+        );
+        assert!(!online.iter().any(|s| source_path_of(s).ends_with("one.db")));
+        assert!(!online.iter().any(|s| s.contains("mysql://127.0.0.1")));
+    }
+
+    #[test]
+    fn entry_marca_el_tipo_no_solo_sqlite() {
+        let mut state = storage::AppState::new();
+        state.recents = vec![
+            "base.duckdb".to_string(),
+            "mysql://localhost/lazy".to_string(),
+            "postgres://db.azure.com/prod".to_string(),
+        ];
+        let sources = App::build_sources(&state, SourceTab::All, None);
+        assert!(sources.iter().any(|s| s.starts_with("D ")), "DuckDB debe marcarse D");
+        assert!(sources.iter().any(|s| s.starts_with("M ")), "MySQL debe marcarse M");
+        assert!(sources.iter().any(|s| s.starts_with("P ")), "Postgres debe marcarse P");
     }
 
     #[test]
