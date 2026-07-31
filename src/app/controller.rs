@@ -857,15 +857,7 @@ impl App {
                     SourceTab::Local => "Todo [Local] Online",
                     SourceTab::Online => "Todo Local [Online]",
                 };
-                // DB conectada (nombre corto + ●) si hay conexión activa
-                let conn = self.db_path.as_deref().map_or(String::new(), |path| {
-                    let name = std::path::Path::new(path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(path);
-                    format!(" · {name} ●")
-                });
-                format!("[{num}]Fuentes{conn} ({tabs})")
+                format!("[{num}]Fuentes ({tabs})")
             }
             PanelKind::Tables => {
                 if self.tables.is_empty() {
