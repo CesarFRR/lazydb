@@ -13,11 +13,6 @@ const LARGE_WIDTH: u16 = 120;
 const KB_BYTES: u64 = 1024;
 const MB_BYTES: u64 = KB_BYTES * 1024;
 
-/// TTL del caché de salud de fuentes: pasado este tiempo, la fuente
-/// seleccionada se re-verifica (el archivo/servicio pudo cambiar sin que
-/// lazydb se entere: renombrados, servicios caídos, etc.).
-const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
-
 // ---------------------------------------------------------------------------
 // Enums de UI (transición: algunos se moverán a panel.rs en el futuro)
 // ---------------------------------------------------------------------------
@@ -344,9 +339,11 @@ fn db_type_mark(value: &str) -> char {
 // ── formato de items del panel Fuentes ─────────────────────────────────
 // Cada item es un string plano con marcas que el render colorea:
 //   sección:   "\u{1}LABEL"          (marcador interno, no visible)
-//   entry:     [● ]<★|▣|D|M|P|⊙ ><texto>   (● = conectada, ★ = favorito,
-//                                     ▣ = sqlite, D = duckdb, M = mysql,
-//                                     P = postgres, ⊙ = endpoint genérico)
+//   entry:     [● ][✗ ]<★|▣|D|M|P|⊙ ><texto>
+//                     ● = conectada, ✗ = con problemas (sin marca = bien),
+//                     ★ = favorito, ▣ = sqlite, D = duckdb, M = mysql,
+//                     P = postgres, ⊙ = endpoint genérico
+// Los favoritos van al inicio de la lista sin sección propia (la ★ basta).
 // Los favoritos usan "name => path"; el resto muestra el path directo.
 
 /// Marcador interno de sección (SOH): nunca se renderiza tal cual.
@@ -365,7 +362,7 @@ fn is_source_section(item: &str) -> bool {
 fn strip_source_marks(mut item: &str) -> &str {
     loop {
         let mut stripped = false;
-        for mark in ["● ", "★ ", "✓ ", "✗ ", "▣ ", "D ", "M ", "P ", "⊙ "] {
+        for mark in ["● ", "★ ", "✗ ", "▣ ", "D ", "M ", "P ", "⊙ "] {
             if let Some(rest) = item.strip_prefix(mark) {
                 item = rest;
                 stripped = true;
@@ -439,7 +436,7 @@ impl SourceFilter {
 struct SourceList<'a> {
     state: &'a storage::AppState,
     connected: Option<&'a str>,
-    health: &'a HashMap<String, (bool, std::time::Instant)>,
+    health: &'a HashMap<String, bool>,
     out: Vec<String>,
     seen: HashSet<String>,
     sections: HashSet<String>,
@@ -463,12 +460,8 @@ impl SourceList<'_> {
         }
         let is_fav = self.state.favorites.values().any(|v| v == &path);
         let prefix = if is_fav { "★ ".to_string() } else { format!("{} ", db_type_mark(&path)) };
-        // Salud: ✓ accesible / ✗ con problemas / sin marca = no verificado
-        let health_mark = match self.health.get(&path) {
-            Some((true, _)) => "✓ ",
-            Some((false, _)) => "✗ ",
-            None => "",
-        };
+        // Solo se marca el error: sin marca = la fuente está bien (no hay ✓).
+        let health_mark = if self.health.get(&path) == Some(&false) { "✗ " } else { "" };
         let mark = format!(
             "{}{}",
             if self.connected == Some(path.as_str()) { "● " } else { "" },
@@ -489,10 +482,7 @@ impl SourceList<'_> {
             .map(|(n, p)| (n.clone(), p.clone()))
             .collect();
         favs.sort_by(|a, b| a.0.cmp(&b.0));
-        if favs.is_empty() {
-            return;
-        }
-        self.section("FAVORITOS");
+        // Sin sección propia: la ★ ya identifica al favorito; van primero.
         for (name, path) in &favs {
             self.entry(path, Some(name));
         }
@@ -603,10 +593,10 @@ pub struct App {
     pub state: storage::AppState,
 
     // ── probe de salud de fuentes (filosofía culling) ──
-    /// Caché de salud por fuente (path → accesible + momento del probe).
-    /// Solo se prueban las fuentes que el usuario va seleccionando, nunca
-    /// toda la lista; el TTL (3s) permite detectar cambios externos en vivo.
-    pub health: HashMap<String, (bool, std::time::Instant)>,
+    /// Último estado de salud conocido por fuente (path → accesible). Solo
+    /// se prueban las fuentes que el usuario selecciona (click o flechas),
+    /// nunca toda la lista ni por tiempo.
+    pub health: HashMap<String, bool>,
     /// Fuente con probe en vuelo (evita lanzar dos probes seguidos).
     probing: Option<String>,
     /// Canal de resultados de probes en segundo plano (tx/rx).
@@ -765,24 +755,10 @@ impl App {
 
     // ── probe de salud de fuentes (filosofía culling) ─────────────────
 
-    /// ¿Hay que (re)verificar esta fuente? `false` si está en vuelo o si el
-    /// caché es más fresco que el TTL. Función pura, testeable.
-    fn should_probe(
-        health: &HashMap<String, (bool, std::time::Instant)>,
-        path: &str,
-        probing: Option<&str>,
-    ) -> bool {
-        if probing == Some(path) {
-            return false;
-        }
-        match health.get(path) {
-            None => true,
-            Some((_, at)) => at.elapsed() >= PROBE_TTL,
-        }
-    }
-
-    /// Lanza en segundo plano el probe de la fuente bajo el cursor, si no
-    /// está en vuelo y el caché expiró (TTL). Nunca bloquea la UI.
+    /// Lanza en segundo plano el probe de la fuente bajo el cursor. Se
+    /// re-verifica en cada selección (click o flechas): si algo cambió en
+    /// el exterior, la marca ✗ aparece al volver a pasar por la fuente.
+    /// Nunca bloquea la UI ni se re-probea por tiempo.
     fn probe_selected(&mut self) {
         let Some(selected) =
             self.items_for(PanelKind::Sources).get(self.selected_idx(PanelKind::Sources))
@@ -790,7 +766,7 @@ impl App {
             return;
         };
         let path = source_path_of(selected).to_string();
-        if !Self::should_probe(&self.health, &path, self.probing.as_deref()) {
+        if self.probing.as_deref() == Some(&path) {
             return;
         }
         let Some(tx) = self.probe_tx.clone() else { return };
@@ -801,14 +777,14 @@ impl App {
         });
     }
 
-    /// Aplica los resultados de probes terminados y re-verifica en vivo la
-    /// fuente seleccionada (llamado cada frame en `compute_layout`).
+    /// Aplica los resultados de probes terminados (llamado cada frame en
+    /// `compute_layout`).
     fn poll_probe_results(&mut self) {
         let Some(rx) = self.probe_rx.as_mut() else { return };
         while let Ok((path, ok)) = rx.try_recv() {
-            // Rebuild solo si el estado cambió (✓ → ✗ o primera verificación)
-            let changed = self.health.get(&path).map(|(old, _)| *old) != Some(ok);
-            self.health.insert(path.clone(), (ok, std::time::Instant::now()));
+            // Rebuild solo si el estado cambió (primera verificación o ✗ ↔ ok)
+            let changed = self.health.get(&path) != Some(&ok);
+            self.health.insert(path.clone(), ok);
             if self.probing.as_deref() == Some(&path) {
                 self.probing = None;
             }
@@ -821,10 +797,6 @@ impl App {
                 );
             }
         }
-        // Re-verificación en vivo: aunque el usuario no mueva el cursor, la
-        // fuente seleccionada se re-probea al expirar el TTL (archivo
-        // renombrado, servicio que se cae, etc.).
-        self.probe_selected();
     }
 
     // ── navegación de foco ────────────────────────────────────────────
@@ -1088,7 +1060,7 @@ impl App {
         state: &storage::AppState,
         source_tab: SourceTab,
         connected: Option<&str>,
-        health: &HashMap<String, (bool, std::time::Instant)>,
+        health: &HashMap<String, bool>,
     ) -> Vec<String> {
         let mut list = SourceList {
             state,
@@ -2926,13 +2898,38 @@ mod tests {
         state.favorites.insert("remote".to_string(), "https://remote.example/db".to_string());
         let sources = App::build_sources(&state, SourceTab::Online, None, &HashMap::new());
 
-        assert!(sources.iter().any(|s| s == &source_section("FAVORITOS")));
-        assert!(sources.iter().any(|s| s.starts_with("★ remote => https://remote.example/db")));
+        // Sin sección FAVORITOS: la ★ identifica al favorito, va el primero
+        assert!(
+            !sources.iter().any(|s| s == &source_section("FAVORITOS")),
+            "la sección FAVORITOS no debe existir: {sources:?}"
+        );
+        assert_eq!(
+            sources.first().map(String::as_str),
+            Some("★ remote => https://remote.example/db"),
+            "el favorito debe encabezar la lista sin sección"
+        );
         // "one" es favorito local → no aparece en el tab Online
         assert!(!sources.iter().any(|s| s.contains("/a/one.db")));
         // Sin acciones fijas en Online
         assert!(!sources.iter().any(|s| s == "Abrir sakila.db"));
         assert!(!sources.iter().any(|s| s == "Buscar archivo .db"));
+    }
+
+    #[test]
+    fn build_sources_pon_los_favoritos_de_primeras() {
+        // En el tab All: favoritos al inicio (sin sección), luego RECIENTES
+        let state = state_de_prueba(); // favorito "one => /a/one.db", recientes /a/one.db + https
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
+
+        assert!(sources.first().is_some_and(|s| s.starts_with("★ one => /a/one.db")));
+        let recents_idx = sources
+            .iter()
+            .position(|s| s == &source_section("RECIENTES"))
+            .expect("la sección RECIENTES debe existir");
+        assert!(
+            sources[..recents_idx].iter().all(|s| !is_source_section(s)),
+            "antes de RECIENTES solo puede haber favoritos sueltos"
+        );
     }
 
     #[test]
@@ -3116,60 +3113,33 @@ mod tests {
     }
 
     #[test]
-    fn build_sources_marca_salud() {
+    fn build_sources_solo_marca_el_error() {
         let mut state = storage::AppState::new();
         state.recents = vec!["ok.db".to_string(), "caida.db".to_string()];
         let canonical_ok = crate::paths::normalize_path("ok.db");
         let canonical_caida = crate::paths::normalize_path("caida.db");
 
-        let mut health = HashMap::new();
-        health.insert(canonical_ok.clone(), (true, std::time::Instant::now()));
-        health.insert(canonical_caida.clone(), (false, std::time::Instant::now()));
-
-        let sources = App::build_sources(&state, SourceTab::All, None, &health);
+        // Sin caché → sin marcas de salud en absoluto (nada de ✓ por defecto)
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
         assert!(
-            sources.iter().any(|s| s.starts_with(&format!("✓ ▣ {canonical_ok}"))),
-            "fuente sana debe llevar ✓: {sources:?}"
+            sources.iter().any(|s| s.contains(&canonical_ok) && !s.starts_with("✗ ")),
+            "la fuente sana no debe llevar marca: {sources:?}"
         );
+
+        let mut health = HashMap::new();
+        health.insert(canonical_caida.clone(), false);
+        let sources = App::build_sources(&state, SourceTab::All, None, &health);
         assert!(
             sources.iter().any(|s| s.starts_with(&format!("✗ ▣ {canonical_caida}"))),
             "fuente caída debe llevar ✗: {sources:?}"
         );
-        // La conectada combina ● + ✓
+        // Conectada y caída combina ● + ✗
         let sources_connected =
-            App::build_sources(&state, SourceTab::All, Some(&canonical_ok), &health);
+            App::build_sources(&state, SourceTab::All, Some(&canonical_caida), &health);
         assert!(
-            sources_connected.iter().any(|s| s.starts_with(&format!("● ✓ ▣ {canonical_ok}"))),
-            "conectada + sana = '● ✓': {sources_connected:?}"
+            sources_connected.iter().any(|s| s.starts_with(&format!("● ✗ ▣ {canonical_caida}"))),
+            "conectada + caída = '● ✗': {sources_connected:?}"
         );
-    }
-
-    #[test]
-    fn should_probe_respeta_ttl_y_probing() {
-        use std::time::Instant;
-
-        let empty = HashMap::new();
-        // Sin caché ni probe en vuelo → hay que verificar
-        assert!(App::should_probe(&empty, "x.db", None));
-
-        // En vuelo → no
-        assert!(!App::should_probe(&empty, "x.db", Some("x.db")));
-
-        // Caché fresco (recién insertado) → no re-verificar
-        let mut fresh = HashMap::new();
-        fresh.insert("x.db".to_string(), (true, Instant::now()));
-        assert!(!App::should_probe(&fresh, "x.db", None));
-
-        // Caché vencido (> TTL) → re-verificar (el archivo pudo cambiar)
-        let mut stale = HashMap::new();
-        stale.insert(
-            "x.db".to_string(),
-            (true, Instant::now().checked_sub(PROBE_TTL).expect("reloj estable")),
-        );
-        assert!(App::should_probe(&stale, "x.db", None));
-
-        // Vencido pero en vuelo → no duplicar
-        assert!(!App::should_probe(&stale, "x.db", Some("x.db")));
     }
 
     #[test]
