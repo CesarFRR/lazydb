@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod db;
 mod keys;
+mod paths;
 mod query;
 mod storage;
 mod ui;

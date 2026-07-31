@@ -299,18 +299,23 @@ impl SourceList<'_> {
     }
 
     fn entry(&mut self, path: &str, display: Option<&str>) {
-        if !self.seen.insert(path.to_string()) {
+        // Choke point de normalización: los favoritos/recientes guardados por
+        // versiones antiguas pueden estar en relativo; aquí todos se comparan
+        // y muestran en canónico (absoluto), para que el `seen` deduplique y
+        // la marca ● coincida con `connected`.
+        let path = crate::paths::normalize_path(path);
+        if !self.seen.insert(path.clone()) {
             return;
         }
-        let is_fav = self.state.favorites.values().any(|v| v == path);
+        let is_fav = self.state.favorites.values().any(|v| v == &path);
         let prefix = if is_fav {
             "★ "
-        } else if is_online_source(path) {
+        } else if is_online_source(&path) {
             "⊙ "
         } else {
             "▣ "
         };
-        let mark = if self.connected == Some(path) { "● " } else { "" };
+        let mark = if self.connected == Some(path.as_str()) { "● " } else { "" };
         match display {
             Some(name) => self.out.push(format!("{mark}{prefix}{name} => {path}")),
             None => self.out.push(format!("{mark}{prefix}{path}")),
@@ -977,20 +982,25 @@ impl App {
     // ── conexión SQLite ───────────────────────────────────────────────
 
     fn connect_sqlite(&mut self, path: &str) {
+        // Choke point de normalización: cualquier ruta que entre aquí queda
+        // canónica (absoluta, sin ./ ni ..), igual que la que produce el
+        // escaneo. Sin esto la misma DB aparece duplicada en Fuentes y la
+        // marca ● de "conectada" nunca coincide (relativo vs absoluto).
+        let path = crate::paths::normalize_path(path);
         self.is_loading = true;
         self.status = format!("Conectando a {path}...");
-        let tables = db::backends::sqlite::list_objects_by_type(path, "table");
-        let views = db::backends::sqlite::list_objects_by_type(path, "view");
-        let advanced = db::backends::sqlite::list_advanced_objects(path);
+        let tables = db::backends::sqlite::list_objects_by_type(&path, "table");
+        let views = db::backends::sqlite::list_objects_by_type(&path, "view");
+        let advanced = db::backends::sqlite::list_advanced_objects(&path);
 
         if let (Ok(tables), Ok(views), Ok(advanced)) = (tables, views, advanced) {
-            let path_str = path.to_string();
+            let path_str = path.clone();
             self.state.add_recent(path_str);
             let _ = self.state.save();
-            self.sources = Self::build_sources(&self.state, self.source_tab, Some(path));
+            self.sources = Self::build_sources(&self.state, self.source_tab, Some(&path));
 
-            self.db_path = Some(path.to_string());
-            self.db_size_bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
+            self.db_path = Some(path.clone());
+            self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
             self.tables = tables;
             self.views = views;
             self.advanced = advanced;
@@ -1457,11 +1467,16 @@ impl App {
             return;
         }
 
-        self.state.remove_recent(&path);
-        self.state.remove_favorite_by_path(&path);
+        // Olvidar tanto la forma mostrada (canónica) como cualquier variante
+        // relativa que dejaran versiones antiguas de lazydb en el storage.
+        let canonical = crate::paths::normalize_path(&path);
+        for candidate in [path.as_str(), canonical.as_str()] {
+            self.state.remove_recent(candidate);
+            self.state.remove_favorite_by_path(candidate);
+        }
         let _ = self.state.save();
 
-        if self.db_path.as_deref() == Some(path.as_str()) {
+        if self.db_path.as_deref() == Some(canonical.as_str()) {
             self.disconnect_db();
         } else {
             self.sources =
@@ -2645,6 +2660,56 @@ mod tests {
         let state = state_de_prueba();
         let sources = App::build_sources(&state, SourceTab::All, Some("/a/one.db"));
         assert!(sources.iter().any(|s| s.starts_with("● ★ one => /a/one.db")));
+    }
+
+    // ── regresión: normalización de rutas (Bug 1) ──────────────────────
+
+    #[test]
+    fn relativo_y_absoluto_no_se_duplican() {
+        // Un reciente guardado en relativo por una versión antigua ("one.db")
+        // y el mismo archivo detectado en absoluto ("/a/one.db") deben
+        // colapsar en UNA sola entrada: el `seen` compara rutas canónicas.
+        let mut state = storage::AppState::new();
+        state.recents = vec!["one.db".to_string(), "https://remote.example/db".to_string()];
+        let sources = App::build_sources(&state, SourceTab::All, None);
+
+        let matches = sources
+            .iter()
+            .filter(|s| {
+                source_path_of(s) != "Buscar archivo .db" && source_path_of(s) != "Abrir sakila.db"
+            })
+            .filter(|s| source_path_of(s).ends_with("one.db"))
+            .count();
+        assert_eq!(matches, 1, "la DB relativa y la absoluta deben ser una sola");
+    }
+
+    #[test]
+    fn conectada_por_ruta_relativa_marca_con_absoluto() {
+        // Conectar "one.db" (relativo) normaliza a absoluto; el panel debe
+        // mostrar ● sobre la entrada absoluta, no sobre una relativa huérfana.
+        let mut state = storage::AppState::new();
+        state.recents = vec!["one.db".to_string()];
+        let connected = crate::paths::normalize_path("one.db");
+        let sources = App::build_sources(&state, SourceTab::All, Some(&connected));
+        assert!(
+            sources.iter().any(|s| s.starts_with(&format!("● ▣ {connected}"))),
+            "la entrada absoluta debe llevar ●: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn build_sources_normaliza_el_reciente_mostrado() {
+        // El reciente relativo "one.db" debe mostrarse en su forma canónica.
+        let mut state = storage::AppState::new();
+        state.recents = vec!["one.db".to_string()];
+        let sources = App::build_sources(&state, SourceTab::All, None);
+        let shown = sources.iter().find_map(|s| {
+            let p = source_path_of(s);
+            (!is_source_section(s) && p != "Abrir sakila.db" && p != "Buscar archivo .db")
+                .then_some(p)
+        });
+        let canonical = crate::paths::normalize_path("one.db");
+        assert_eq!(shown, Some(canonical.as_str()));
     }
 
     #[test]
