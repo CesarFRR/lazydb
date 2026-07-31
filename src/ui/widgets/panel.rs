@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, List, ListItem, ListState, Row, Table, TableState},
 };
 
+use crate::app::controller::SOURCE_SECTION_MARK;
 use crate::app::{PanelKind, PanelMode};
 
 /// Trunca un string con un carácter de elipsis en el medio si excede `max_w`.
@@ -422,6 +423,33 @@ fn render_collapsed_line(
     frame.render_widget(para, area);
 }
 
+/// Línea de un item del panel Fuentes con sus marcas coloreadas:
+/// - sección `\u{1}LABEL` → subtítulo `── LABEL ────` en `DarkGray` (dim)
+/// - entry `[● ]<★|▣|⊙ >texto` → prefijo coloreado + texto normal
+///
+/// Los prefijos siguen el orden real del item ("● " puede combinar con ★/▣/⊙).
+fn source_line(item: &str, width: u16) -> RatLine<'_> {
+    if let Some(label) = item.strip_prefix(SOURCE_SECTION_MARK) {
+        let prefix = format!("── {label}");
+        let fill = usize::from(width).saturating_sub(prefix.len() + 3);
+        let line = format!("{prefix} {}", "─".repeat(fill));
+        return RatLine::from(Span::styled(line, Style::default().fg(Color::DarkGray)));
+    }
+
+    let mut spans = Vec::new();
+    let mut rest = item;
+    for (mark, color) in
+        [("● ", Color::Cyan), ("★ ", Color::Yellow), ("▣ ", Color::Blue), ("⊙ ", Color::Magenta)]
+    {
+        if let Some(after) = rest.strip_prefix(mark) {
+            spans.push(Span::styled(mark, Style::default().fg(color)));
+            rest = after;
+        }
+    }
+    spans.push(Span::raw(rest));
+    RatLine::from(spans)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_expanded(
     frame: &mut Frame<'_>,
@@ -462,11 +490,15 @@ fn render_expanded(
 
     let list_items: Vec<ListItem<'_>> = visible
         .map(|item| {
-            // SIN prefijos hardcodeados: ratatui reserva la primera columna
-            // para el highlight_symbol "▸ " (o su espacio en blanco) en TODAS
-            // las filas, y pinta "▸" solo en la seleccionada. Así el texto de
-            // todos los items queda alineado y el ▸ no empuja nada.
-            ListItem::new(item.clone())
+            if kind == PanelKind::Sources {
+                ListItem::new(source_line(item, inner.width))
+            } else {
+                // SIN prefijos hardcodeados: ratatui reserva la primera columna
+                // para el highlight_symbol "▸ " (o su espacio en blanco) en TODAS
+                // las filas, y pinta "▸" solo en la seleccionada. Así el texto de
+                // todos los items queda alineado y el ▸ no empuja nada.
+                ListItem::new(item.clone())
+            }
         })
         .collect();
 

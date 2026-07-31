@@ -104,7 +104,7 @@ cargo test
 ```
 
 Controles actuales:
-- `q` o `Esc`: salir (o volver atras).
+- `q` o `Esc`: cerrar por capas (estilo lazygit): vuelve de Detalle → cierra la DB conectada → solo con todo limpio sale.
 - `Ctrl+C`: cierre seguro (cierra filtro/menus abiertos, luego sale).
 - `Tab` / `Shift+Tab`: cambiar foco.
 - `1` / `2` / `3` / `4` / `5`: ir a un panel especifico.
@@ -114,13 +114,16 @@ Controles actuales:
 - `Ctrl+Q`: ejecutar COUNT(*) en tabla seleccionada.
 - `Enter`: saltar al panel Detalle.
 - `r`: refrescar.
-- `f`: guardar la DB actual en favoritos.
+- `f`: en Fuentes, marcar/desmarcar favorito el item bajo el cursor; en otro panel, guardar la DB actual en favoritos.
+- `d`: en Fuentes, olvidar la fuente bajo el cursor (quita de recientes/favoritos; si era la DB conectada, la cierra).
 - `y`: copiar item seleccionado al portapapeles.
 - `e`: exportar la tabla actual a CSV.
 - `/`: iniciar filtro de búsqueda en listas.
 - `x` o `b`: menu de acciones.
 - `shift+h` / `shift+l`: scroll horizontal de columnas.
 - `shift+rueda`: scroll horizontal con el mouse.
+
+El panel `[1]Fuentes` agrupa las bases por secciones (`── FAVORITOS ──`, `── RECIENTES ──`, `── LOCAL DETECTADO (./) ──`), con marcas de tipo: `●` conectada, `★` favorito, `▣` sqlite local, `⊙` online. Los subtítulos de sección no son seleccionables: la navegacion los salta.
 
 ## Estructura
 

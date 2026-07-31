@@ -222,6 +222,159 @@ fn is_local_source(value: &str) -> bool {
     !is_online_source(value)
 }
 
+// ── formato de items del panel Fuentes ─────────────────────────────────
+// Cada item es un string plano con marcas que el render colorea:
+//   sección:   "\u{1}LABEL"          (marcador interno, no visible)
+//   entry:     [● ]<★|▣|⊙ ><texto>   (● = conectada, ★ = favorito,
+//                                     ▣ = sqlite local, ⊙ = online)
+// Los favoritos usan "name => path"; el resto muestra el path directo.
+
+/// Marcador interno de sección (SOH): nunca se renderiza tal cual.
+pub const SOURCE_SECTION_MARK: char = '\u{1}';
+
+fn source_section(label: &str) -> String {
+    format!("{SOURCE_SECTION_MARK}{label}")
+}
+
+fn is_source_section(item: &str) -> bool {
+    item.starts_with(SOURCE_SECTION_MARK)
+}
+
+/// Quita las marcas decorativas (● ★ ▣ ⊙, combinables: "● ★ x") de un item de
+/// Fuentes y devuelve el dato real (path o "name => path" para favoritos).
+fn strip_source_marks(mut item: &str) -> &str {
+    loop {
+        let mut stripped = false;
+        for mark in ["● ", "★ ", "▣ ", "⊙ "] {
+            if let Some(rest) = item.strip_prefix(mark) {
+                item = rest;
+                stripped = true;
+            }
+        }
+        if !stripped {
+            return item;
+        }
+    }
+}
+
+/// Extrae el path real de un item de Fuentes (con o sin marcas).
+fn source_path_of(item: &str) -> &str {
+    let clean = strip_source_marks(item);
+    clean.split_once(" => ").map_or(clean, |(_, path)| path)
+}
+
+/// Filtro de visibilidad de una fuente según el tab activo.
+#[derive(Clone, Copy)]
+enum SourceFilter {
+    All,
+    Local,
+    Online,
+}
+
+impl SourceFilter {
+    fn passes(self, path: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Local => is_local_source(path),
+            Self::Online => is_online_source(path),
+        }
+    }
+}
+
+/// Construye la lista del panel Fuentes por secciones: FAVORITOS, RECIENTES
+/// y LOCAL DETECTADO (./), con marcas de tipo y de DB conectada.
+struct SourceList<'a> {
+    state: &'a storage::AppState,
+    connected: Option<&'a str>,
+    out: Vec<String>,
+    seen: HashSet<String>,
+    sections: HashSet<String>,
+}
+
+impl SourceList<'_> {
+    fn section(&mut self, label: &str) {
+        if self.sections.insert(label.to_string()) {
+            self.out.push(source_section(label));
+        }
+    }
+
+    fn entry(&mut self, path: &str, display: Option<&str>) {
+        if !self.seen.insert(path.to_string()) {
+            return;
+        }
+        let is_fav = self.state.favorites.values().any(|v| v == path);
+        let prefix = if is_fav {
+            "★ "
+        } else if is_online_source(path) {
+            "⊙ "
+        } else {
+            "▣ "
+        };
+        let mark = if self.connected == Some(path) { "● " } else { "" };
+        match display {
+            Some(name) => self.out.push(format!("{mark}{prefix}{name} => {path}")),
+            None => self.out.push(format!("{mark}{prefix}{path}")),
+        }
+    }
+
+    fn add_favs(&mut self, filter: SourceFilter) {
+        let mut favs: Vec<(String, String)> = self
+            .state
+            .favorites
+            .iter()
+            .filter(|(_, p)| filter.passes(p))
+            .map(|(n, p)| (n.clone(), p.clone()))
+            .collect();
+        favs.sort_by(|a, b| a.0.cmp(&b.0));
+        if favs.is_empty() {
+            return;
+        }
+        self.section("FAVORITOS");
+        for (name, path) in &favs {
+            self.entry(path, Some(name));
+        }
+    }
+
+    fn add_recents(&mut self, filter: SourceFilter) {
+        let is_fav = |path: &str| self.state.favorites.values().any(|v| v == path);
+        let recents: Vec<String> =
+            self.state.recents.iter().filter(|p| filter.passes(p) && !is_fav(p)).cloned().collect();
+        if recents.is_empty() {
+            return;
+        }
+        self.section("RECIENTES");
+        for recent in &recents {
+            self.entry(recent, None);
+        }
+    }
+
+    fn add_detected(&mut self) {
+        // DBs SQLite de la carpeta actual (donde se ejecuta lazydb)
+        let scanned = scan_cwd_databases();
+        let fresh: Vec<String> =
+            scanned.iter().filter(|p| !self.seen.contains(*p)).cloned().collect();
+        if fresh.is_empty() {
+            return;
+        }
+        self.section("LOCAL DETECTADO (./)");
+        for db in &fresh {
+            self.entry(db, None);
+        }
+    }
+
+    fn finish(mut self, source_tab: SourceTab) -> Vec<String> {
+        if self.out.is_empty() {
+            self.out.push("<sin entradas>".to_string());
+        }
+        // Acciones fijas: solo tienen sentido junto a fuentes locales
+        if matches!(source_tab, SourceTab::All | SourceTab::Local) {
+            self.out.push("Buscar archivo .db".to_string());
+            self.out.push("Abrir sakila.db".to_string());
+        }
+        self.out
+    }
+}
+
 /// Escanea el directorio de trabajo actual (donde se ejecuta `cargo run` /
 /// lazydb) buscando archivos de base de datos `SQLite`: `*.db`, `*.sqlite` y
 /// `*.sqlite3`. Devuelve los paths completos ordenados alfabéticamente.
@@ -251,12 +404,6 @@ fn scan_cwd_databases() -> Vec<String> {
 // ---------------------------------------------------------------------------
 // App (estado global)
 // ---------------------------------------------------------------------------
-
-enum EnterAction {
-    Connect(String),
-    UpdateStatus,
-    None,
-}
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
@@ -349,7 +496,7 @@ impl App {
             active_panel: PanelKind::Sources,
             last_sidebar_focus: PanelKind::Sources,
             layout: ComputedLayout::default(),
-            sources: Self::build_sources(&state, source_tab),
+            sources: Self::build_sources(&state, source_tab, None),
             source_tab,
             tables: vec![],
             views: vec![],
@@ -510,6 +657,10 @@ impl App {
                     len,
                     step,
                 );
+                // Las secciones (subtítulos) no son seleccionables: saltarlas
+                let idx = self.panel(PanelKind::Sources).selected_idx;
+                let new = Self::skip_section_idx(&self.sources, idx, step);
+                self.panel_mut(PanelKind::Sources).selected_idx = new;
             }
             PanelKind::Tables | PanelKind::Views | PanelKind::Advanced => {
                 let len = match self.active_panel {
@@ -564,6 +715,29 @@ impl App {
         let last = len.saturating_sub(1);
         let next = current.saturating_add_signed(step);
         *current = next.min(last);
+    }
+
+    /// Avanza `idx` en la dirección de `step` hasta aterrizar en un item que
+    /// no sea sección (se queda en el borde si no hay más entries).
+    fn skip_section_idx(items: &[String], mut idx: usize, step: isize) -> usize {
+        if items.is_empty() {
+            return idx;
+        }
+        let last = items.len().saturating_sub(1);
+        while items.get(idx).is_some_and(|s| is_source_section(s)) {
+            if step > 0 {
+                if idx >= last {
+                    break;
+                }
+                idx += 1;
+            } else {
+                if idx == 0 {
+                    break;
+                }
+                idx -= 1;
+            }
+        }
+        idx
     }
 
     // ── items por panel ───────────────────────────────────────────────
@@ -659,81 +833,42 @@ impl App {
 
     // ── fuentes ───────────────────────────────────────────────────────
 
-    fn build_sources(state: &storage::AppState, source_tab: SourceTab) -> Vec<String> {
-        let mut sources = Vec::new();
-        let mut seen = HashSet::new();
-
-        let mut push_unique = |value: String, out: &mut Vec<String>| {
-            if seen.insert(value.clone()) {
-                out.push(value);
-            }
+    fn build_sources(
+        state: &storage::AppState,
+        source_tab: SourceTab,
+        connected: Option<&str>,
+    ) -> Vec<String> {
+        let mut list = SourceList {
+            state,
+            connected,
+            out: Vec::new(),
+            seen: HashSet::new(),
+            sections: HashSet::new(),
         };
 
         match source_tab {
             SourceTab::All => {
-                for recent in &state.recents {
-                    push_unique(recent.clone(), &mut sources);
-                }
-                let mut favorites = state
-                    .favorites
-                    .iter()
-                    .map(|(name, path)| format!("{name} => {path}"))
-                    .collect::<Vec<_>>();
-                favorites.sort();
-                for fav in favorites {
-                    push_unique(fav, &mut sources);
-                }
-                // DBs SQLite de la carpeta actual (donde se ejecuta lazydb)
-                for db in scan_cwd_databases() {
-                    push_unique(db, &mut sources);
-                }
+                list.add_favs(SourceFilter::All);
+                list.add_recents(SourceFilter::All);
+                list.add_detected();
             }
             SourceTab::Local => {
-                for recent in &state.recents {
-                    if is_local_source(recent) {
-                        push_unique(recent.clone(), &mut sources);
-                    }
-                }
-                let mut favorites = state.favorites.iter().collect::<Vec<_>>();
-                favorites.sort_by(|a, b| a.0.cmp(b.0));
-                for (name, path) in favorites {
-                    if is_local_source(path) {
-                        push_unique(format!("{name} => {path}"), &mut sources);
-                    }
-                }
-                // DBs SQLite de la carpeta actual (son locales por definición)
-                for db in scan_cwd_databases() {
-                    push_unique(db, &mut sources);
-                }
+                list.add_favs(SourceFilter::Local);
+                list.add_recents(SourceFilter::Local);
+                list.add_detected();
             }
             SourceTab::Online => {
-                for recent in &state.recents {
-                    if is_online_source(recent) {
-                        push_unique(recent.clone(), &mut sources);
-                    }
-                }
-                let mut favorites = state.favorites.iter().collect::<Vec<_>>();
-                favorites.sort_by(|a, b| a.0.cmp(b.0));
-                for (name, path) in favorites {
-                    if is_online_source(path) {
-                        push_unique(format!("{name} => {path}"), &mut sources);
-                    }
-                }
+                list.add_favs(SourceFilter::Online);
+                list.add_recents(SourceFilter::Online);
             }
         }
 
-        if sources.is_empty() {
-            sources.push("<sin entradas>".to_string());
-        }
-
-        sources.push("Buscar archivo .db".to_string());
-        sources.push("Abrir sakila.db".to_string());
-        sources
+        list.finish(source_tab)
     }
 
     fn set_source_tab(&mut self, tab: SourceTab) {
         self.source_tab = tab;
-        self.sources = Self::build_sources(&self.state, self.source_tab);
+        self.sources = Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
         self.set_selected_idx(PanelKind::Sources, 0);
     }
 
@@ -852,7 +987,7 @@ impl App {
             let path_str = path.to_string();
             self.state.add_recent(path_str);
             let _ = self.state.save();
-            self.sources = Self::build_sources(&self.state, self.source_tab);
+            self.sources = Self::build_sources(&self.state, self.source_tab, Some(path));
 
             self.db_path = Some(path.to_string());
             self.db_size_bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
@@ -1267,8 +1402,92 @@ impl App {
 
         self.state.add_favorite(favorite_name.clone(), path.to_string());
         let _ = self.state.save();
-        self.sources = Self::build_sources(&self.state, self.source_tab);
+        self.sources = Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
         self.status = format!("Favorito guardado: {favorite_name}");
+    }
+
+    /// `f` en el panel Fuentes: marca/desmarca como favorito el item bajo el
+    /// cursor. En cualquier otro panel: favoritear la DB conectada.
+    fn toggle_favorite_source(&mut self) {
+        if self.active_panel != PanelKind::Sources {
+            self.mark_current_db_as_favorite();
+            return;
+        }
+
+        let selected = self.selected_source().to_string();
+        if is_source_section(&selected) || selected == "<sin entradas>" {
+            return;
+        }
+
+        let path = source_path_of(&selected).to_string();
+
+        if let Some(name) = self.state.favorite_name_for_path(&path) {
+            self.state.remove_favorite(&name);
+            self.status = format!("Favorito quitado: {name}");
+        } else {
+            let name = std::path::Path::new(&path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(&path)
+                .to_string();
+            self.state.add_favorite(name.clone(), path);
+            self.status = format!("Favorito guardado: {name}");
+        }
+
+        let _ = self.state.save();
+        self.sources = Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
+    }
+
+    /// `d` en el panel Fuentes: olvida la fuente bajo el cursor (la quita de
+    /// recientes y de favoritos). Si era la DB conectada, la cierra.
+    fn forget_source(&mut self) {
+        if self.active_panel != PanelKind::Sources {
+            return;
+        }
+
+        let selected = self.selected_source().to_string();
+        if is_source_section(&selected) || selected == "<sin entradas>" {
+            return;
+        }
+
+        let path = source_path_of(&selected).to_string();
+        // Acciones fijas del final de la lista: no se olvidan
+        if path == "Abrir sakila.db" || path == "Buscar archivo .db" {
+            self.status = "Las acciones fijas no se pueden olvidar".to_string();
+            return;
+        }
+
+        self.state.remove_recent(&path);
+        self.state.remove_favorite_by_path(&path);
+        let _ = self.state.save();
+
+        if self.db_path.as_deref() == Some(path.as_str()) {
+            self.disconnect_db();
+        } else {
+            self.sources =
+                Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
+            self.status = format!("Fuente olvidada: {path}");
+        }
+    }
+
+    /// Cierra la conexión actual y vuelve el foco a Fuentes.
+    fn disconnect_db(&mut self) {
+        self.db_path = None;
+        self.db_size_bytes = None;
+        self.tables.clear();
+        self.views.clear();
+        self.advanced.clear();
+        self.preview_rows = vec!["Sin conexion SQLite".to_string()];
+        self.total_rows = 0;
+        self.preview_loaded_offset = 0;
+        self.current_page = 0;
+        self.detail_tab = DetailTab::Data;
+        self.query_state = query::QueryState::Idle;
+        self.query_results.clear();
+        self.sources = Self::build_sources(&self.state, self.source_tab, None);
+        self.set_focus(PanelKind::Sources);
+        self.set_selected_idx(PanelKind::Sources, 0);
+        self.status = "Base de datos cerrada".to_string();
     }
 
     // ── menú de acciones ──────────────────────────────────────────────
@@ -1385,11 +1604,16 @@ impl App {
     fn yank_selected(&mut self) {
         let items = self.items_for(self.active_panel);
         let idx = self.selected_idx(self.active_panel);
-        let text = items.get(idx).cloned().unwrap_or_default();
+        let mut text = items.get(idx).cloned().unwrap_or_default();
 
         if text.is_empty() {
             self.status = "Nada que copiar".to_string();
             return;
+        }
+
+        // En Fuentes, copiar el dato real (sin marcas ▣/★/⊙/●)
+        if self.active_panel == PanelKind::Sources {
+            text = strip_source_marks(&text).to_string();
         }
 
         let copied = Self::copy_to_clipboard(&text);
@@ -1453,8 +1677,11 @@ impl App {
         } else {
             let items = self.original_items_for(self.active_panel);
             let query = self.filter_query.to_ascii_lowercase();
-            let filtered: Vec<String> =
-                items.iter().filter(|s| s.to_ascii_lowercase().contains(&query)).cloned().collect();
+            let filtered: Vec<String> = items
+                .iter()
+                .filter(|s| !is_source_section(s) && s.to_ascii_lowercase().contains(&query))
+                .cloned()
+                .collect();
             if filtered.is_empty() {
                 self.status = format!("Sin resultados para: {query}");
                 self.filtered_items.clear();
@@ -1522,7 +1749,7 @@ impl App {
     fn reload_runtime_config(&mut self) {
         self.keymap = keys::Keymap::load();
         self.state = storage::AppState::load();
-        self.sources = Self::build_sources(&self.state, self.source_tab);
+        self.sources = Self::build_sources(&self.state, self.source_tab, self.db_path.as_deref());
 
         let ui_config = config::load_ui_config();
         self.rows_per_page = ui_config.rows_per_page;
@@ -1565,12 +1792,18 @@ impl App {
     fn connect_selected_source(&mut self) {
         let selected = self.selected_source().to_string();
 
+        if is_source_section(&selected) {
+            return; // secciones no conectables
+        }
+
         if selected == "<sin entradas>" {
             self.status = "No hay elementos en esta sección".to_string();
             return;
         }
 
-        match selected.as_str() {
+        let clean = strip_source_marks(&selected).to_string();
+
+        match clean.as_str() {
             "Abrir sakila.db" => self.connect_sqlite("sakila.db"),
             "Buscar archivo .db" => {
                 self.status = "Buscador de archivos .db no implementado todavia".to_string();
@@ -1586,7 +1819,9 @@ impl App {
             {
                 self.connect_sqlite(s);
             }
-            _ => {}
+            _ => {
+                self.status = format!("No se puede conectar: {clean}");
+            }
         }
     }
 
@@ -1596,39 +1831,7 @@ impl App {
         if self.active_panel != PanelKind::Sources {
             return;
         }
-
-        let selected = self.selected_source().to_string();
-
-        if selected == "<sin entradas>" {
-            self.status = "No hay elementos en esta sección".to_string();
-            return;
-        }
-
-        let action = match selected.as_str() {
-            "Abrir sakila.db" => EnterAction::Connect("sakila.db".to_string()),
-            "Buscar archivo .db" => EnterAction::UpdateStatus,
-            s if s.contains(" => ") => {
-                let path =
-                    s.split_once(" => ").map(|(_, path)| path.to_string()).unwrap_or_default();
-                EnterAction::Connect(path)
-            }
-            s if s.starts_with('/')
-                || std::path::Path::new(s)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db")) =>
-            {
-                EnterAction::Connect(s.to_string())
-            }
-            _ => EnterAction::None,
-        };
-
-        match action {
-            EnterAction::Connect(path) => self.connect_sqlite(&path),
-            EnterAction::UpdateStatus => {
-                self.status = "Buscador de archivos .db no implementado todavia".to_string();
-            }
-            EnterAction::None => {}
-        }
+        self.connect_selected_source();
     }
 
     // ── keyboard ──────────────────────────────────────────────────────
@@ -1752,9 +1955,14 @@ impl App {
             keys::AppAction::HScrollLeft => self.on_h_scroll(-1),
             keys::AppAction::HScrollRight => self.on_h_scroll(1),
             keys::AppAction::ToggleCurrentPanel => self.toggle_active_panel(),
+            // esc/q cierran por capas (estilo lazygit): primero el panel
+            // Detail vuelve a Tablas, luego se cierra la DB conectada, y
+            // solo con todo limpio sale de lazydb.
             keys::AppAction::QuitOrBack => {
                 if self.active_panel == PanelKind::Detail {
                     self.set_focus(PanelKind::Tables);
+                } else if self.db_path.is_some() {
+                    self.disconnect_db();
                 } else {
                     self.should_quit = true;
                 }
@@ -1779,6 +1987,8 @@ impl App {
                 self.refresh_from_connection();
             }
             keys::AppAction::FavoriteCurrentDb => self.mark_current_db_as_favorite(),
+            keys::AppAction::ToggleFavoriteSource => self.toggle_favorite_source(),
+            keys::AppAction::ForgetSource => self.forget_source(),
             keys::AppAction::MoveUp => self.move_selection(-1),
             keys::AppAction::MoveDown => self.move_selection(1),
             keys::AppAction::PrevPage => {
@@ -2332,8 +2542,14 @@ impl App {
                 }
                 let max_idx = self.items_len_for(kind).saturating_sub(1);
                 let scroll = self.panel(kind).scroll_offset.get();
+                let mut index = (index + scroll).min(max_idx);
+                // Click sobre una sección de Fuentes → aterrizar en el primer entry
+                if kind == PanelKind::Sources {
+                    let shown = self.items_for(kind);
+                    index = Self::skip_section_idx(shown, index, 1);
+                }
                 let p = self.panel_mut(kind);
-                p.selected_idx = (index + scroll).min(max_idx);
+                p.selected_idx = index;
 
                 // Doble-click: detectar 2 clicks en < 400ms sobre el mismo panel+ítem
                 let now = now_millis();
@@ -2366,5 +2582,84 @@ impl App {
         }
 
         // Click fuera de cualquier panel → ignorar
+    }
+}
+
+// ── tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_de_prueba() -> storage::AppState {
+        let mut state = storage::AppState::new();
+        state.recents = vec!["/a/one.db".to_string(), "https://remote.example/db".to_string()];
+        state.favorites.insert("one".to_string(), "/a/one.db".to_string());
+        state
+    }
+
+    #[test]
+    fn strip_marks_quita_prefijos_decorativos() {
+        assert_eq!(strip_source_marks("▣ /tmp/x.db"), "/tmp/x.db");
+        assert_eq!(strip_source_marks("⊙ https://api.x/db"), "https://api.x/db");
+        assert_eq!(strip_source_marks("★ one => /a/one.db"), "one => /a/one.db");
+        assert_eq!(strip_source_marks("Abrir sakila.db"), "Abrir sakila.db");
+        // Marcas combinables (conectada + tipo)
+        assert_eq!(strip_source_marks("● ▣ /tmp/x.db"), "/tmp/x.db");
+        assert_eq!(strip_source_marks("● ★ one => /a/one.db"), "one => /a/one.db");
+    }
+
+    #[test]
+    fn source_path_extrae_el_dato_real() {
+        assert_eq!(source_path_of("★ one => /a/one.db"), "/a/one.db");
+        assert_eq!(source_path_of("● ▣ /tmp/x.db"), "/tmp/x.db");
+        assert_eq!(source_path_of("⊙ https://api.x/db"), "https://api.x/db");
+        assert_eq!(source_path_of("Abrir sakila.db"), "Abrir sakila.db");
+    }
+
+    #[test]
+    fn secciones_llevan_marcador_interno() {
+        let s = source_section("FAVORITOS");
+        assert!(is_source_section(&s));
+        assert!(!is_source_section("★ one => /a/one.db"));
+        assert!(!is_source_section("sakila.db"));
+    }
+
+    #[test]
+    fn build_sources_online_agrupa_favoritos_y_recents() {
+        let mut state = state_de_prueba();
+        state.favorites.insert("remote".to_string(), "https://remote.example/db".to_string());
+        let sources = App::build_sources(&state, SourceTab::Online, None);
+
+        assert!(sources.iter().any(|s| s == &source_section("FAVORITOS")));
+        assert!(sources.iter().any(|s| s.starts_with("★ remote => https://remote.example/db")));
+        // "one" es favorito local → no aparece en el tab Online
+        assert!(!sources.iter().any(|s| s.contains("/a/one.db")));
+        // Sin acciones fijas en Online
+        assert!(!sources.iter().any(|s| s == "Abrir sakila.db"));
+        assert!(!sources.iter().any(|s| s == "Buscar archivo .db"));
+    }
+
+    #[test]
+    fn build_sources_marca_la_conectada() {
+        let state = state_de_prueba();
+        let sources = App::build_sources(&state, SourceTab::All, Some("/a/one.db"));
+        assert!(sources.iter().any(|s| s.starts_with("● ★ one => /a/one.db")));
+    }
+
+    #[test]
+    fn skip_section_aterriza_en_entry() {
+        let items = vec![
+            source_section("FAVORITOS"),
+            "★ one => /a/one.db".to_string(),
+            source_section("RECIENTES"),
+            "▣ /tmp/x.db".to_string(),
+            "Abrir sakila.db".to_string(),
+        ];
+        assert_eq!(App::skip_section_idx(&items, 0, 1), 1);
+        assert_eq!(App::skip_section_idx(&items, 2, 1), 3);
+        assert_eq!(App::skip_section_idx(&items, 2, -1), 1);
+        // Borde inferior: se queda en el último entry
+        assert_eq!(App::skip_section_idx(&items, 4, 1), 4);
     }
 }

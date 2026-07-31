@@ -37,7 +37,12 @@ pub enum AppAction {
     /// Saltar al panel Detalle sin colapsar el panel sidebar actual
     JumpToDetail,
     Refresh,
+    /// Favoritear la DB actualmente conectada (sin binding por defecto)
     FavoriteCurrentDb,
+    /// Toggle favorito del item bajo el cursor en Fuentes (o la DB conectada)
+    ToggleFavoriteSource,
+    /// Olvidar la fuente bajo el cursor (quitar de recientes/favoritos)
+    ForgetSource,
     MoveUp,
     MoveDown,
     PrevPage,
@@ -132,7 +137,8 @@ impl Default for Keymap {
         bindings.insert("esc".to_string(), AppAction::QuitOrBack);
         bindings.insert("q".to_string(), AppAction::QuitOrBack);
         bindings.insert("r".to_string(), AppAction::Refresh);
-        bindings.insert("f".to_string(), AppAction::FavoriteCurrentDb);
+        bindings.insert("f".to_string(), AppAction::ToggleFavoriteSource);
+        bindings.insert("d".to_string(), AppAction::ForgetSource);
 
         // ── foco entre paneles (Tab / Shift+Tab) ──
         bindings.insert("tab".to_string(), AppAction::FocusNext);
@@ -235,6 +241,8 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "jump_to_detail" => Some(AppAction::JumpToDetail),
         "refresh" => Some(AppAction::Refresh),
         "favorite_current_db" => Some(AppAction::FavoriteCurrentDb),
+        "toggle_favorite_source" => Some(AppAction::ToggleFavoriteSource),
+        "forget_source" => Some(AppAction::ForgetSource),
         "move_up" => Some(AppAction::MoveUp),
         "move_down" => Some(AppAction::MoveDown),
         "prev_page" => Some(AppAction::PrevPage),

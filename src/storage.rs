@@ -87,6 +87,21 @@ impl AppState {
     pub fn remove_favorite(&mut self, name: &str) {
         self.favorites.remove(name);
     }
+
+    /// Quita un path de recientes (para olvidar fuentes con `d`)
+    pub fn remove_recent(&mut self, path: &str) {
+        self.recents.retain(|p| p != path);
+    }
+
+    /// Nombre del favorito cuyo path coincide, si existe.
+    pub fn favorite_name_for_path(&self, path: &str) -> Option<String> {
+        self.favorites.iter().find(|(_, v)| v.as_str() == path).map(|(name, _)| name.clone())
+    }
+
+    /// Quita el favorito que apunta al path dado (si existe).
+    pub fn remove_favorite_by_path(&mut self, path: &str) {
+        self.favorites.retain(|_, v| v != path);
+    }
 }
 
 impl Default for AppState {
