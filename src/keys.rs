@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum AppAction {
     RunCountQuery,
     ClearQueryState,
@@ -72,6 +72,145 @@ pub enum AppAction {
     HScrollLeft,
     /// Scroll horizontal de columnas (shift+l)
     HScrollRight,
+    /// Ayuda de teclas (?)
+    ToggleHelp,
+}
+
+/// Grupos de la ayuda de teclas (patrón lazygit §5.3: la ayuda se
+/// autogenera desde los bindings REALES, no desde un doc hardcodeado).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyGroup {
+    /// Moverse y salir
+    Navigation,
+    /// Foco entre paneles
+    Focus,
+    /// Gestión de fuentes (favoritos, olvidar, tabs)
+    Sources,
+    /// Pestañas de Detalle y secciones
+    Tabs,
+    /// Queries y scroll de datos
+    Data,
+    /// Acciones (menú, yank, CSV, filtro)
+    Actions,
+}
+
+impl KeyGroup {
+    /// Título de la sección en la ayuda.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Navigation => "Navegación",
+            Self::Focus => "Foco y paneles",
+            Self::Sources => "Fuentes",
+            Self::Tabs => "Pestañas y secciones",
+            Self::Data => "Datos y queries",
+            Self::Actions => "Acciones",
+        }
+    }
+}
+
+impl AppAction {
+    /// Grupo de la ayuda al que pertenece la acción.
+    pub const fn group(self) -> KeyGroup {
+        use AppAction::{
+            ClearQueryState, DetailTabData, DetailTabMeta, DetailTabNext, DetailTabPrev,
+            DetailTabSchema, DetailTabSql, Enter, ExportCsv, FavoriteCurrentDb,
+            FocusAdvanced, FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview,
+            FocusSources, FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight,
+            JumpToDetail, MoveDown, MoveUp, NextPage, ObjectSectionAdvanced,
+            ObjectSectionTables, ObjectSectionViews, PrevPage, QuitOrBack, Refresh,
+            ReloadRuntimeConfig, RunCountQuery, SidebarFocusNext, SidebarFocusPrev,
+            SourceTabFavorites, SourceTabNext, SourceTabPrev, SourceTabRecents,
+            StartFilter, ToggleActionsMenu, ToggleCurrentPanel, ToggleFavoriteSource,
+            ToggleHelp, Yank,
+        };
+        match self {
+            MoveUp | MoveDown | PrevPage | NextPage | QuitOrBack | Refresh => KeyGroup::Navigation,
+            FocusPrev | FocusNext | SidebarFocusPrev | SidebarFocusNext | FocusSources
+            | FocusTables | FocusViews | FocusAdvanced | FocusDetail | FocusObjects
+            | FocusPreview | ToggleCurrentPanel | JumpToDetail => KeyGroup::Focus,
+            FavoriteCurrentDb | ToggleFavoriteSource | ForgetSource | SourceTabRecents
+            | SourceTabFavorites | SourceTabNext | SourceTabPrev => KeyGroup::Sources,
+            ObjectSectionTables
+            | ObjectSectionViews
+            | ObjectSectionAdvanced
+            | DetailTabPrev
+            | DetailTabNext
+            | DetailTabData
+            | DetailTabSchema
+            | DetailTabSql
+            | DetailTabMeta => KeyGroup::Tabs,
+            RunCountQuery | ClearQueryState | ReloadRuntimeConfig | HScrollLeft | HScrollRight => {
+                KeyGroup::Data
+            }
+            Enter | ToggleActionsMenu | Yank | ExportCsv | StartFilter | ToggleHelp => {
+                KeyGroup::Actions
+            }
+        }
+    }
+
+    /// Descripción humana para la ayuda (es la misma que verás en la UI).
+    pub const fn description(self) -> &'static str {
+        use AppAction::{
+            ClearQueryState, DetailTabData, DetailTabMeta, DetailTabNext, DetailTabPrev,
+            DetailTabSchema, DetailTabSql, Enter, ExportCsv, FavoriteCurrentDb,
+            FocusAdvanced, FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview,
+            FocusSources, FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight,
+            JumpToDetail, MoveDown, MoveUp, NextPage, ObjectSectionAdvanced,
+            ObjectSectionTables, ObjectSectionViews, PrevPage, QuitOrBack, Refresh,
+            ReloadRuntimeConfig, RunCountQuery, SidebarFocusNext, SidebarFocusPrev,
+            SourceTabFavorites, SourceTabNext, SourceTabPrev, SourceTabRecents,
+            StartFilter, ToggleActionsMenu, ToggleCurrentPanel, ToggleFavoriteSource,
+            ToggleHelp, Yank,
+        };
+        match self {
+            RunCountQuery => "Contar filas (query async)",
+            ClearQueryState => "Limpiar resultado de query",
+            ReloadRuntimeConfig => "Recargar config en caliente",
+            QuitOrBack => "Volver / salir (por capas)",
+            FocusPrev => "Panel anterior",
+            FocusNext => "Panel siguiente",
+            SidebarFocusPrev => "Sidebar anterior",
+            SidebarFocusNext => "Sidebar siguiente",
+            FocusSources => "Ir a Fuentes",
+            FocusTables => "Ir a Tablas",
+            FocusViews => "Ir a Vistas",
+            FocusAdvanced => "Ir a Avanzado",
+            FocusDetail => "Ir a Detalle",
+            FocusObjects => "Ir a Tablas (obsoleto)",
+            FocusPreview => "Ir a Detalle (obsoleto)",
+            ToggleCurrentPanel => "Colapsar/expandir panel",
+            JumpToDetail => "Saltar a Detalle",
+            Refresh => "Refrescar",
+            FavoriteCurrentDb => "Favoritear DB conectada",
+            ToggleFavoriteSource => "Toggle favorito",
+            ForgetSource => "Olvidar fuente",
+            MoveUp => "Mover arriba",
+            MoveDown => "Mover abajo",
+            PrevPage => "Página anterior",
+            NextPage => "Página siguiente",
+            Enter => "Abrir / seleccionar",
+            SourceTabRecents => "Tabs Fuentes: recientes",
+            SourceTabFavorites => "Tabs Fuentes: favoritos",
+            ObjectSectionTables => "Sección Tablas",
+            ObjectSectionViews => "Sección Vistas",
+            ObjectSectionAdvanced => "Sección Avanzado",
+            DetailTabPrev => "Pestaña Detalle anterior",
+            DetailTabNext => "Pestaña Detalle siguiente",
+            DetailTabData => "Pestaña Datos",
+            DetailTabSchema => "Pestaña Esquema",
+            DetailTabSql => "Pestaña SQL",
+            DetailTabMeta => "Pestaña Meta",
+            SourceTabNext => "Pestaña Fuentes siguiente",
+            SourceTabPrev => "Pestaña Fuentes anterior",
+            ToggleActionsMenu => "Menú de acciones",
+            Yank => "Copiar (yank)",
+            ExportCsv => "Exportar CSV",
+            StartFilter => "Filtrar /",
+            HScrollLeft => "Scroll izq. (columnas)",
+            HScrollRight => "Scroll der. (columnas)",
+            ToggleHelp => "Ayuda de teclas",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +260,45 @@ impl Keymap {
     fn set_binding(&mut self, token: &str, action: AppAction) {
         self.bindings.retain(|_, existing| *existing != action);
         self.bindings.insert(normalize_token(token), action);
+    }
+
+    /// Secciones de ayuda autogeneradas desde los bindings REALES:
+    /// cada fila es `(teclas, descripción)` — si el usuario remapea una
+    /// tecla en config.toml, la ayuda muestra lo que de verdad funciona.
+    pub fn help_sections(&self) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
+        use std::collections::HashMap;
+
+        let groups: [KeyGroup; 6] = [
+            KeyGroup::Navigation,
+            KeyGroup::Focus,
+            KeyGroup::Sources,
+            KeyGroup::Tabs,
+            KeyGroup::Data,
+            KeyGroup::Actions,
+        ];
+
+        groups
+            .into_iter()
+            .map(|group| {
+                // acción → [tokens] (las variantes de una misma acción se
+                // agrupan en una sola fila: "j, ↓" → Mover abajo)
+                let mut by_action: HashMap<AppAction, Vec<String>> = HashMap::new();
+                for (token, action) in &self.bindings {
+                    if action.group() == group {
+                        by_action.entry(*action).or_default().push(token.clone());
+                    }
+                }
+                let mut rows: Vec<(String, &'static str)> = by_action
+                    .into_iter()
+                    .map(|(action, mut tokens)| {
+                        tokens.sort();
+                        (tokens.join(", "), action.description())
+                    })
+                    .collect();
+                rows.sort_by(|a, b| a.1.cmp(b.1));
+                (group.title(), rows)
+            })
+            .collect()
     }
 }
 
@@ -178,6 +356,7 @@ impl Default for Keymap {
         bindings.insert("y".to_string(), AppAction::Yank);
         bindings.insert("e".to_string(), AppAction::ExportCsv);
         bindings.insert("/".to_string(), AppAction::StartFilter);
+        bindings.insert("?".to_string(), AppAction::ToggleHelp);
 
         // ── scroll horizontal de columnas (Data tab) ──
         bindings.insert("shift+h".to_string(), AppAction::HScrollLeft);
@@ -267,6 +446,7 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "start_filter" => Some(AppAction::StartFilter),
         "h_scroll_left" => Some(AppAction::HScrollLeft),
         "h_scroll_right" => Some(AppAction::HScrollRight),
+        "toggle_help" => Some(AppAction::ToggleHelp),
         _ => None,
     }
 }
@@ -278,4 +458,60 @@ fn normalize_token(token: &str) -> String {
 fn config_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config").join("lazydb").join("config.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_sections_agrupan_bindings_reales_por_grupo() {
+        let k = Keymap::default();
+        let sections = k.help_sections();
+
+        // 6 grupos, todos presentes
+        assert_eq!(sections.len(), 6);
+
+        // "j, ↓" y "k, ↑" se agrupan en una sola fila por acción
+        let nav = sections.iter().find(|(t, _)| *t == "Navegación").expect("grupo nav");
+        assert!(nav.1.iter().any(|(keys, desc)| keys == "down, j" && *desc == "Mover abajo"));
+        assert!(nav.1.iter().any(|(keys, desc)| keys == "k, up" && *desc == "Mover arriba"));
+
+        // La ayuda `?` existe y está en Acciones
+        let actions = sections.iter().find(|(t, _)| *t == "Acciones").expect("grupo acciones");
+        assert!(actions.1.iter().any(|(keys, desc)| keys == "?" && *desc == "Ayuda de teclas"));
+
+        // Toda fila tiene descripción no vacía y su grupo coincide con el título
+        for (title, rows) in &sections {
+            for (_, desc) in rows {
+                assert!(!desc.is_empty(), "descripción vacía en {title}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_sections_reflejan_remapeos_del_usuario() {
+        let mut k = Keymap::default();
+        // El usuario remapea "Contar filas" a la tecla `p`
+        k.set_binding("p", AppAction::RunCountQuery);
+
+        let sections = k.help_sections();
+        let data = sections.iter().find(|(t, _)| *t == "Datos y queries").expect("grupo datos");
+        assert!(
+            data.1.iter().any(|(keys, desc)| keys == "p" && *desc == "Contar filas (query async)")
+        );
+
+        // El binding viejo ctrl+q ya no aparece (se reemplazó)
+        assert!(!data.1.iter().any(|(keys, _)| keys.contains("ctrl+q")));
+    }
+
+    #[test]
+    fn cada_accion_del_keymap_default_tiene_descripcion() {
+        let k = Keymap::default();
+        for (_, rows) in k.help_sections() {
+            for (_, desc) in rows {
+                assert!(!desc.trim().is_empty());
+            }
+        }
+    }
 }

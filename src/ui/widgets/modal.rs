@@ -28,6 +28,18 @@ impl ModalScroll {
         self.offset = self.offset.saturating_add(1);
     }
 
+    /// Desplaza `n` líneas hacia arriba (help modal).
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn up(&mut self, n: usize) {
+        self.offset = self.offset.saturating_sub(n);
+    }
+
+    /// Desplaza `n` líneas hacia abajo (help modal).
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn down(&mut self, n: usize) {
+        self.offset = self.offset.saturating_add(n);
+    }
+
     #[allow(clippy::missing_const_for_fn)]
     pub fn reset(&mut self) {
         self.offset = 0;
@@ -43,6 +55,22 @@ pub fn render(
     area: Rect,
     title: &str,
     lines: &[String],
+    scroll: &ModalScroll,
+    width_pct: u16,
+    height_pct: u16,
+) -> Rect {
+    let styled: Vec<Line<'_>> = lines.iter().map(|s| Line::from(s.as_str())).collect();
+    render_lines(frame, area, title, &styled, scroll, width_pct, height_pct)
+}
+
+/// Renderiza un modal centrado con líneas ya estilizadas (`Line`/`Span`).
+///
+/// Devuelve el inner rect (área de contenido sin bordes) para cálculos futuros.
+pub fn render_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: &[Line<'_>],
     scroll: &ModalScroll,
     width_pct: u16,
     height_pct: u16,
@@ -63,12 +91,10 @@ pub fn render(
     let visible = usize::from(inner.height.max(1));
 
     // Truncar líneas al offset
-    let visible_lines: Vec<&str> =
-        lines.iter().skip(scroll.offset).take(visible).map(AsRef::as_ref).collect();
+    let visible_lines: Vec<Line<'_>> =
+        lines.iter().skip(scroll.offset).take(visible).cloned().collect();
 
-    let content = visible_lines.join("\n");
-
-    let paragraph = Paragraph::new(content).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(visible_lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, rect);
 
     // Scrollbar manual (misma lógica/estilo que los paneles: thumb de largo

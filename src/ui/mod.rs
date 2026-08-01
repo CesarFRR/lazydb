@@ -55,6 +55,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     if app.show_actions_menu {
         render_actions_menu(frame, area, app);
     }
+
+    // Ayuda de teclas (modal overlay, encima de todo)
+    if app.show_help {
+        render_help(frame, area, app);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +119,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if area.width >= 110 {
         let shortcuts = format!(
-            "tab: foco | ↑↓: selección | ←→: sidebar | []: tabs | space: toggle | 1-5: panel | rueda: scroll | shift+rueda: cols | x: menu | {status}",
+            "tab: foco | ↑↓: selección | ←→: sidebar | []: tabs | space: toggle | 1-5: panel | rueda: scroll | shift+rueda: cols | x: menu | ?: ayuda | {status}",
         );
         frame.render_widget(Paragraph::new(shortcuts), area);
     } else {
@@ -159,6 +164,57 @@ fn render_actions_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, rect);
+}
+
+// ---------------------------------------------------------------------------
+// Help (modal overlay: bindings reales agrupados)
+// ---------------------------------------------------------------------------
+
+fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use ratatui::text::Line;
+
+    let sections = app.keymap.help_sections();
+
+    // Ancho de columna de teclas: el mayor de las filas (clamped 10..24)
+    let max_keys = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(k, _)| k.chars().count()))
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 24);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for (title, rows) in &sections {
+        if rows.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled(
+            format!("── {title} ──"),
+            Style::default().fg(crate::ui::theme::THEME.selection).add_modifier(Modifier::BOLD),
+        )));
+        for (keys, desc) in rows {
+            let pad = max_keys.saturating_sub(keys.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {keys}{}", " ".repeat(pad)),
+                    Style::default().fg(crate::ui::theme::THEME.unfocused),
+                ),
+                Span::raw("  "),
+                Span::raw(*desc),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    widgets::modal::render_lines(
+        frame,
+        area,
+        "Ayuda (bindings reales — ?/esc cerrar)",
+        &lines,
+        &app.help_scroll,
+        58,
+        80,
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -625,6 +625,9 @@ pub struct App {
     pub show_row_inspector: bool,
     pub row_inspector_pairs: Vec<(String, String)>,
     pub inspector_scroll: crate::ui::widgets::modal::ModalScroll,
+    /// Ayuda de teclas (modal `?`): se autogenera desde los bindings reales
+    pub show_help: bool,
+    pub help_scroll: crate::ui::widgets::modal::ModalScroll,
     /// Doble-click: timestamp del último click (ms) y panel clickeado
     pub last_click_time: u64,
     pub last_click_kind: Option<PanelKind>,
@@ -715,6 +718,8 @@ impl App {
             show_row_inspector: false,
             row_inspector_pairs: Vec::new(),
             inspector_scroll: crate::ui::widgets::modal::ModalScroll::default(),
+            show_help: false,
+            help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             last_click_time: 0,
             last_click_kind: None,
             last_click_idx: 0,
@@ -2289,6 +2294,12 @@ impl App {
             return;
         }
 
+        // ── ayuda de teclas (modal) ──
+        if self.show_help {
+            self.handle_help_key(action);
+            return;
+        }
+
         // ── menú de acciones (modal) ──
         if self.show_actions_menu {
             self.handle_actions_menu_key(action);
@@ -2334,6 +2345,24 @@ impl App {
         }
     }
 
+    fn handle_help_key(&mut self, action: keys::AppAction) {
+        match action {
+            keys::AppAction::ToggleHelp
+            | keys::AppAction::QuitOrBack
+            | keys::AppAction::ToggleActionsMenu => {
+                self.show_help = false;
+            }
+            // ↑/↓ desplazan el contenido si no cabe en el modal
+            keys::AppAction::MoveUp | keys::AppAction::PrevPage => {
+                self.help_scroll.up(2);
+            }
+            keys::AppAction::MoveDown | keys::AppAction::NextPage => {
+                self.help_scroll.down(2);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_actions_menu_key(&mut self, action: keys::AppAction) {
         match action {
             keys::AppAction::ToggleActionsMenu | keys::AppAction::QuitOrBack => {
@@ -2365,6 +2394,12 @@ impl App {
                 self.show_actions_menu = true;
                 self.actions_menu_idx = 0;
                 self.status = "Menu de acciones abierto".to_string();
+            }
+            keys::AppAction::ToggleHelp => {
+                self.show_help = !self.show_help;
+                if self.show_help {
+                    self.status = "Ayuda de teclas (bindings reales)".to_string();
+                }
             }
             keys::AppAction::Yank => self.yank_selected(),
             keys::AppAction::ExportCsv => self.export_csv(),
