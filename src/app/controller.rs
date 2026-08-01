@@ -565,6 +565,18 @@ pub struct ErrorPopup {
     pub body: String,
 }
 
+/// Estado del popup de input SQL (`:`): buffer, cursor y navegación del
+/// historial (↑/↓ estilo fish).
+#[derive(Clone, Debug, Default)]
+pub struct QueryInputState {
+    pub buffer: String,
+    /// Posición del cursor dentro de `buffer` (índice de char)
+    pub cursor: usize,
+    /// `Some(i)` = navegando el historial (la entrada i rellena el buffer);
+    /// `None` = escribiendo una query nueva.
+    pub history_idx: Option<usize>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     // ── sistema de paneles ──
@@ -626,8 +638,8 @@ pub struct App {
     /// facto cualquier tarea en vuelo.
     query_gen: u64,
     /// Canal de resultados del query runner: generación + SQL + resultado.
-    query_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::CountMsg>>,
-    query_tx: Option<tokio::sync::mpsc::UnboundedSender<query::CountMsg>>,
+    query_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::QueryMsg>>,
+    query_tx: Option<tokio::sync::mpsc::UnboundedSender<query::QueryMsg>>,
     /// Contador de frames para el spinner del status bar.
     pub frame: usize,
     pub keymap: keys::Keymap,
@@ -643,6 +655,12 @@ pub struct App {
     /// Popup de error global (modal rojo que se cierra con Enter/Esc/q).
     /// Cualquier error de ejecución/IO lo dispara vía `show_error`.
     pub error: Option<ErrorPopup>,
+    /// Popup de input SQL (`:`): `Some` = abierto. El historial persistente
+    /// vive en `state.query_history` (storage).
+    pub query_input: Option<QueryInputState>,
+    /// El preview muestra el resultado de una query libre del usuario (no el
+    /// objeto seleccionado). Los scrolls infinitos y refreshes lo respetan.
+    pub query_mode: bool,
     /// Doble-click: timestamp del último click (ms) y panel clickeado
     pub last_click_time: u64,
     pub last_click_kind: Option<PanelKind>,
@@ -743,6 +761,8 @@ impl App {
             show_help: false,
             help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             error: None,
+            query_input: None,
+            query_mode: false,
             last_click_time: 0,
             last_click_kind: None,
             last_click_idx: 0,
@@ -1424,6 +1444,9 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     fn refresh_preview_from_selected_object(&mut self) {
+        // El resultado de una query libre ya no aplica: navegar a un objeto
+        // devuelve el preview a la tabla seleccionada.
+        self.query_mode = false;
         // Ajustar rows_per_page dinámicamente según espacio disponible
         self.rows_per_page = self.optimal_rows_per_page();
         // Reset scroll_offset del viewport al recargar completamente los datos
@@ -1621,6 +1644,9 @@ impl App {
     /// Solo para tabla de datos (`DetailTab::Data`). Actualiza la selección
     /// para que apunte a la primera fila recién cargada (continuidad hacia abajo).
     fn scroll_down_infinite(&mut self) {
+        if self.query_mode {
+            return; // resultado de query libre: sin scroll infinito
+        }
         let data_len = self.preview_rows.len().saturating_sub(1);
         let next_offset = self.preview_loaded_offset as usize + data_len;
         if next_offset >= self.total_rows as usize {
@@ -1673,6 +1699,9 @@ impl App {
     /// y la selección para que apunte a la última fila recién cargada
     /// (continuidad hacia arriba).
     fn scroll_up_infinite(&mut self) {
+        if self.query_mode {
+            return; // resultado de query libre: sin scroll infinito
+        }
         if self.preview_loaded_offset == 0 {
             return; // ya estamos al inicio del dataset
         }
@@ -1780,7 +1809,7 @@ impl App {
 
         tokio::spawn(async move {
             let res = query::count_query_results(&path, &sql).await;
-            let _ = tx.send((generation, sql, res));
+            let _ = tx.send(query::QueryMsg::Count(generation, sql, res));
         });
     }
 
@@ -1811,17 +1840,57 @@ impl App {
     }
 
     fn poll_query_results(&mut self) {
-        let Some(rx) = self.query_rx.as_mut() else { return };
-        while let Ok((generation, sql, res)) = rx.try_recv() {
-            let Some((state, status)) =
-                Self::apply_count_result(self.query_gen, generation, &sql, res)
-            else {
-                continue; // stale: descartar
-            };
-            self.query_results =
-                if let query::QueryState::Done(rows) = &state { rows.clone() } else { Vec::new() };
-            self.query_state = state;
-            self.status = status;
+        // Drenar el canal en un scope corto: los borrows del loop no pueden
+        // convivir con las mutaciones de self que hace el procesamiento.
+        let drained: Vec<query::QueryMsg> = {
+            let Some(rx) = self.query_rx.as_mut() else { return };
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        };
+        for msg in drained {
+            match msg {
+                query::QueryMsg::Count(generation, sql, res) => {
+                    let Some((state, status)) =
+                        Self::apply_count_result(self.query_gen, generation, &sql, res)
+                    else {
+                        continue; // stale: descartar
+                    };
+                    self.query_results = if let query::QueryState::Done(rows) = &state {
+                        rows.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    self.query_state = state;
+                    self.status = status;
+                }
+                query::QueryMsg::Free(generation, _sql, res) => {
+                    if generation != self.query_gen {
+                        continue; // stale: una query más nueva ya se lanzó
+                    }
+                    self.is_loading = false;
+                    let (state, rows) = Self::apply_user_query_result(&res);
+                    if matches!(state, query::QueryState::Done(_)) {
+                        self.query_mode = true;
+                        self.query_state = state;
+                        self.query_results = rows;
+                        self.detail_tab = DetailTab::Data;
+                        // Vista de datos 2D: fila 0 es el header, el
+                        // resto son datos (el render ya hace el split).
+                        self.preview_rows = self.query_results.clone();
+                        self.preview_data = None;
+                        self.preview_loaded_offset = 0;
+                        self.set_selected_idx(PanelKind::Detail, 0);
+                        self.status = format!(
+                            "{} filas · query OK (limit {})",
+                            self.query_results.len(),
+                            query::QUERY_RESULT_LIMIT
+                        );
+                    } else if let query::QueryState::Error(e) = state {
+                        self.query_state = query::QueryState::Error(e.clone());
+                        self.status = format!("Error SQL: {e}");
+                        self.show_error("Error SQL", &e);
+                    }
+                }
+            }
         }
     }
 
@@ -1831,6 +1900,124 @@ impl App {
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
         self.status = "Query limpia".to_string();
+    }
+
+    // ── input SQL (`:` popup + historial persistente estilo fish) ──────
+
+    fn handle_query_input_key(&mut self, key: KeyEvent) {
+        let Some(state) = self.query_input.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => {
+                self.query_input = None;
+            }
+            KeyCode::Enter => {
+                let sql = state.buffer.trim().to_string();
+                self.query_input = None;
+                if sql.is_empty() {
+                    return;
+                }
+                self.execute_user_query(&sql);
+            }
+            KeyCode::Backspace => {
+                if state.cursor > 0 {
+                    let idx = state
+                        .buffer
+                        .char_indices()
+                        .nth(state.cursor.saturating_sub(1))
+                        .map_or(0, |(i, _)| i);
+                    state.buffer.remove(idx);
+                    state.cursor = state.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Left => {
+                state.cursor = state.cursor.saturating_sub(1);
+                state.history_idx = None;
+            }
+            KeyCode::Right => {
+                if state.cursor < state.buffer.chars().count() {
+                    state.cursor += 1;
+                    state.history_idx = None;
+                }
+            }
+            KeyCode::Up => self.query_history_select(1),
+            KeyCode::Down => self.query_history_select(0),
+            KeyCode::Char(c) => {
+                state.buffer.insert(
+                    state
+                        .buffer
+                        .char_indices()
+                        .nth(state.cursor)
+                        .map_or(state.buffer.len(), |(i, _)| i),
+                    c,
+                );
+                state.cursor += 1;
+                state.history_idx = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// ↑/↓ sobre el historial (estilo fish): rellena el buffer con la query
+    /// seleccionada; en `step = 0` (↓) vuelve hacia la query nueva.
+    fn query_history_select(&mut self, step: usize) {
+        let Some(state) = self.query_input.as_mut() else { return };
+        let len = self.state.query_history.len();
+        if len == 0 {
+            self.status = "Historial vacío".to_string();
+            return;
+        }
+        // step=1 (↑): avanza hacia atrás; step=0 (↓): hacia la nueva
+        let idx = match state.history_idx {
+            Some(i) if step == 1 => i.saturating_add(1).min(len - 1),
+            Some(i) if step == 0 && i > 0 => i - 1,
+            Some(_) | None => 0,
+        };
+        let sql = self.state.query_history[idx].clone();
+        state.history_idx = Some(idx);
+        state.buffer = sql;
+        state.cursor = state.buffer.chars().count();
+    }
+
+    /// Ejecuta una query libre del usuario contra la DB (async, con
+    /// generación anti-stale), registra el historial y muestra el resultado
+    /// en el preview (modo query, sin scroll infinito).
+    fn execute_user_query(&mut self, sql: &str) {
+        let Some(path) = self.db_path.clone() else {
+            self.show_error("Sin conexión", "Conecta una base primero (`:`)");
+            return;
+        };
+        let sql = sql.to_string();
+
+        self.state.add_query_history(&sql);
+        let _ = self.state.save();
+        self.sources = Self::build_sources(&self.state, self.source_tab, Some(&path), &self.health);
+
+        tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query_gen + 1);
+        self.query_gen += 1;
+        let generation = self.query_gen;
+        let Some(tx) = self.query_tx.clone() else { return };
+
+        self.query_state = query::QueryState::Running;
+        self.status = "Ejecutando query...".to_string();
+        self.is_loading = true;
+
+        tokio::spawn(async move {
+            let res = query::execute_query(&path, &sql, query::QUERY_RESULT_LIMIT).await;
+            let _ = tx.send(query::QueryMsg::Free(generation, sql, res));
+        });
+    }
+
+    /// Aplica el resultado de una query libre. Pura para testear sin App.
+    fn apply_user_query_result(
+        res: &Result<query::QueryResult, crate::db::DbError>,
+    ) -> (query::QueryState, Vec<String>) {
+        match res {
+            Ok(qr) => qr.error.as_ref().map_or_else(
+                || (query::QueryState::Done(qr.rows.clone()), qr.rows.clone()),
+                |err| (query::QueryState::Error(err.clone()), Vec::new()),
+            ),
+            Err(e) => (query::QueryState::Error(e.to_string()), Vec::new()),
+        }
     }
 
     // ── favoritos ─────────────────────────────────────────────────────
@@ -2446,17 +2633,26 @@ impl App {
             return;
         }
 
-        let Some(action) = keys::map_key(&self.keymap, key) else {
-            return;
-        };
-
         // ── popup de error (modal urgente: Enter/Esc/q lo cierran) ──
+        // Captura teclas crudas (no acciones mapeadas) para que ninguna
+        // navegación cierre el error por accidente.
         if self.error.is_some() {
             if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
                 self.error = None;
             }
             return;
         }
+
+        // ── input SQL (modal `:` — captura TODO mientras está abierto,
+        // incluidos chars no mapeados a ninguna acción) ──
+        if self.query_input.is_some() {
+            self.handle_query_input_key(key);
+            return;
+        }
+
+        let Some(action) = keys::map_key(&self.keymap, key) else {
+            return;
+        };
 
         // ── row inspector modal ──
         if self.show_row_inspector {
@@ -2560,6 +2756,10 @@ impl App {
             keys::AppAction::RunCountQuery => self.execute_count_query(),
             keys::AppAction::ClearQueryState => self.clear_query_state(),
             keys::AppAction::ReloadRuntimeConfig => self.reload_runtime_config(),
+            keys::AppAction::OpenQueryInput => {
+                self.query_input = Some(QueryInputState::default());
+                self.status = "SQL: escribe una query, ↑/↓ historial, enter ejecuta".to_string();
+            }
             keys::AppAction::ToggleActionsMenu => {
                 self.show_actions_menu = true;
                 self.actions_menu_idx = 0;
@@ -3678,5 +3878,116 @@ mod tests {
         let mut app = app_con_error();
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(app.error.is_some(), "navegación no debe cerrar el popup");
+    }
+
+    // ── input SQL (`:` popup + historial persistente) ────────────────
+
+    fn app_con_query_input(history: &[&str]) -> App {
+        let mut app = App::new();
+        app.query_input = Some(QueryInputState::default());
+        // Más reciente al inicio: coincide con add_query_history (insert(0, ...))
+        app.state.query_history = history.iter().map(|s| (*s).to_string()).collect();
+        // Para consistencia visual en los tests: invertimos si lo declaran
+        // en orden cronológico (viejo→nuevo). Los tests pasan el array como
+        // "qué devolverá query_history_select en orden de navegación":
+        // idx 0 = la query más reciente, idx 1 = la siguiente, etc.
+        app
+    }
+
+    #[test]
+    fn abrir_query_input_se_dispara_con_dos_puntos_y_abre_el_popup() {
+        let mut app = App::new();
+        // `:` está bindeado a OpenQueryInput; la acción abre el popup
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert!(app.query_input.is_some(), "`:` debe abrir el input SQL");
+    }
+
+    #[test]
+    fn escribir_en_el_input_appendea_chars_al_buffer_y_mueve_el_cursor() {
+        let mut app = app_con_query_input(&[]);
+        for c in ['S', 'E', 'L'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let s = app.query_input.as_ref().unwrap();
+        assert_eq!(s.buffer, "SEL");
+        assert_eq!(s.cursor, 3);
+    }
+
+    #[test]
+    fn backspace_borra_el_char_antes_del_cursor() {
+        let mut app = app_con_query_input(&[]);
+        for c in ['S', 'E', 'L'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let s = app.query_input.as_ref().unwrap();
+        assert_eq!(s.buffer, "SE");
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn flecha_arriba_rellena_el_buffer_con_la_query_mas_reciente_del_historial() {
+        let mut app = app_con_query_input(&["SELECT 2", "SELECT 1"]);
+        // buffer vacío + ↑ → la query más reciente (idx 0 = "SELECT 2")
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let s = app.query_input.as_ref().unwrap();
+        assert_eq!(s.buffer, "SELECT 2");
+        assert_eq!(s.history_idx, Some(0));
+        assert_eq!(s.cursor, s.buffer.chars().count());
+    }
+
+    #[test]
+    fn flecha_arriba_dos_veces_avanza_por_el_historial() {
+        let mut app = app_con_query_input(&["SELECT 2", "SELECT 1"]);
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let s = app.query_input.as_ref().unwrap();
+        // Llegamos a la entrada más vieja: "SELECT 1"
+        assert_eq!(s.buffer, "SELECT 1");
+        assert_eq!(s.history_idx, Some(1));
+    }
+
+    #[test]
+    fn flecha_abajo_despues_de_arriba_vuelve_a_query_nueva() {
+        let mut app = app_con_query_input(&["SELECT 2", "SELECT 1"]);
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        // ↑ rellenó "SELECT 2" (idx 0); ↓ baja hacia la siguiente → "SELECT 1"
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let s = app.query_input.as_ref().unwrap();
+        // ↓ desde idx=1 debería bajar a idx=0 (más reciente)
+        assert_eq!(s.buffer, "SELECT 2", "↓ desde posición alta vuelve a la más reciente");
+    }
+
+    #[test]
+    fn enter_con_buffer_vacio_cierra_sin_ejecutar_ni_historial() {
+        let mut app = app_con_query_input(&[]);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.query_input.is_none());
+        assert!(app.state.query_history.is_empty(), "buffer vacío no registra historial");
+    }
+
+    #[test]
+    fn enter_con_sql_sin_db_muestra_error_sin_panico() {
+        let mut app = app_con_query_input(&[]);
+        for c in "SELECT 1".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.query_input.is_none(), "Enter cierra el popup");
+        assert!(app.error.is_some(), "sin db_path → error global (no paniquea)");
+        assert!(app.state.query_history.is_empty(), "historial solo se guarda al ejecutar con DB");
+    }
+
+    #[test]
+    fn apply_user_query_result_devuelve_done_o_error_sin_panic() {
+        let ok = query::QueryResult { rows: vec!["a | b".to_string()], error: None };
+        let (state, rows) = App::apply_user_query_result(&Ok(ok));
+        assert!(matches!(state, query::QueryState::Done(_)));
+        assert_eq!(rows, vec!["a | b".to_string()]);
+
+        let err = crate::db::DbError::Sqlite("no such table: x".to_string());
+        let (state, rows) = App::apply_user_query_result(&Err(err));
+        assert!(matches!(state, query::QueryState::Error(_)));
+        assert!(rows.is_empty());
     }
 }

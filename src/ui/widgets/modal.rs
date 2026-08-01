@@ -112,7 +112,8 @@ pub fn render_lines(
 }
 
 #[must_use]
-const fn inner_area(area: Rect) -> Rect {
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) const fn inner_area(area: Rect) -> Rect {
     Rect {
         x: area.x + 1,
         y: area.y + 1,

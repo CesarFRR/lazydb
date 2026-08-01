@@ -10,6 +10,11 @@ use ratatui::style::Color;
 /// Paleta semántica de la aplicación.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
+    /// Texto de primer plano base (lo que escribe/lee el usuario).
+    pub text: Color,
+    /// Fondo de la app (terminal oscura). Usado para inversión (bloque de
+    /// selección: `fg=bg`, `bg=selection`) y para Clear sobre modales.
+    pub bg: Color,
     /// Foco/selección activa (bordes, títulos, cursor, thumb de scroll).
     pub selection: Color,
     /// Panel presente pero sin foco (elementos atenuados no apagados).
@@ -59,6 +64,8 @@ impl Theme {
     /// - gris: sin foco · gris oscuro: secundario
     pub const fn breeze_dark() -> Self {
         Self {
+            text: Color::White,
+            bg: Color::Black,
             selection: Color::Cyan,
             unfocused: Color::Gray,
             dim: Color::DarkGray,

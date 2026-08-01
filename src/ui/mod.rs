@@ -61,6 +61,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_help(frame, area, app);
     }
 
+    // Input SQL (modal `:` — buffer con cursor + historial estilo fish)
+    if app.query_input.is_some() {
+        render_query_input(frame, area, app);
+    }
+
     // Popup de error global (modal rojo, encima de todo — Enter/Esc/q cierra)
     if let Some(err) = &app.error {
         let title = format!(" ✗ {}", err.title);
@@ -237,6 +242,87 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 // ---------------------------------------------------------------------------
 // Terminal muy pequeña
 // ---------------------------------------------------------------------------
+
+/// Modal de input SQL (`:`): buffer editable con cursor visible, historial
+/// navegable debajo (↑/↓, estilo fish) y hint de teclas al pie.
+fn render_query_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let Some(state) = &app.query_input else { return };
+    let theme = &crate::ui::theme::THEME;
+
+    // Tamaño del modal: ancho 70%, alto = borde + input + hasta 8 historial + footer
+    let width = area.width.saturating_mul(70) / 100;
+    let history_len = app.state.query_history.len().min(8);
+    #[allow(clippy::cast_possible_truncation)]
+    let height = (4 + history_len).min(12) as u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .title(" SQL › ".to_string())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.selection));
+    let inner = crate::ui::widgets::modal::inner_area(rect);
+    frame.render_widget(block, rect);
+
+    // Fila 0 del inner: prompt + buffer (texto base)
+    let prompt = "❯ ";
+    let prompt_w = u16::try_from(prompt.chars().count()).unwrap_or(2);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(prompt.to_string()),
+            Span::styled(state.buffer.as_str(), Style::default().fg(theme.text)),
+        ])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    // Filas 1..N: historial (estilo fish; la entrada activa queda resaltada
+    // con inversión fg=bg / bg=selection)
+    let footer_y = inner.y + inner.height.saturating_sub(1);
+    for (row_y, (i, sql)) in (inner.y + 1..).zip(
+        app.state.query_history.iter().take(8).enumerate(),
+    ) {
+        if row_y >= footer_y {
+            break;
+        }
+        let selected = state.history_idx == Some(i);
+        let style = if selected {
+            Style::default().fg(theme.bg).bg(theme.selection)
+        } else {
+            Style::default().fg(theme.unfocused)
+        };
+        // Truncar el SQL al ancho útil del inner (dejando 2 de indent + 1 de margen)
+        let avail = usize::from(inner.width.saturating_sub(3));
+        let text = if sql.chars().count() > avail {
+            let truncated: String = sql.chars().take(avail.saturating_sub(1)).collect();
+            format!("{truncated}…")
+        } else {
+            sql.clone()
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(format!("  {text}"), style)),
+            Rect::new(inner.x, row_y, inner.width, 1),
+        );
+    }
+
+    // Footer: hint de teclas (patrón lazygit: acciones del modal siempre visibles)
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " [enter] ejecutar  [esc] cerrar  [up/down] historial",
+            Style::default().fg(theme.unfocused),
+        )),
+        Rect::new(inner.x, footer_y, inner.width, 1),
+    );
+
+    // Cursor real del terminal sobre el buffer (posición del char `cursor`)
+    #[allow(clippy::cast_possible_truncation)]
+    let cursor_offset = prompt_w + state.cursor as u16;
+    frame.set_cursor_position((inner.x + cursor_offset.min(inner.width), inner.y));
+}
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
     let msg = "Terminal pequena: amplia ancho/alto para ver lazydb";

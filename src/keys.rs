@@ -8,6 +8,8 @@ pub enum AppAction {
     RunCountQuery,
     ClearQueryState,
     ReloadRuntimeConfig,
+    /// Abrir el input SQL (`:` estilo vim; historial con ↑/↓)
+    OpenQueryInput,
     QuitOrBack,
     /// Navegar al panel anterior (cicla los 5 paneles)
     FocusPrev,
@@ -116,9 +118,9 @@ impl AppAction {
             FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview, FocusSources,
             FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight, JumpToDetail,
             MoveDown, MoveUp, NextPage, ObjectSectionAdvanced, ObjectSectionTables,
-            ObjectSectionViews, PrevPage, QuitOrBack, Refresh, ReloadRuntimeConfig, RunCountQuery,
-            SidebarFocusNext, SidebarFocusPrev, SourceTabFavorites, SourceTabNext, SourceTabPrev,
-            SourceTabRecents, StartFilter, ToggleActionsMenu, ToggleCurrentPanel,
+            ObjectSectionViews, OpenQueryInput, PrevPage, QuitOrBack, Refresh, ReloadRuntimeConfig,
+            RunCountQuery, SidebarFocusNext, SidebarFocusPrev, SourceTabFavorites, SourceTabNext,
+            SourceTabPrev, SourceTabRecents, StartFilter, ToggleActionsMenu, ToggleCurrentPanel,
             ToggleFavoriteSource, ToggleHelp, Yank,
         };
         match self {
@@ -137,9 +139,8 @@ impl AppAction {
             | DetailTabSchema
             | DetailTabSql
             | DetailTabMeta => KeyGroup::Tabs,
-            RunCountQuery | ClearQueryState | ReloadRuntimeConfig | HScrollLeft | HScrollRight => {
-                KeyGroup::Data
-            }
+            RunCountQuery | ClearQueryState | ReloadRuntimeConfig | OpenQueryInput
+            | HScrollLeft | HScrollRight => KeyGroup::Data,
             Enter | ToggleActionsMenu | Yank | ExportCsv | StartFilter | ToggleHelp => {
                 KeyGroup::Actions
             }
@@ -154,15 +155,16 @@ impl AppAction {
             FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview, FocusSources,
             FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight, JumpToDetail,
             MoveDown, MoveUp, NextPage, ObjectSectionAdvanced, ObjectSectionTables,
-            ObjectSectionViews, PrevPage, QuitOrBack, Refresh, ReloadRuntimeConfig, RunCountQuery,
-            SidebarFocusNext, SidebarFocusPrev, SourceTabFavorites, SourceTabNext, SourceTabPrev,
-            SourceTabRecents, StartFilter, ToggleActionsMenu, ToggleCurrentPanel,
+            ObjectSectionViews, OpenQueryInput, PrevPage, QuitOrBack, Refresh, ReloadRuntimeConfig,
+            RunCountQuery, SidebarFocusNext, SidebarFocusPrev, SourceTabFavorites, SourceTabNext,
+            SourceTabPrev, SourceTabRecents, StartFilter, ToggleActionsMenu, ToggleCurrentPanel,
             ToggleFavoriteSource, ToggleHelp, Yank,
         };
         match self {
             RunCountQuery => "Contar filas (query async)",
             ClearQueryState => "Limpiar resultado de query",
             ReloadRuntimeConfig => "Recargar config en caliente",
+            OpenQueryInput => "Abrir input SQL (: historial)",
             QuitOrBack => "Volver / salir (por capas)",
             FocusPrev => "Panel anterior",
             FocusNext => "Panel siguiente",
@@ -320,6 +322,7 @@ impl Default for Keymap {
         bindings.insert("ctrl+q".to_string(), AppAction::RunCountQuery);
         bindings.insert("ctrl+l".to_string(), AppAction::ClearQueryState);
         bindings.insert("ctrl+r".to_string(), AppAction::ReloadRuntimeConfig);
+        bindings.insert(":".to_string(), AppAction::OpenQueryInput);
 
         // ── navegación global ──
         bindings.insert("esc".to_string(), AppAction::QuitOrBack);

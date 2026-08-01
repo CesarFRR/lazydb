@@ -7,11 +7,17 @@ use std::path::PathBuf;
 pub struct AppState {
     pub recents: Vec<String>,
     pub favorites: HashMap<String, String>,
+    /// Historial de queries ejecutadas (navegable con ↑/↓ en el query input).
+    /// Más reciente al inicio; máx. `QUERY_HISTORY_MAX` entradas.
+    pub query_history: Vec<String>,
 }
+
+/// Tope del historial de queries persistente (como los 10 recents, acotado).
+pub const QUERY_HISTORY_MAX: usize = 50;
 
 impl AppState {
     pub fn new() -> Self {
-        Self { recents: Vec::new(), favorites: HashMap::new() }
+        Self { recents: Vec::new(), favorites: HashMap::new(), query_history: Vec::new() }
     }
 
     /// Carga el estado desde ~/.config/lazydb/recents.json
@@ -42,7 +48,12 @@ impl AppState {
             })
             .unwrap_or_default();
 
-        Self { recents, favorites }
+        let query_history = json["query_history"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        Self { recents, favorites, query_history }
     }
     /// Guarda el estado a ~/.config/lazydb/recents.json
     pub fn save(&self) -> Result<(), crate::db::DbError> {
@@ -56,6 +67,7 @@ impl AppState {
         let json = json!({
             "recents": self.recents,
             "favorites": self.favorites,
+            "query_history": self.query_history,
         });
 
         let content = serde_json::to_string_pretty(&json)
@@ -81,6 +93,25 @@ impl AppState {
     #[allow(dead_code)]
     pub fn add_favorite(&mut self, name: String, path: String) {
         self.favorites.insert(name, path);
+    }
+
+    /// Registra una query ejecutada: evita la duplicada consecutiva,
+    /// reposiciona al frente las queries ya existentes y mantiene
+    /// `QUERY_HISTORY_MAX` entradas (la más reciente al inicio).
+    pub fn add_query_history(&mut self, sql: &str) {
+        let sql = sql.trim().to_string();
+        if sql.is_empty() {
+            return;
+        }
+        // Si ya es la más reciente, NO ensuciar el historial
+        if self.query_history.first().is_some_and(|h| h == &sql) {
+            return;
+        }
+        // Remover cualquier aparición anterior (para reposicionarla al frente,
+        // sin duplicados)
+        self.query_history.retain(|h| h != &sql);
+        self.query_history.insert(0, sql);
+        self.query_history.truncate(QUERY_HISTORY_MAX);
     }
 
     /// Remueve un favorito
@@ -114,4 +145,53 @@ impl Default for AppState {
 fn config_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config").join("lazydb").join("recents.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_query_history_guarda_al_inicio_y_deduplica_consecutivas() {
+        let mut s = AppState::new();
+        s.add_query_history("SELECT 1");
+        s.add_query_history("SELECT 2");
+        // La misma query repetida justo después NO ensucia el historial
+        s.add_query_history("SELECT 2");
+        assert_eq!(s.query_history, vec!["SELECT 2".to_string(), "SELECT 1".to_string(),]);
+    }
+
+    #[test]
+    fn add_query_history_ignora_espacios_y_vacias() {
+        let mut s = AppState::new();
+        s.add_query_history("   SELECT 1   ");
+        // Hace trim: queda sin espacios
+        assert_eq!(s.query_history, vec!["SELECT 1".to_string()]);
+        s.add_query_history("    ");
+        assert_eq!(s.query_history.len(), 1, "query de espacios no se guarda");
+    }
+
+    #[test]
+    fn add_query_history_acota_en_query_history_max() {
+        let mut s = AppState::new();
+        for i in 0..(QUERY_HISTORY_MAX + 5) {
+            s.add_query_history(&format!("SELECT {i}"));
+        }
+        assert_eq!(s.query_history.len(), QUERY_HISTORY_MAX);
+        // Las más recientes sobreviven al inicio
+        assert!(s.query_history[0].contains(&(QUERY_HISTORY_MAX + 4).to_string()));
+        // Las más viejas se cayeron
+        assert!(!s.query_history.iter().any(|q| q == "SELECT 0"));
+    }
+
+    #[test]
+    fn add_query_history_permite_repetir_una_query_mas_tarde() {
+        let mut s = AppState::new();
+        s.add_query_history("SELECT 1");
+        s.add_query_history("SELECT 2");
+        // Re-ejecutar la primera Cuenta como nueva: sube al frente
+        s.add_query_history("SELECT 1");
+        assert_eq!(s.query_history[0], "SELECT 1");
+        assert_eq!(s.query_history.len(), 2, "la duplicada NO consecutiva se reposiciona");
+    }
 }

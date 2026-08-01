@@ -199,13 +199,42 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
   migrados 10 callers: apertura de DB, SQL/contar/obtener filas, schema, export
   y cli sqlite3. `render_lines` gana `border_style: Option<Style>` opcional.
   2 tests (cierre con Enter/Esc/q, otras teclas ignoradas).
-- Historial de queries persistente
+- **Historial de queries persistente** — ✅ HECHO: input SQL modal estilo `:` (vim) con
+  cursor real del terminal (`set_cursor_position`), historial navegable ↑/↓ (rellena el
+  buffer, selección resaltada cyan, estilo fish). Enter ejecuta la query asíncrona
+  (`tokio::spawn`, generación anti-stale) usando `query::execute_query` (re-desterileizado
+  de `dead_code`). Canal unificado `QueryMsg::Count | QueryMsg::Free`. Resultado en
+  preview (modo query, sin scroll infinito). Historial persistente en `recents.json`
+  (`query_history: Vec<String>` deduplicado, trim, reposiciona, máx 50 entradas).
+  `Theme` gana `text`/`bg` para inversión semántica; `inner_area` hecho pub(crate).
+  `Render_query_input` en ui/mod.rs (modal con prompt `❯`, historial debajo, hint al pie).
+  13 tests (storage 4, controller 8, theme se mantiene).
 
 ## FASE 2 — Multi-backend local
 
-- **DuckDB** (`.duckdb`, crate `duckdb` bundled, mismo patrón que sqlite.rs)
-- **MySQL localhost** (crate `mysql`) y **PostgreSQL** (crate `postgres`)
+### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
+
+| Motor | Crate | Tipo | Estado 2026 | Nota lazydb |
+|---|---|---|---|---|
+| SQLite | `rusqlite` | sync, FFI C | ✅ vigente (0.38) | YA EN USO. bundled; read-only (WAL no aplica) |
+| DuckDB | `duckdb` (~1.10505) | sync, FFI | ✅ muy activo | API estilo rusqlite → copia directa del patrón sqlite.rs |
+| PostgreSQL | `postgres` (sync) / `tokio-postgres` (async) | protocolo nativo | ✅ vigente | **sync para nosotros** + `spawn_blocking`. Pool bb8/deadpool si hace falta. Pipelining nativo (tip gemini) |
+| MySQL/MariaDB | `mysql` (sync) / `mysql_async` | protocolo binario puro | ✅ vigente | sync para nosotros; protocolo binario sin capa de red |
+| MongoDB | `mongodb` (oficial) | async, 100% Rust | ✅ | Fase 3; bson para bytes |
+| Redis | `redis-rs` (+ `fred` para clustering masivo) | async | ✅ | Fase 3; redis-rs basta (fred = overkill para TUI) |
+| ClickHouse | `clickhouse` | async, columnar | ✅ | Fase 3; formato nativo de bloques |
+| ScyllaDB | `scylla` | async | ✅ | opcional, solo si el usuario lo pide |
+| MSSQL | `tiberius` | async, TDS puro | ✅ | opcional (evita ODBC en Linux) |
+| Embebido KV | `redb` (100% Rust) / `rust-rocksdb` | sync | ✅ | candidato caché local; JSON simple basta por ahora |
+| ❌ Evitar | `sqlx` | async | — | compile-time queries inútiles para SQL dinámico de usuario; overhead de parsing AST; decisión de arquitectura ya tomada (trait sync + spawn_blocking) |
+
+### Estrategia lazy (de Gemini, ya aplicada en parte)
+
 - Trait de backend **SÍNCRONO** + `spawn_blocking` en el servicio (patrón lazysql, no gobang)
+- Queries en task + `tokio::sync::mpsc` → la UI nunca se congela (query runner actual)
+- Culling: solo la página visible (LIMIT/OFFSET ya implementado); los bytes crudos
+  on-demand (`Arc<[u8]>` hasta el render) son un refinamiento futuro, no bloqueante:
+  el modelo tipado `Row.cells` ya decodifica a nivel de filas/páginas visibles
 - `BackendCapabilities { has_schemas, supports_limit_offset, quoting }` para adaptar la UI
   sin `if backend == sqlite`
 - Selector de fuente: popup de conexiones (gobang connections.rs)

@@ -10,8 +10,17 @@ pub enum QueryState {
     Error(String),
 }
 
-/// Mensaje del query runner por el canal: (generación, SQL, resultado).
-pub type CountMsg = (u64, String, Result<u32, DbError>);
+/// Mensaje del query runner por el canal: COUNT(*) o query libre del usuario.
+pub enum QueryMsg {
+    /// (generación, SQL, resultado del COUNT)
+    Count(u64, String, Result<u32, DbError>),
+    /// (generación, SQL, resultado de query libre)
+    Free(u64, String, Result<QueryResult, DbError>),
+}
+
+/// Tope de filas para una query libre (filosofía culling: nunca materializar
+/// la DB entera en el preview).
+pub const QUERY_RESULT_LIMIT: u32 = 500;
 
 #[allow(dead_code)]
 pub struct QueryResult {
@@ -21,7 +30,6 @@ pub struct QueryResult {
 
 /// Ejecuta una query SQL de forma asincrónica contra la base de datos
 /// Las queries son read-only y se ejecutan en un thread de Tokio para no bloquear la UI
-#[allow(dead_code)]
 pub async fn execute_query(db_path: &str, sql: &str, limit: u32) -> Result<QueryResult, DbError> {
     let db_path = db_path.to_string();
     let sql = sql.to_string();
