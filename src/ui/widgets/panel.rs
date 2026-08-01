@@ -610,18 +610,26 @@ pub fn draw_v_scrollbar(frame: &mut Frame<'_>, area: Rect, content_len: usize, o
     // División entera: con offset == max_scroll el thumb toca el borde inferior
     let thumb_start = offset.min(max_scroll).saturating_mul(track) / max_scroll;
 
-    let x = area.x + area.width - 1;
+    // La columna de la barra NO puede sobrepasar el buffer del frame
+    // (off-by-one al redimensionar la terminal a una dimension menor).
+    let (frame_w, frame_h) = (frame.area().width, frame.area().height);
+    let x = (area.x + area.width.saturating_sub(1)).min(frame_w.saturating_sub(1));
+    let y_range = area.y + 1..area.y + 1 + inner_h as u16;
     let track_style = Style::default().fg(THEME.dim);
     let thumb_style = Style::default().fg(THEME.selection);
     let buf = frame.buffer_mut();
-    for i in 0..inner_h {
+    for (i, cy) in y_range.enumerate() {
+        if cy >= frame_h {
+            break;
+        }
         let (symbol, style) = if i >= thumb_start && i < thumb_start + thumb_h {
             ("█", thumb_style)
         } else {
             ("│", track_style)
         };
-        let cell = buf.cell_mut((x, area.y + 1 + i as u16)).expect("celda del scrollbar");
-        cell.set_symbol(symbol).set_style(style);
+        if let Some(cell) = buf.cell_mut((x, cy)) {
+            cell.set_symbol(symbol).set_style(style);
+        }
     }
 }
 

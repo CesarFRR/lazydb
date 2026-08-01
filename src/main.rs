@@ -41,12 +41,23 @@ fn init_tracing() -> io::Result<WorkerGuard> {
 
 /// Hook de pánico: log a disco + restaurar la terminal ANTES de que el
 /// proceso muera (sin esto, un panic dejaba la terminal en raw mode /
-/// alternate screen y había que reiniciarla a mano).
+/// alternate screen y había que reiniciarla a mano). Encadenamos al hook
+/// interno de `ratatui::init()` para preservar su restore completo
+/// (raw mode + alternate screen + mouse capture + cursor).
 fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // 1) Logging a disco (nuestra parte)
         tracing::error!(panic = %info, "panic: terminal restaurada");
-        // Restaurar lo antes posible: si esto falla, nada que podamos hacer
-        ratatui::restore();
+        // 2) Desactivar la captura del ratón explícitamente: si el panic
+        // ocurrió con mouse capture activo, el hook interno de ratatui no
+        // siempre lo desactiva. Lo hacemos antes para no dejar la terminal
+        // enviando eventos crudos al proceso zombie.
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        // 3) Restaurar la terminal (delegado al hook interno de ratatui).
+        prev_hook(info);
+        // 4) Mensaje al stderr para que el usuario sepa qué pasó (después
+        // del restore, ya en modo cooked).
         eprintln!("\n[panic] lazydb: {info}\nDetalles en ~/.config/lazydb/logs/");
     }));
 }

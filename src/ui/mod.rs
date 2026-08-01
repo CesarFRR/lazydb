@@ -318,10 +318,14 @@ fn render_query_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Rect::new(inner.x, footer_y, inner.width, 1),
     );
 
-    // Cursor real del terminal sobre el buffer (posición del char `cursor`)
+    // Cursor real del terminal sobre el buffer (posición del char `cursor`),
+    // acotado al tamaño real del frame para que el redimensionado nunca cause
+    // panic "index outside of buffer".
     #[allow(clippy::cast_possible_truncation)]
     let cursor_offset = prompt_w + state.cursor as u16;
-    frame.set_cursor_position((inner.x + cursor_offset.min(inner.width), inner.y));
+    let col = (inner.x + cursor_offset).min(frame.area().width.saturating_sub(1));
+    let row = inner.y.min(frame.area().height.saturating_sub(1));
+    frame.set_cursor_position((col, row));
 }
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
