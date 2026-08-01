@@ -1,6 +1,6 @@
 // Casos de uso de alto nivel que consumen `DbAdapter`.
-use crate::db::DbError;
 use crate::db::adapter::DbAdapter;
+use crate::db::{DbError, TableData};
 
 #[allow(dead_code)]
 pub fn list_objects(adapter: &dyn DbAdapter, object_type: &str) -> Result<Vec<String>, DbError> {
@@ -13,7 +13,7 @@ pub fn preview_table(
     table: &str,
     limit: u32,
     offset: u32,
-) -> Result<Vec<String>, DbError> {
+) -> Result<TableData, DbError> {
     adapter.table_rows(table, limit, offset)
 }
 

@@ -47,8 +47,7 @@ pub async fn execute_query(db_path: &str, sql: &str, limit: u32) -> Result<Query
                 if i > 0 {
                     row_str.push_str(" | ");
                 }
-                let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
-                row_str.push_str(&val);
+                row_str.push_str(&crate::db::backends::sqlite::cell_value_to_string(row, i));
             }
             Ok(row_str)
         })?;

@@ -1466,9 +1466,13 @@ impl App {
                     offset,
                     order_col,
                 ) {
-                    Ok(rows) => {
-                        self.preview_rows =
-                            if rows.is_empty() { vec!["<sin datos>".to_string()] } else { rows };
+                    Ok(data) => {
+                        // TableData → view-model del Data tab (header + filas)
+                        self.preview_rows = if data.rows.is_empty() {
+                            vec!["<sin datos>".to_string()]
+                        } else {
+                            data.to_lines()
+                        };
                         self.preview_loaded_offset = offset;
                         self.set_selected_idx(
                             PanelKind::Detail,
@@ -1506,10 +1510,13 @@ impl App {
 
                 match db::backends::sqlite::table_columns(path, &object_name) {
                     Ok(columns) => {
+                        // ColumnInfo → líneas de presentación del Schema tab
                         self.preview_rows = if columns.is_empty() {
                             vec!["Sin columnas visibles".to_string()]
                         } else {
-                            columns
+                            let mut lines = vec!["cid | name | type | nullability".to_string()];
+                            lines.extend(columns.iter().map(crate::db::ColumnInfo::to_line));
+                            lines
                         };
                         self.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
@@ -1587,21 +1594,21 @@ impl App {
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
         #[allow(clippy::cast_possible_truncation)]
-        if let Ok(rows) = crate::db::backends::sqlite::table_rows_sorted(
+        if let Ok(data) = crate::db::backends::sqlite::table_rows_sorted(
             path,
             &object,
             limit,
             next_offset as u32,
             order_col,
         ) {
-            // rows[0] es header (lo descartamos, ya tenemos el nuestro)
-            // rows[1..] son las filas de datos nuevas
-            if rows.len() <= 1 {
+            // data.rows son las filas de datos nuevas (sin header: ya tenemos
+            // el nuestro en preview_rows[0])
+            if data.rows.is_empty() {
                 self.is_loading = false;
                 return;
             }
             let old_len = self.preview_rows.len();
-            self.preview_rows.extend(rows.iter().skip(1).cloned());
+            self.preview_rows.extend(data.rows.iter().map(|row| row.to_line(" | ")));
             // La selección va a la primera fila nueva (continuidad: se avanzó 1 paso)
             self.set_selected_idx(PanelKind::Detail, old_len);
         }
@@ -1635,20 +1642,20 @@ impl App {
         self.status = format!("Cargando filas anteriores (offset {offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-        if let Ok(rows) =
+        if let Ok(data) =
             crate::db::backends::sqlite::table_rows_sorted(path, &object, limit, offset, order_col)
         {
-            // rows[0] es header (lo descartamos), rows[1..] son datos nuevos
-            if rows.len() <= 1 {
+            // data.rows son los datos nuevos (el header ya está en index 0)
+            let n = data.rows.len(); // cantidad de filas nuevas
+            if n == 0 {
                 self.is_loading = false;
                 return;
             }
-            let n = rows.len() - 1; // cantidad de filas nuevas
 
             // Anteponer las filas nuevas (preservando el header en index 0)
             let header = self.preview_rows[0].clone();
             let mut expanded = vec![header];
-            expanded.extend(rows.iter().skip(1).cloned());
+            expanded.extend(data.rows.iter().map(|row| row.to_line(" | ")));
             expanded.extend(self.preview_rows.iter().skip(1).cloned());
             self.preview_rows = expanded;
 
@@ -1984,12 +1991,17 @@ impl App {
             return;
         };
 
-        let values: Vec<&str> = rows.first().map_or("", String::as_str).split('|').collect();
+        // Celdas tipadas: los valores viajan intactos (un "a | b" dentro de
+        // una celda ya no se rompe con split('|'))
+        let values: Vec<String> = rows.first().map(|row| row.cells.clone()).unwrap_or_default();
 
         self.row_inspector_pairs = columns
             .iter()
-            .zip(values.iter().chain(std::iter::repeat(&"")))
-            .map(|(col, val)| (col.clone(), val.to_string()))
+            .enumerate()
+            .map(|(i, col)| {
+                let val = values.get(i).cloned().unwrap_or_default();
+                (col.name.clone(), val)
+            })
             .collect();
         // Al cambiar de fila, empezar el scroll del modal desde arriba
         self.inspector_scroll.reset();

@@ -1,5 +1,5 @@
-use crate::db::DbError;
 use crate::db::adapter::DbAdapter;
+use crate::db::{ColumnInfo, DbError, TableData};
 
 /// Adapter ligero que delega en las funciones existentes de `db::backends::sqlite`.
 #[allow(dead_code)]
@@ -27,16 +27,11 @@ impl DbAdapter for SqliteAdapter {
         crate::db::backends::sqlite::object_sql(&self.path, object_name)
     }
 
-    fn table_columns(&self, table_name: &str) -> Result<Vec<String>, DbError> {
+    fn table_columns(&self, table_name: &str) -> Result<Vec<ColumnInfo>, DbError> {
         crate::db::backends::sqlite::table_columns(&self.path, table_name)
     }
 
-    fn table_rows(
-        &self,
-        table_name: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<String>, DbError> {
+    fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
         crate::db::backends::sqlite::table_rows(&self.path, table_name, limit, offset)
     }
 

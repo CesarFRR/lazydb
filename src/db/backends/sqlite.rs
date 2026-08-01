@@ -1,6 +1,6 @@
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use crate::db::DbError;
+use crate::db::{Column, ColumnInfo, DbError, Row, TableData};
 
 pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>, DbError> {
     let conn = open_read_only(path)?;
@@ -77,14 +77,18 @@ pub fn list_objects(path: &str) -> Result<Vec<String>, DbError> {
     Ok(out)
 }
 
-/// Solo nombres de columna, sin metadatos. Para inspector de fila.
-pub fn column_names(path: &str, table_name: &str) -> Result<Vec<String>, DbError> {
+/// Columnas (nombre + tipo declarado) de una tabla. Para inspector de fila.
+pub fn column_names(path: &str, table_name: &str) -> Result<Vec<Column>, DbError> {
     let conn = open_read_only(path)?;
     let escaped = table_name.replace('"', "\"\"");
     let sql = format!("PRAGMA table_info(\"{escaped}\")");
     let mut stmt = conn.prepare(&sql)?;
 
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        let dtype: String = row.get(2)?;
+        Ok(Column { name, dtype })
+    })?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -93,9 +97,9 @@ pub fn column_names(path: &str, table_name: &str) -> Result<Vec<String>, DbError
     Ok(out)
 }
 
-/// Metadata completo (cid, name, type, nullability). Para pestaña Schema.
-#[allow(dead_code)]
-pub fn table_columns(path: &str, table_name: &str) -> Result<Vec<String>, DbError> {
+/// Metadata completo de columna (cid, name, type, nullability). Para pestaña
+/// Schema; `ColumnInfo::to_line()` formatea la línea de presentación.
+pub fn table_columns(path: &str, table_name: &str) -> Result<Vec<ColumnInfo>, DbError> {
     let conn = open_read_only(path)?;
     let escaped = table_name.replace('"', "\"\"");
     let sql = format!("PRAGMA table_info(\"{escaped}\")");
@@ -107,13 +111,10 @@ pub fn table_columns(path: &str, table_name: &str) -> Result<Vec<String>, DbErro
         let dtype: String = row.get(2)?;
         let notnull: i64 = row.get(3)?;
         let pk: i64 = row.get(5)?;
-
-        let null_flag = if notnull == 1 { "NOT NULL" } else { "NULL" };
-        let pk_flag = if pk == 1 { " PK" } else { "" };
-        Ok(format!("{cid} | {name} | {dtype} | {null_flag}{pk_flag}"))
+        Ok(ColumnInfo { cid, name, dtype, notnull: notnull == 1, pk: pk == 1 })
     })?;
 
-    let mut out = vec!["cid | name | type | nullability".to_string()];
+    let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
@@ -127,7 +128,7 @@ pub fn table_data_rows(
     table_name: &str,
     limit: u32,
     offset: u32,
-) -> Result<Vec<String>, DbError> {
+) -> Result<Vec<Row>, DbError> {
     let conn = open_read_only(path)?;
     let escaped = table_name.replace('"', "\"\"");
     let sql = format!("SELECT * FROM \"{escaped}\" LIMIT {limit} OFFSET {offset}");
@@ -138,10 +139,9 @@ pub fn table_data_rows(
     let rows = stmt.query_map([], |row| {
         let mut values = Vec::new();
         for i in 0..col_count {
-            let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
-            values.push(val);
+            values.push(cell_value_to_string(row, i));
         }
-        Ok(values.join("|"))
+        Ok(Row { cells: values })
     })?;
 
     let mut out = Vec::new();
@@ -152,52 +152,25 @@ pub fn table_data_rows(
     Ok(out)
 }
 
-/// Filas con header incluido (para el preview de datos).
+/// Filas + columnas, para el preview de datos.
 pub fn table_rows(
     path: &str,
     table_name: &str,
     limit: u32,
     offset: u32,
-) -> Result<Vec<String>, DbError> {
-    let conn = open_read_only(path)?;
-    let escaped = table_name.replace('"', "\"\"");
-    let sql = format!("SELECT * FROM \"{escaped}\" LIMIT {limit} OFFSET {offset}");
-    let mut stmt = conn.prepare(&sql)?;
-
-    let mut out = Vec::new();
-    let col_names = stmt.column_names().iter().map(ToString::to_string).collect::<Vec<_>>();
-
-    if col_names.is_empty() {
-        return Ok(out);
-    }
-
-    out.push(col_names.join(" | "));
-
-    let col_count = col_names.len();
-    let rows = stmt.query_map([], |row| {
-        let mut values = Vec::new();
-        for i in 0..col_count {
-            let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
-            values.push(val);
-        }
-        Ok(values.join(" | "))
-    })?;
-
-    for row in rows {
-        out.push(row?);
-    }
-
-    Ok(out)
+) -> Result<TableData, DbError> {
+    table_rows_sorted(path, table_name, limit, offset, None)
 }
 
-/// Filas con header, con ORDER BY opcional.
+/// Filas + columnas, con ORDER BY opcional. El contrato del dominio habla
+/// en modelos (`TableData`), no en strings formateados.
 pub fn table_rows_sorted(
     path: &str,
     table_name: &str,
     limit: u32,
     offset: u32,
     order_col: Option<(&str, bool)>, // (column_name, asc)
-) -> Result<Vec<String>, DbError> {
+) -> Result<TableData, DbError> {
     let conn = open_read_only(path)?;
     let escaped = table_name.replace('"', "\"\"");
     let order_clause = if let Some((col, asc)) = order_col {
@@ -210,25 +183,33 @@ pub fn table_rows_sorted(
     let sql = format!("SELECT * FROM \"{escaped}\"{order_clause} LIMIT {limit} OFFSET {offset}");
 
     let mut stmt = conn.prepare(&sql)?;
-    let mut out = Vec::new();
-    let col_names = stmt.column_names().iter().map(ToString::to_string).collect::<Vec<_>>();
-    if col_names.is_empty() {
-        return Ok(out);
+    let col_count = stmt.column_count();
+    // El dtype declarado lo da PRAGMA table_info (pestaña Schema); aquí el
+    // modelo viaja con el nombre real de cada columna.
+    let columns = (0..col_count)
+        .map(|i| Column {
+            name: stmt.column_name(i).unwrap_or("?").to_string(),
+            dtype: String::new(),
+        })
+        .collect::<Vec<_>>();
+
+    if columns.is_empty() {
+        return Ok(TableData { columns, rows: Vec::new() });
     }
-    out.push(col_names.join(" | "));
-    let col_count = col_names.len();
+
     let rows = stmt.query_map([], |row| {
         let mut values = Vec::new();
         for i in 0..col_count {
-            let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
-            values.push(val);
+            values.push(cell_value_to_string(row, i));
         }
-        Ok(values.join(" | "))
+        Ok(Row { cells: values })
     })?;
+
+    let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
-    Ok(out)
+    Ok(TableData { columns, rows: out })
 }
 
 pub fn table_row_count(path: &str, table_name: &str) -> Result<u32, DbError> {
@@ -245,4 +226,73 @@ pub fn table_row_count(path: &str, table_name: &str) -> Result<u32, DbError> {
 fn open_read_only(path: &str) -> Result<Connection, DbError> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|err| DbError::Open(format!("{path}: {err}")))
+}
+
+/// Convierte una celda a String según el tipo de valor almacenado
+/// (entero, real, texto, nulo, blob).
+///
+/// `row.get::<_, String>` falla para columnas numéricas (rusqlite no
+/// convierte INTEGER/REAL a String) y producía `[NULL]` falsos en todas
+/// las celdas numéricas de la UI.
+pub fn cell_value_to_string(row: &rusqlite::Row<'_>, i: usize) -> String {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(i) {
+        Ok(ValueRef::Null) => "[NULL]".to_string(),
+        Ok(ValueRef::Integer(v)) => v.to_string(),
+        Ok(ValueRef::Real(v)) => v.to_string(),
+        Ok(ValueRef::Text(t)) => String::from_utf8_lossy(t).into_owned(),
+        Ok(ValueRef::Blob(_)) => "<blob>".to_string(),
+        Err(e) => format!("<error: {e}>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DB temporal con una tabla que incluye un valor con pipes dentro de
+    /// una celda: el bug que motivó los modelos tipados.
+    fn temp_db(name: &str) -> (std::path::PathBuf, impl FnOnce()) {
+        let dir = std::env::temp_dir().join(format!("lazydb_test_{}_{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("crear dir temp");
+        let path = dir.join("model.db");
+        let conn = Connection::open(&path).expect("abrir db temp");
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, note TEXT);
+             INSERT INTO t VALUES (1, 'a | b'), (2, 'ok');",
+        )
+        .expect("schema");
+        drop(conn);
+        let cleanup_path = path.clone();
+        let cleanup = move || {
+            let _ = std::fs::remove_file(&cleanup_path);
+            let _ = std::fs::remove_dir(&dir);
+        };
+        (path, cleanup)
+    }
+
+    #[test]
+    fn table_rows_sorted_devuelve_modelos_con_celdas_intactas() {
+        let (path, cleanup) = temp_db("model");
+        let data =
+            table_rows_sorted(path.to_str().unwrap(), "t", 10, 0, None).expect("consultar tabla");
+
+        assert_eq!(data.columns.len(), 2);
+        assert_eq!(data.columns[0].name, "id");
+        assert_eq!(data.columns[1].name, "note");
+
+        assert_eq!(data.rows.len(), 2);
+        // La celda con pipes viaja intacta: esto se rompía con split('|')
+        assert_eq!(data.rows[0].cells, vec!["1", "a | b"]);
+        assert_eq!(data.rows[1].cells, vec!["2", "ok"]);
+
+        cleanup();
+    }
+
+    #[test]
+    fn table_row_count_devuelve_el_total_real() {
+        let (path, cleanup) = temp_db("model_count");
+        assert_eq!(table_row_count(path.to_str().unwrap(), "t"), Ok(2));
+        cleanup();
+    }
 }
