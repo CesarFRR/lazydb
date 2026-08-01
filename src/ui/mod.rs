@@ -1,4 +1,5 @@
 pub mod layout;
+pub mod theme;
 pub mod widgets;
 
 use ratatui::{
@@ -150,7 +151,7 @@ fn render_actions_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let border_style = Style::default().fg(Color::Cyan);
+    let border_style = Style::default().fg(crate::ui::theme::THEME.border);
     let block = Block::default()
         .title("Acciones (x/b cerrar, Enter ejecutar)")
         .borders(Borders::ALL)

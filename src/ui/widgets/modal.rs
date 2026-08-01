@@ -10,6 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
+use crate::ui::theme::THEME;
 /// Scroll state externo: el caller lo mantiene y lo pasa cada frame.
 #[derive(Clone, Debug, Default)]
 pub struct ModalScroll {
@@ -54,7 +55,7 @@ pub fn render(
 
     frame.render_widget(Clear, rect);
 
-    let border_style = Style::default().fg(Color::Cyan);
+    let border_style = Style::default().fg(THEME.border);
     let block =
         Block::default().title(title.to_string()).borders(Borders::ALL).border_style(border_style);
 
@@ -111,7 +112,7 @@ pub fn render_table(
 
     frame.render_widget(Clear, rect);
 
-    let border_style = Style::default().fg(Color::Cyan);
+    let border_style = Style::default().fg(THEME.border);
     let block =
         Block::default().title(title.to_string()).borders(Borders::ALL).border_style(border_style);
 
@@ -119,7 +120,8 @@ pub fn render_table(
     let key_w = (inner.width.saturating_sub(3) * 40 / 100).max(8);
     let val_w = inner.width.saturating_sub(key_w).saturating_sub(3);
 
-    let header = Row::new(["Columna", "Valor"]).style(Style::default().fg(Color::Cyan)).height(1);
+    let header =
+        Row::new(["Columna", "Valor"]).style(Style::default().fg(THEME.selection)).height(1);
 
     // Expandir pares en filas: valor largo → múltiples filas
     let mut rows: Vec<Row<'_>> = Vec::new();

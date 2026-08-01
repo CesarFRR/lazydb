@@ -11,6 +11,7 @@ use ratatui::{
 
 use crate::app::controller::SOURCE_SECTION_MARK;
 use crate::app::{PanelKind, PanelMode};
+use crate::ui::theme::THEME;
 
 /// Trunca un string con un carácter de elipsis en el medio si excede `max_w`.
 /// Ej: "Luis Hernando Garcia..." → "Luis Hern…arcia"
@@ -261,7 +262,7 @@ pub fn render_data_table(
             };
             Cell::from(Span::styled(
                 text,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(THEME.selection).add_modifier(Modifier::BOLD),
             ))
         })
         .collect::<Vec<Cell<'_>>>();
@@ -277,7 +278,7 @@ pub fn render_data_table(
             } else {
                 format!(" {}", "─".repeat(w.saturating_sub(1)))
             };
-            Cell::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+            Cell::from(Span::styled(text, Style::default().fg(THEME.dim)))
         })
         .collect::<Vec<Cell<'_>>>();
     all_rows.push(Row::new(sep_cells).height(1));
@@ -375,7 +376,7 @@ pub fn render_data_table(
         // se distinguen: pestañas (borde del título), barra horizontal (esta
         // fila) y headers (click = ordenar). Con `▄` el thumb se pegaba a los
         // headers y la mitad vacía parecía "barra fantasma".
-        let thumb_style = Style::default().fg(Color::Cyan);
+        let thumb_style = Style::default().fg(THEME.selection);
         let buf = frame.buffer_mut();
         for i in thumb_start..thumb_start + thumb_w {
             let cell = buf
@@ -400,7 +401,7 @@ fn render_collapsed_line(
         return;
     }
 
-    let fg = if focused { Color::Cyan } else { Color::Gray };
+    let fg = if focused { THEME.selection } else { THEME.unfocused };
     let num = kind.number();
     let prefix = format!("─[{num}]─");
     // Quitar [N] del título si viene de title_for (para no duplicar)
@@ -435,20 +436,20 @@ fn source_line(item: &str, width: u16) -> RatLine<'_> {
         let prefix = format!("── {label}");
         let fill = usize::from(width).saturating_sub(prefix.len() + 3);
         let line = format!("{prefix} {}", "─".repeat(fill));
-        return RatLine::from(Span::styled(line, Style::default().fg(Color::DarkGray)));
+        return RatLine::from(Span::styled(line, Style::default().fg(THEME.dim)));
     }
 
     let mut spans = Vec::new();
     let mut rest = item;
     for (mark, color) in [
-        ("● ", Color::Cyan),
-        ("★ ", Color::Yellow),
-        ("✗ ", Color::Red),
-        ("▣ ", Color::Blue),
-        ("D ", Color::Green),
-        ("M ", Color::Red),
-        ("P ", Color::Magenta),
-        ("⊙ ", Color::Magenta),
+        ("● ", THEME.selection),
+        ("★ ", THEME.favorite),
+        ("✗ ", THEME.error),
+        ("▣ ", THEME.source.sqlite),
+        ("D ", THEME.source.duckdb),
+        ("M ", THEME.source.mysql),
+        ("P ", THEME.source.postgres),
+        ("⊙ ", THEME.source.generic),
     ] {
         if let Some(after) = rest.strip_prefix(mark) {
             spans.push(Span::styled(mark, Style::default().fg(color)));
@@ -539,8 +540,11 @@ fn render_expanded(
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {
-    let border_style =
-        if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::Gray) };
+    let border_style = if focused {
+        Style::default().fg(THEME.selection)
+    } else {
+        Style::default().fg(THEME.unfocused)
+    };
 
     Block::default().title(title.to_string()).borders(Borders::ALL).border_style(border_style)
 }
@@ -572,8 +576,8 @@ pub fn draw_v_scrollbar(frame: &mut Frame<'_>, area: Rect, content_len: usize, o
     let thumb_start = offset.min(max_scroll).saturating_mul(track) / max_scroll;
 
     let x = area.x + area.width - 1;
-    let track_style = Style::default().fg(Color::DarkGray);
-    let thumb_style = Style::default().fg(Color::Cyan);
+    let track_style = Style::default().fg(THEME.dim);
+    let thumb_style = Style::default().fg(THEME.selection);
     let buf = frame.buffer_mut();
     for i in 0..inner_h {
         let (symbol, style) = if i >= thumb_start && i < thumb_start + thumb_h {
