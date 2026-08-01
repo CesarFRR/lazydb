@@ -60,6 +60,21 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     if app.show_help {
         render_help(frame, area, app);
     }
+
+    // Popup de error global (modal rojo, encima de todo — Enter/Esc/q cierra)
+    if let Some(err) = &app.error {
+        let title = format!(" ✗ {}", err.title);
+        widgets::modal::render_lines(
+            frame,
+            area,
+            &title,
+            &[Line::from(err.body.as_str())],
+            &crate::ui::widgets::modal::ModalScroll::default(),
+            70,
+            40,
+            Some(Style::default().fg(crate::ui::theme::THEME.error)),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +230,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         &app.help_scroll,
         58,
         80,
+        None,
     );
 }
 

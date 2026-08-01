@@ -558,6 +558,13 @@ fn scan_cwd_databases() -> Vec<String> {
 // App (estado global)
 // ---------------------------------------------------------------------------
 
+/// Contenido del popup de error global (modal rojo encima de todo).
+#[derive(Clone, Debug)]
+pub struct ErrorPopup {
+    pub title: String,
+    pub body: String,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     // ── sistema de paneles ──
@@ -633,6 +640,9 @@ pub struct App {
     /// Ayuda de teclas (modal `?`): se autogenera desde los bindings reales
     pub show_help: bool,
     pub help_scroll: crate::ui::widgets::modal::ModalScroll,
+    /// Popup de error global (modal rojo que se cierra con Enter/Esc/q).
+    /// Cualquier error de ejecución/IO lo dispara vía `show_error`.
+    pub error: Option<ErrorPopup>,
     /// Doble-click: timestamp del último click (ms) y panel clickeado
     pub last_click_time: u64,
     pub last_click_kind: Option<PanelKind>,
@@ -732,6 +742,7 @@ impl App {
             inspector_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             show_help: false,
             help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
+            error: None,
             last_click_time: 0,
             last_click_kind: None,
             last_click_idx: 0,
@@ -781,6 +792,14 @@ impl App {
 
     fn set_selected_idx(&mut self, kind: PanelKind, idx: usize) {
         self.panel_mut(kind).selected_idx = idx;
+    }
+
+    /// Popup de error global: loggea con `tracing::error!` y abre el modal
+    /// rojo (se cierra con Enter/Esc/q). Los fallos de IO/ejecución deben
+    /// pasar por aquí en lugar de silenciarse en el status bar.
+    fn show_error(&mut self, title: &str, body: &str) {
+        tracing::error!(title, body, "error global");
+        self.error = Some(ErrorPopup { title: title.to_string(), body: body.to_string() });
     }
 
     // ── probe de salud de fuentes (filosofía culling) ─────────────────
@@ -1364,7 +1383,10 @@ impl App {
             self.set_focus(PanelKind::Tables);
         } else {
             self.is_loading = false;
-            self.status = format!("Error al abrir {path}: no se pudo leer sqlite_master");
+            self.show_error(
+                "No se pudo abrir la base",
+                &format!("{path}: no se pudo leer sqlite_master"),
+            );
             tracing::error!(path = %path, "no se pudo abrir: sqlite_master ilegible");
         }
     }
@@ -1447,6 +1469,7 @@ impl App {
                         }
                         Err(err) => {
                             self.preview_rows = vec![format!("Error SQL: {err}")];
+                            self.show_error("Error SQL", &err.to_string());
                         }
                     }
                     self.preview_data = None;
@@ -1461,6 +1484,7 @@ impl App {
                     Ok(_) => {} // total_rows ya fue actualizado arriba
                     Err(err) => {
                         self.preview_rows = vec![format!("Error contando filas: {err}")];
+                        self.show_error("Error contando filas", &err.to_string());
                         self.preview_data = None;
                         self.total_rows = 0;
                         self.preview_loaded_offset = 0;
@@ -1497,6 +1521,7 @@ impl App {
                     }
                     Err(err) => {
                         self.preview_rows = vec![format!("Error obteniendo filas: {err}")];
+                        self.show_error("Error obteniendo filas", &err.to_string());
                         self.preview_data = None;
                         self.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
@@ -1516,6 +1541,7 @@ impl App {
                         }
                         Err(err) => {
                             self.preview_rows = vec![format!("Error SQL: {err}")];
+                            self.show_error("Error SQL", &err.to_string());
                         }
                     }
                     self.preview_data = None;
@@ -1542,6 +1568,7 @@ impl App {
                     }
                     Err(err) => {
                         self.preview_rows = vec![format!("Error schema: {err}")];
+                        self.show_error("Error schema", &err.to_string());
                         self.preview_data = None;
                         self.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
@@ -1562,6 +1589,7 @@ impl App {
                     }
                     Err(err) => {
                         self.preview_rows = vec![format!("Error SQL: {err}")];
+                        self.show_error("Error SQL", &err.to_string());
                         self.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                     }
@@ -1967,7 +1995,7 @@ impl App {
             Ok(output) => {
                 if !output.status.success() {
                     let err = String::from_utf8_lossy(&output.stderr);
-                    self.status = format!("Error exportando: {err}");
+                    self.show_error("Error exportando", &err);
                     self.is_loading = false;
                     return;
                 }
@@ -1984,12 +2012,12 @@ impl App {
                         self.status = format!("Exportado: {filename} ({size_str})");
                     }
                     Err(e) => {
-                        self.status = format!("Error escribiendo {filename}: {e}");
+                        self.show_error("Error escribiendo", &format!("{filename}: {e}"));
                     }
                 }
             }
             Err(e) => {
-                self.status = format!("Error ejecutando sqlite3: {e}");
+                self.show_error("Error ejecutando sqlite3", &e.to_string());
             }
         }
         self.is_loading = false;
@@ -2421,6 +2449,14 @@ impl App {
         let Some(action) = keys::map_key(&self.keymap, key) else {
             return;
         };
+
+        // ── popup de error (modal urgente: Enter/Esc/q lo cierran) ──
+        if self.error.is_some() {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                self.error = None;
+            }
+            return;
+        }
 
         // ── row inspector modal ──
         if self.show_row_inspector {
@@ -3176,6 +3212,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     fn state_de_prueba() -> storage::AppState {
         let mut state = storage::AppState::new();
@@ -3616,5 +3653,30 @@ mod tests {
         .expect("resultado actual");
         assert!(matches!(state, query::QueryState::Error(e) if e.contains("no such table")));
         assert_eq!(status, "Error de SQLite: no such table");
+    }
+
+    // ── popup de error global ─────────────────────────────────────────
+
+    fn app_con_error() -> App {
+        let mut app = App::new();
+        app.error =
+            Some(ErrorPopup { title: "Error de prueba".to_string(), body: "cuerpo".to_string() });
+        app
+    }
+
+    #[test]
+    fn el_popup_de_error_se_cierra_con_enter_esc_o_q() {
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = app_con_error();
+            app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(app.error.is_none(), "tecla {code:?} debería cerrar el popup");
+        }
+    }
+
+    #[test]
+    fn el_popup_de_error_ignora_las_demas_teclas() {
+        let mut app = app_con_error();
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(app.error.is_some(), "navegación no debe cerrar el popup");
     }
 }

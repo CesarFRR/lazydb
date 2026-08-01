@@ -60,12 +60,16 @@ pub fn render(
     height_pct: u16,
 ) -> Rect {
     let styled: Vec<Line<'_>> = lines.iter().map(|s| Line::from(s.as_str())).collect();
-    render_lines(frame, area, title, &styled, scroll, width_pct, height_pct)
+    render_lines(frame, area, title, &styled, scroll, width_pct, height_pct, None)
 }
 
 /// Renderiza un modal centrado con líneas ya estilizadas (`Line`/`Span`).
 ///
+/// `border_style: None` usa el borde neutro del tema; `Some(style)` permite
+/// colores semánticos (rojo para popups de error, etc.).
+///
 /// Devuelve el inner rect (área de contenido sin bordes) para cálculos futuros.
+#[allow(clippy::too_many_arguments)]
 pub fn render_lines(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -74,6 +78,7 @@ pub fn render_lines(
     scroll: &ModalScroll,
     width_pct: u16,
     height_pct: u16,
+    border_style: Option<Style>,
 ) -> Rect {
     let width = area.width.saturating_mul(width_pct) / 100;
     let height = area.height.saturating_mul(height_pct) / 100;
@@ -83,7 +88,7 @@ pub fn render_lines(
 
     frame.render_widget(Clear, rect);
 
-    let border_style = Style::default().fg(THEME.border);
+    let border_style = border_style.unwrap_or_else(|| Style::default().fg(THEME.border));
     let block =
         Block::default().title(title.to_string()).borders(Borders::ALL).border_style(border_style);
 

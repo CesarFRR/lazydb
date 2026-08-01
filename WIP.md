@@ -192,7 +192,14 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
   cargada, se recarga la lista. Sin FK o valor nulo → inspector de fila (como antes).
   `to: Option<String>` en `ForeignKey`; helpers `foreign_keys()` y `row_offset_of()`
   en sqlite.rs + 4 tests de contrato (FK list, tabla sin FKs, offset, tabla vacía).
-- Popup de error global · historial de queries persistente
+- **Popup de error global** — ✅ HECHO: modal rojo (`THEME.error`) encima de todo,
+  título `✗` + body con wrap; se cierra con Enter/Esc/q y **ignora el resto de
+  teclas** (patrón lazygit: el error nunca se pierde bajo navegación). Helper
+  `App::show_error()` → `tracing::error!` + estado `error: Option<ErrorPopup>`;
+  migrados 10 callers: apertura de DB, SQL/contar/obtener filas, schema, export
+  y cli sqlite3. `render_lines` gana `border_style: Option<Style>` opcional.
+  2 tests (cierre con Enter/Esc/q, otras teclas ignoradas).
+- Historial de queries persistente
 
 ## FASE 2 — Multi-backend local
 
