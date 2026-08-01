@@ -20,6 +20,7 @@ thiserror = "2.0.19"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 tracing-appender = "0.2.5"
+serde = { version = "1.0.229", features = ["derive"] }
 
 [lints.rust]
 unsafe_code = "forbid"

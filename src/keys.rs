@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -220,33 +219,41 @@ impl Keymap {
     pub fn load() -> Self {
         let mut keymap = Self::default();
 
-        let path = config_file_path();
-        let Ok(content) = fs::read_to_string(path) else {
-            return keymap;
-        };
+        // Config GLOBAL + config POR PROYECTO (lazydb.toml hacia arriba
+        // desde el CWD): el proyecto sobreescribe a la global. `set_binding`
+        // reemplaza bindings previos de la misma acción, así la fusión es
+        // natural: primero global, luego proyecto.
+        let paths: [Option<std::path::PathBuf>; 2] =
+            [Some(crate::config::config_file_path()), crate::config::find_project_config()];
 
-        let Ok(parsed) = content.parse::<toml::Value>() else {
-            return keymap;
-        };
-
-        let Some(table) = parsed.get("keys").and_then(toml::Value::as_table) else {
-            return keymap;
-        };
-
-        for (action_name, value) in table {
-            let Some(action) = action_from_name(action_name) else {
+        for path in paths.into_iter().flatten() {
+            let Ok(content) = fs::read_to_string(&path) else {
                 continue;
             };
 
-            if let Some(token) = value.as_str() {
-                keymap.set_binding(token, action);
+            let Ok(parsed) = content.parse::<toml::Value>() else {
                 continue;
-            }
+            };
 
-            if let Some(tokens) = value.as_array() {
-                for token in tokens {
-                    if let Some(token_str) = token.as_str() {
-                        keymap.set_binding(token_str, action);
+            let Some(table) = parsed.get("keys").and_then(toml::Value::as_table) else {
+                continue;
+            };
+
+            for (action_name, value) in table {
+                let Some(action) = action_from_name(action_name) else {
+                    continue;
+                };
+
+                if let Some(token) = value.as_str() {
+                    keymap.set_binding(token, action);
+                    continue;
+                }
+
+                if let Some(tokens) = value.as_array() {
+                    for token in tokens {
+                        if let Some(token_str) = token.as_str() {
+                            keymap.set_binding(token_str, action);
+                        }
                     }
                 }
             }
@@ -456,11 +463,6 @@ fn action_from_name(name: &str) -> Option<AppAction> {
 
 fn normalize_token(token: &str) -> String {
     token.trim().to_ascii_lowercase()
-}
-
-fn config_file_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config").join("lazydb").join("config.toml")
 }
 
 #[cfg(test)]

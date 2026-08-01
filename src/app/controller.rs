@@ -663,7 +663,7 @@ impl App {
     pub fn new() -> Self {
         let state = storage::AppState::load();
         let keymap = keys::Keymap::load();
-        let ui_config = config::load_ui_config();
+        let ui_config = config::Config::load().ui;
         let source_tab = SourceTab::All;
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
         let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2174,7 +2174,7 @@ impl App {
             &self.health,
         );
 
-        let ui_config = config::load_ui_config();
+        let ui_config = config::Config::load().ui;
         self.rows_per_page = ui_config.rows_per_page;
 
         // Ajustar índices si las listas se achicaron
