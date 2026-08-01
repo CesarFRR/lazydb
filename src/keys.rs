@@ -113,15 +113,14 @@ impl AppAction {
     pub const fn group(self) -> KeyGroup {
         use AppAction::{
             ClearQueryState, DetailTabData, DetailTabMeta, DetailTabNext, DetailTabPrev,
-            DetailTabSchema, DetailTabSql, Enter, ExportCsv, FavoriteCurrentDb,
-            FocusAdvanced, FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview,
-            FocusSources, FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight,
-            JumpToDetail, MoveDown, MoveUp, NextPage, ObjectSectionAdvanced,
-            ObjectSectionTables, ObjectSectionViews, PrevPage, QuitOrBack, Refresh,
-            ReloadRuntimeConfig, RunCountQuery, SidebarFocusNext, SidebarFocusPrev,
-            SourceTabFavorites, SourceTabNext, SourceTabPrev, SourceTabRecents,
-            StartFilter, ToggleActionsMenu, ToggleCurrentPanel, ToggleFavoriteSource,
-            ToggleHelp, Yank,
+            DetailTabSchema, DetailTabSql, Enter, ExportCsv, FavoriteCurrentDb, FocusAdvanced,
+            FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview, FocusSources,
+            FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight, JumpToDetail,
+            MoveDown, MoveUp, NextPage, ObjectSectionAdvanced, ObjectSectionTables,
+            ObjectSectionViews, PrevPage, QuitOrBack, Refresh, ReloadRuntimeConfig, RunCountQuery,
+            SidebarFocusNext, SidebarFocusPrev, SourceTabFavorites, SourceTabNext, SourceTabPrev,
+            SourceTabRecents, StartFilter, ToggleActionsMenu, ToggleCurrentPanel,
+            ToggleFavoriteSource, ToggleHelp, Yank,
         };
         match self {
             MoveUp | MoveDown | PrevPage | NextPage | QuitOrBack | Refresh => KeyGroup::Navigation,
@@ -152,15 +151,14 @@ impl AppAction {
     pub const fn description(self) -> &'static str {
         use AppAction::{
             ClearQueryState, DetailTabData, DetailTabMeta, DetailTabNext, DetailTabPrev,
-            DetailTabSchema, DetailTabSql, Enter, ExportCsv, FavoriteCurrentDb,
-            FocusAdvanced, FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview,
-            FocusSources, FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight,
-            JumpToDetail, MoveDown, MoveUp, NextPage, ObjectSectionAdvanced,
-            ObjectSectionTables, ObjectSectionViews, PrevPage, QuitOrBack, Refresh,
-            ReloadRuntimeConfig, RunCountQuery, SidebarFocusNext, SidebarFocusPrev,
-            SourceTabFavorites, SourceTabNext, SourceTabPrev, SourceTabRecents,
-            StartFilter, ToggleActionsMenu, ToggleCurrentPanel, ToggleFavoriteSource,
-            ToggleHelp, Yank,
+            DetailTabSchema, DetailTabSql, Enter, ExportCsv, FavoriteCurrentDb, FocusAdvanced,
+            FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview, FocusSources,
+            FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight, JumpToDetail,
+            MoveDown, MoveUp, NextPage, ObjectSectionAdvanced, ObjectSectionTables,
+            ObjectSectionViews, PrevPage, QuitOrBack, Refresh, ReloadRuntimeConfig, RunCountQuery,
+            SidebarFocusNext, SidebarFocusPrev, SourceTabFavorites, SourceTabNext, SourceTabPrev,
+            SourceTabRecents, StartFilter, ToggleActionsMenu, ToggleCurrentPanel,
+            ToggleFavoriteSource, ToggleHelp, Yank,
         };
         match self {
             RunCountQuery => "Contar filas (query async)",
@@ -260,6 +258,11 @@ impl Keymap {
     fn set_binding(&mut self, token: &str, action: AppAction) {
         self.bindings.retain(|_, existing| *existing != action);
         self.bindings.insert(normalize_token(token), action);
+    }
+
+    /// Cantidad de bindings activos (para logs/depuración).
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
     }
 
     /// Secciones de ayuda autogeneradas desde los bindings REALES:

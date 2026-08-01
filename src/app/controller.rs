@@ -668,6 +668,12 @@ impl App {
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
         let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        tracing::debug!(
+            recents = state.recents.len(),
+            keymap = %keymap.binding_count(),
+            "App::new"
+        );
+
         let panels = [
             Panel::new_sidebar(PanelKind::Sources),
             Panel::new_sidebar(PanelKind::Tables),
@@ -817,6 +823,7 @@ impl App {
         }
         let Some(tx) = self.probe_tx.clone() else { return };
         self.probing.insert(path.clone());
+        tracing::debug!(path = %path, cache = use_cache, "probe lanzado");
         tokio::spawn(async move {
             let ok = probe_source(&path);
             let _ = tx.send((path, ok));
@@ -874,6 +881,7 @@ impl App {
             self.health.insert(path.clone(), ok);
             self.probing.remove(&path);
             if changed {
+                tracing::debug!(path = %path, ok, "probe resuelto (estado cambiado)");
                 self.sources = Self::build_sources(
                     &self.state,
                     self.source_tab,
@@ -1344,12 +1352,14 @@ impl App {
 
             self.refresh_preview_from_selected_object();
             self.status = format!("Conectado en modo read-only: {path}");
+            tracing::info!(path = %path, tablas = self.tables.len(), vistas = self.views.len(), "conectado");
 
             // Mover foco a Tablas
             self.set_focus(PanelKind::Tables);
         } else {
             self.is_loading = false;
             self.status = format!("Error al abrir {path}: no se pudo leer sqlite_master");
+            tracing::error!(path = %path, "no se pudo abrir: sqlite_master ilegible");
         }
     }
 
@@ -1701,6 +1711,7 @@ impl App {
         }
 
         let sql = format!("SELECT COUNT(*) FROM \"{}\";", object.replace('"', "\"\""));
+        tracing::debug!(object = %object, "COUNT(*) lanzado (generación {})", self.query_gen + 1);
 
         // Generación nueva: cualquier resultado en vuelo de queries anteriores
         // queda marcado como stale y se descarta al llegar.
@@ -1889,6 +1900,7 @@ impl App {
         self.set_focus(PanelKind::Sources);
         self.set_selected_idx(PanelKind::Sources, 0);
         self.status = "Base de datos cerrada".to_string();
+        tracing::info!("desconectado");
     }
 
     // ── menú de acciones ──────────────────────────────────────────────

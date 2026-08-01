@@ -7,7 +7,7 @@ mod query;
 mod storage;
 mod ui;
 
-use std::{io, time::Duration};
+use std::{fs, io, path::PathBuf, time::Duration};
 
 use app::App;
 use crossterm::{
@@ -16,29 +16,63 @@ use crossterm::{
         MouseButton, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::prelude::*;
+use tracing_appender::non_blocking::WorkerGuard;
+
+/// Inicializa el logger: archivo rotativo diario en
+/// `~/.config/lazydb/logs/lazydb.YYYY-MM-DD.log` (patrón lazygit: la app
+/// NUNCA imprime en stdout, todo va a disco; el usuario ve solo la TUI).
+fn init_tracing() -> io::Result<WorkerGuard> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let log_dir = PathBuf::from(home).join(".config").join("lazydb").join("logs");
+    fs::create_dir_all(&log_dir)?;
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "lazydb.log");
+    let (writer, guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(false)
+        .with_level(true)
+        .init();
+    tracing::info!(dir = %log_dir.display(), "logs inicializados");
+    Ok(guard)
+}
+
+/// Hook de pánico: log a disco + restaurar la terminal ANTES de que el
+/// proceso muera (sin esto, un panic dejaba la terminal en raw mode /
+/// alternate screen y había que reiniciarla a mano).
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!(panic = %info, "panic: terminal restaurada");
+        // Restaurar lo antes posible: si esto falla, nada que podamos hacer
+        ratatui::restore();
+        eprintln!("\n[panic] lazydb: {info}\nDetalles en ~/.config/lazydb/logs/");
+    }));
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let _log_guard = init_tracing()?;
+    tracing::debug!("arrancando lazydb");
+
+    // Setup estándar de ratatui (raw mode + alternate screen) con panic
+    // hook integrado; añadimos el nuestro para loggear a disco.
+    let mut terminal = ratatui::init();
+    install_panic_hook();
+    execute!(terminal.backend_mut(), EnableMouseCapture)?;
 
     let mut app = App::new();
     let result = run_app(&mut terminal, &mut app);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+    ratatui::restore();
+    tracing::debug!(salida = ?result.is_ok(), "cerrando lazydb");
 
     result
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
     loop {
         // Calcular layout antes de renderizar
         let size = terminal.size()?;
