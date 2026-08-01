@@ -1723,7 +1723,7 @@ impl App {
         query_gen: u64,
         generation: u64,
         sql: &str,
-        res: Result<u32, String>,
+        res: Result<u32, crate::db::DbError>,
     ) -> Option<(query::QueryState, String)> {
         if generation != query_gen {
             return None; // stale: resultado de una query que ya no importa
@@ -1734,7 +1734,8 @@ impl App {
                 format!("Query completada: {count} filas"),
             ),
             Err(e) => {
-                let msg = format!("Error contando filas: {e}");
+                // El Display de DbError ya incluye contexto de la variante
+                let msg = e.to_string();
                 (query::QueryState::Error(msg.clone()), msg)
             }
         };
@@ -3429,10 +3430,10 @@ mod tests {
             5,
             5,
             "SELECT COUNT(*) FROM nope;",
-            Err("no such table".into()),
+            Err(crate::db::DbError::Sqlite("no such table".into())),
         )
         .expect("resultado actual");
         assert!(matches!(state, query::QueryState::Error(e) if e.contains("no such table")));
-        assert_eq!(status, "Error contando filas: no such table");
+        assert_eq!(status, "Error de SQLite: no such table");
     }
 }

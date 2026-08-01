@@ -1,5 +1,7 @@
 use rusqlite::Connection;
 
+use crate::db::DbError;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueryState {
     Idle,
@@ -9,7 +11,7 @@ pub enum QueryState {
 }
 
 /// Mensaje del query runner por el canal: (generación, SQL, resultado).
-pub type CountMsg = (u64, String, Result<u32, String>);
+pub type CountMsg = (u64, String, Result<u32, DbError>);
 
 #[allow(dead_code)]
 pub struct QueryResult {
@@ -20,7 +22,7 @@ pub struct QueryResult {
 /// Ejecuta una query SQL de forma asincrónica contra la base de datos
 /// Las queries son read-only y se ejecutan en un thread de Tokio para no bloquear la UI
 #[allow(dead_code)]
-pub async fn execute_query(db_path: &str, sql: &str, limit: u32) -> Result<QueryResult, String> {
+pub async fn execute_query(db_path: &str, sql: &str, limit: u32) -> Result<QueryResult, DbError> {
     let db_path = db_path.to_string();
     let sql = sql.to_string();
 
@@ -28,9 +30,9 @@ pub async fn execute_query(db_path: &str, sql: &str, limit: u32) -> Result<Query
     tokio::task::spawn_blocking(move || {
         let conn =
             Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| format!("Error abriendo DB: {e}"))?;
+                .map_err(|e| DbError::Open(format!("{db_path}: {e}")))?;
 
-        let mut stmt = conn.prepare(&sql).map_err(|e| format!("Error parsing SQL: {e}"))?;
+        let mut stmt = conn.prepare(&sql)?;
 
         let mut rows = Vec::new();
         let mut count = 0u32;
@@ -39,57 +41,46 @@ pub async fn execute_query(db_path: &str, sql: &str, limit: u32) -> Result<Query
         let col_count = stmt.column_count();
 
         // Ejecutar query con LIMIT para evitar cargar todo
-        let result = stmt
-            .query_map([], |row| {
-                let mut row_str = String::new();
-                for i in 0..col_count {
-                    if i > 0 {
-                        row_str.push_str(" | ");
-                    }
-                    let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
-                    row_str.push_str(&val);
+        let result = stmt.query_map([], |row| {
+            let mut row_str = String::new();
+            for i in 0..col_count {
+                if i > 0 {
+                    row_str.push_str(" | ");
                 }
-                Ok(row_str)
-            })
-            .map_err(|e| format!("Error ejecutando query: {e}"))?;
+                let val: String = row.get(i).unwrap_or_else(|_| "[NULL]".to_string());
+                row_str.push_str(&val);
+            }
+            Ok(row_str)
+        })?;
 
         for row in result {
             if count >= limit {
                 break;
             }
-            match row {
-                Ok(row_str) => {
-                    rows.push(row_str);
-                    count += 1;
-                }
-                Err(e) => {
-                    return Err(format!("Error leyendo fila: {e}"));
-                }
-            }
+            rows.push(row?);
+            count += 1;
         }
 
         Ok(QueryResult { rows, error: None })
     })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+    .await?
 }
 
 /// Contador de filas con `COUNT(*)` REAL: `SQLite` lo optimiza internamente
 /// (no materializa filas, a diferencia de iterar `query_map`). Se ejecuta en
 /// un thread de Tokio para no bloquear la UI.
-pub async fn count_query_results(db_path: &str, sql: &str) -> Result<u32, String> {
+pub async fn count_query_results(db_path: &str, sql: &str) -> Result<u32, DbError> {
     let db_path = db_path.to_string();
     let sql = sql.to_string();
 
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> Result<u32, DbError> {
         let conn =
             Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| format!("Error abriendo DB: {e}"))?;
+                .map_err(|e| DbError::Open(format!("{db_path}: {e}")))?;
 
-        conn.query_row(&sql, [], |row| row.get(0)).map_err(|e| format!("Error contando filas: {e}"))
+        Ok(conn.query_row(&sql, [], |row| row.get(0))?)
     })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+    .await?
 }
 
 #[cfg(test)]

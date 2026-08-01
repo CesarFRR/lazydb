@@ -45,12 +45,12 @@ impl AppState {
         Self { recents, favorites }
     }
     /// Guarda el estado a ~/.config/lazydb/recents.json
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> Result<(), crate::db::DbError> {
         let config_file = config_file_path();
 
         // Crear directorio si no existe
         if let Some(parent) = config_file.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Error creando config dir: {e}"))?;
+            fs::create_dir_all(parent)?;
         }
 
         let json = json!({
@@ -58,8 +58,9 @@ impl AppState {
             "favorites": self.favorites,
         });
 
-        let content = serde_json::to_string_pretty(&json).map_err(|e| format!("Error: {e}"))?;
-        fs::write(&config_file, content).map_err(|e| format!("Error guardando config: {e}"))?;
+        let content = serde_json::to_string_pretty(&json)
+            .map_err(|e| crate::db::DbError::Io(format!("serializando config: {e}")))?;
+        fs::write(&config_file, content)?;
 
         Ok(())
     }
