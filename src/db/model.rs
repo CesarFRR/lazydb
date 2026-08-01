@@ -74,6 +74,19 @@ impl From<ColumnInfo> for Column {
     }
 }
 
+/// Foreign key declarada en el esquema (`PRAGMA foreign_key_list`).
+///
+/// `from` = columna local · `table` = tabla referenciada · `to` = columna
+/// referenciada (`None` → la PK de `table`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub id: i64,
+    pub seq: i64,
+    pub table: String,
+    pub from: String,
+    pub to: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

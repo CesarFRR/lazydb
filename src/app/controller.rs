@@ -2222,6 +2222,14 @@ impl App {
     // ── menú de acciones ──────────────────────────────────────────────
     fn jump_to_detail(&mut self) {
         if self.active_panel == PanelKind::Detail {
+            // Enter sobre una fila de datos: FK Jump si la fila referencia
+            // otra tabla; si no, el inspector de fila (comportamiento previo).
+            if self.detail_tab == DetailTab::Data
+                && self.selected_idx(PanelKind::Detail) > 0
+                && self.fk_jump()
+            {
+                return;
+            }
             self.open_row_inspector();
             return;
         }
@@ -2238,6 +2246,102 @@ impl App {
 
         self.last_sidebar_focus = self.active_panel;
         self.active_panel = PanelKind::Detail;
+    }
+
+    /// FK Jump (patrón lazygit): con la fila seleccionada, salta a la tabla
+    /// referenciada por la primera foreign key con valor no nulo y se
+    /// posiciona en la fila que apunta (offset por rowid, página exacta).
+    ///
+    /// Devuelve `true` si saltó (la fila tenía una FK resuelta).
+    fn fk_jump(&mut self) -> bool {
+        let Some(path) = self.db_path.as_deref() else { return false };
+        let object = self.selected_object_name();
+        if object.is_empty() || object == "-" {
+            return false;
+        }
+        let Some(data) = self.preview_data.as_ref() else { return false };
+        let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1);
+        let Some(row) = data.rows.get(row_idx) else { return false };
+
+        let Ok(fks) = db::backends::sqlite::foreign_keys(path, &object) else {
+            return false;
+        };
+        if fks.is_empty() {
+            return false;
+        }
+
+        // La primera FK cuyo valor en esta fila no esté vacío
+        let jump = fks.into_iter().find_map(|fk| {
+            let col_idx = data.columns.iter().position(|c| c.name == fk.from)?;
+            let value = row.cells.get(col_idx)?;
+            if value.is_empty() || value == "[NULL]" {
+                return None;
+            }
+            Some((fk, value.clone()))
+        });
+        let Some((fk, value)) = jump else {
+            self.status = "La fila no referencia ninguna tabla (FK vacías)".to_string();
+            return false;
+        };
+
+        // `to` vacío → la PK de la tabla referenciada
+        let to_col = match fk.to {
+            Some(to) if !to.is_empty() => to,
+            _ => {
+                let Ok(cols) = db::backends::sqlite::table_columns(path, &fk.table) else {
+                    return false;
+                };
+                let Some(pk) = cols.iter().find(|c| c.pk).map(|c| c.name.clone()) else {
+                    return false;
+                };
+                pk
+            }
+        };
+
+        // Posición de la fila referenciada (1-based) para cargar la página
+        let Ok(Some(idx)) = db::backends::sqlite::row_offset_of(path, &fk.table, &to_col, &value)
+        else {
+            self.status =
+                format!("FK {}.{} = {value}: fila no encontrada en {}", object, fk.from, fk.table);
+            return false;
+        };
+
+        // Cambiar al objeto referenciado (recargando tablas si no estaba)
+        if !self.tables.contains(&fk.table) {
+            if let Some(path) = self.db_path.as_deref() {
+                if let Ok(tables) = db::backends::sqlite::list_objects_by_type(path, "table") {
+                    self.tables = tables;
+                    self.sources =
+                        Self::build_sources(&self.state, self.source_tab, Some(path), &self.health);
+                }
+            }
+        }
+        let Some(obj_idx) = self.tables.iter().position(|t| *t == fk.table) else {
+            self.status = format!("Tabla {} no encontrada", fk.table);
+            return false;
+        };
+        self.object_section = ObjectSection::Tables;
+        self.set_selected_idx(PanelKind::Tables, obj_idx);
+
+        // Cargar la página que contiene la fila referenciada
+        #[allow(clippy::cast_possible_truncation)]
+        let page = (idx.saturating_sub(1)) / self.rows_per_page;
+        self.current_page = page;
+        self.detail_tab = DetailTab::Data;
+        self.refresh_preview_from_selected_object();
+
+        // Seleccionar la fila exacta dentro de la página
+        #[allow(clippy::cast_possible_truncation)]
+        let local = idx.saturating_sub(page.saturating_mul(self.rows_per_page));
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.set_selected_idx(PanelKind::Detail, local as usize);
+        }
+
+        self.status =
+            format!("FK Jump: {}.{} = {value} → {}.{}", object, fk.from, fk.table, to_col);
+        tracing::info!(desde = %object, col = %fk.from, valor = %value, hacia = %fk.table, "FK jump");
+        true
     }
 
     /// Conecta a la fuente seleccionada en el panel Sources

@@ -6,4 +6,4 @@ pub mod resolver;
 pub mod service;
 
 pub use error::DbError;
-pub use model::{Column, ColumnInfo, Row, TableData};
+pub use model::{Column, ColumnInfo, ForeignKey, Row, TableData};

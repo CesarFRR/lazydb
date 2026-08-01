@@ -223,6 +223,66 @@ pub fn table_row_count(path: &str, table_name: &str) -> Result<u32, DbError> {
     Ok(count)
 }
 
+/// Foreign keys declaradas de una tabla (`PRAGMA foreign_key_list`).
+/// `to = None` significa "la PK de la tabla referenciada".
+pub fn foreign_keys(path: &str, table_name: &str) -> Result<Vec<crate::db::ForeignKey>, DbError> {
+    let conn = open_read_only(path)?;
+    let escaped = table_name.replace('"', "\"\"");
+    let sql = format!("PRAGMA foreign_key_list(\"{escaped}\")");
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(crate::db::ForeignKey {
+            id: row.get(0)?,
+            seq: row.get(1)?,
+            table: row.get(2)?,
+            from: row.get(3)?,
+            to: row.get(4)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Offset 1-based de la primera fila donde `col == value` (para posicionar
+/// el FK Jump en la tabla referenciada). `None` si no existe tal fila.
+pub fn row_offset_of(
+    path: &str,
+    table_name: &str,
+    col: &str,
+    value: &str,
+) -> Result<Option<u32>, DbError> {
+    let conn = open_read_only(path)?;
+    let t = table_name.replace('"', "\"\"");
+    let c = col.replace('"', "\"\"");
+
+    let rowid: Option<i64> = conn
+        .query_row(
+            &format!("SELECT rowid FROM \"{t}\" WHERE \"{c}\" = ?1 LIMIT 1"),
+            [value],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match rowid {
+        Some(rid) => {
+            let n: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM \"{t}\" WHERE rowid <= ?1"),
+                [rid],
+                |row| row.get(0),
+            )?;
+            #[allow(clippy::cast_sign_loss)]
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(Some(n as u32))
+        }
+        None => Ok(None),
+    }
+}
+
 fn open_read_only(path: &str) -> Result<Connection, DbError> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|err| DbError::Open(format!("{path}: {err}")))
@@ -271,6 +331,35 @@ mod tests {
         (path, cleanup)
     }
 
+    /// DB con dos tablas unidas por FK (escenario del FK Jump).
+    fn temp_db_fk(name: &str) -> (std::path::PathBuf, impl FnOnce()) {
+        let dir = std::env::temp_dir().join(format!("lazydb_test_{}_{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("crear dir temp");
+        let path = dir.join("fk.db");
+        let conn = Connection::open(&path).expect("abrir db temp");
+        conn.execute_batch(
+            "CREATE TABLE cliente (
+                 id INTEGER PRIMARY KEY,
+                 nombre TEXT NOT NULL
+             );
+             CREATE TABLE pedido (
+                 id INTEGER PRIMARY KEY,
+                 cliente_id INTEGER REFERENCES cliente(id),
+                 nota TEXT
+             );
+             INSERT INTO cliente VALUES (1, 'ana'), (2, 'beso'), (3, 'cesar');
+             INSERT INTO pedido VALUES (10, 2, 'urgente'), (11, NULL, 'sin cliente');",
+        )
+        .expect("schema");
+        drop(conn);
+        let cleanup_path = path.clone();
+        let cleanup = move || {
+            let _ = std::fs::remove_file(&cleanup_path);
+            let _ = std::fs::remove_dir(&dir);
+        };
+        (path, cleanup)
+    }
+
     #[test]
     fn table_rows_sorted_devuelve_modelos_con_celdas_intactas() {
         let (path, cleanup) = temp_db("model");
@@ -293,6 +382,52 @@ mod tests {
     fn table_row_count_devuelve_el_total_real() {
         let (path, cleanup) = temp_db("model_count");
         assert_eq!(table_row_count(path.to_str().unwrap(), "t"), Ok(2));
+        cleanup();
+    }
+
+    #[test]
+    fn foreign_keys_enumera_la_referencia_pedido_cliente() {
+        let (path, cleanup) = temp_db_fk("fk");
+        let fks = foreign_keys(path.to_str().unwrap(), "pedido").expect("fk list");
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].from, "cliente_id");
+        assert_eq!(fks[0].table, "cliente");
+        assert_eq!(fks[0].to.as_deref(), Some("id"));
+        cleanup();
+    }
+
+    #[test]
+    fn tabla_sin_foreign_keys_devuelve_lista_vacia() {
+        let (path, cleanup) = temp_db_fk("fk_none");
+        let fks = foreign_keys(path.to_str().unwrap(), "cliente").expect("fk list");
+        assert!(fks.is_empty());
+        cleanup();
+    }
+
+    #[test]
+    fn row_offset_of_encuentra_la_fila_por_valor() {
+        let (path, cleanup) = temp_db_fk("fk_off");
+        // 'cesar' es la 3ª fila de cliente → offset 3 (1-based)
+        let off = row_offset_of(path.to_str().unwrap(), "cliente", "nombre", "cesar")
+            .expect("offset")
+            .expect("fila existe");
+        assert_eq!(off, 3);
+
+        // Un valor inexistente → None
+        let none = row_offset_of(path.to_str().unwrap(), "cliente", "nombre", "zzz")
+            .expect("offset sin error");
+        assert_eq!(none, None);
+        cleanup();
+    }
+
+    #[test]
+    fn row_offset_of_tabla_vacia_devuelve_none() {
+        let (path, cleanup) = temp_db("fk_empty");
+        let conn = Connection::open(&path).expect("abrir");
+        conn.execute_batch("CREATE TABLE vacia (id INTEGER);").expect("schema");
+        drop(conn);
+        let off = row_offset_of(path.to_str().unwrap(), "vacia", "id", "1").expect("sin error");
+        assert_eq!(off, None);
         cleanup();
     }
 }
