@@ -6,7 +6,7 @@
 /// - Eje vertical: solo el panel activo + Detalle se expanden; el resto colapsa a 3 líneas.
 use ratatui::prelude::*;
 
-use crate::app::{PanelKind, PanelMode};
+use crate::app::PanelKind;
 
 /// Umbral para que el Detalle migre al stack vertical
 pub const NARROW_THRESHOLD: u16 = 80;
@@ -51,13 +51,11 @@ impl Default for ComputedLayout {
 ///
 /// `active_sidebar`: panel izquierdo que debe mantenerse expandido (siempre sidebar).
 /// `current_focus`: panel que tiene el foco (puede ser Detail).
-/// `panel_modes`: modos de cada panel (Sources..Detail).
 pub fn compute(
     width: u16,
     height: u16,
     active_sidebar: PanelKind,
     current_focus: PanelKind,
-    panel_modes: &[(PanelKind, PanelMode); 5],
 ) -> ComputedLayout {
     debug_assert!(active_sidebar.is_sidebar());
 
@@ -73,16 +71,9 @@ pub fn compute(
     }
 
     let panels = if is_narrow {
-        narrow_layout(
-            content_top,
-            content_height,
-            width,
-            active_sidebar,
-            current_focus,
-            panel_modes,
-        )
+        narrow_layout(content_top, content_height, width, active_sidebar, current_focus)
     } else {
-        wide_layout(content_top, content_height, width, active_sidebar, panel_modes)
+        wide_layout(content_top, content_height, width, active_sidebar)
     };
 
     ComputedLayout {
@@ -101,7 +92,6 @@ fn wide_layout(
     content_h: u16,
     width: u16,
     active_sidebar: PanelKind,
-    panel_modes: &[(PanelKind, PanelMode); 5],
 ) -> [(PanelKind, Rect); 5] {
     let left_width = width.saturating_mul(33) / 100;
     let right_width = width.saturating_sub(left_width);
@@ -111,8 +101,7 @@ fn wide_layout(
     let sidebar_kinds: [PanelKind; 4] =
         [PanelKind::Sources, PanelKind::Tables, PanelKind::Views, PanelKind::Advanced];
 
-    let left_rects =
-        build_left_stack(top, content_h, left_width, &sidebar_kinds, active_sidebar, panel_modes);
+    let left_rects = build_left_stack(top, content_h, left_width, &sidebar_kinds, active_sidebar);
 
     [
         find_panel_rect(&left_rects, PanelKind::Sources),
@@ -133,7 +122,6 @@ fn narrow_layout(
     width: u16,
     active_sidebar: PanelKind,
     _current_focus: PanelKind,
-    _panel_modes: &[(PanelKind, PanelMode); 5],
 ) -> [(PanelKind, Rect); 5] {
     let all_kinds: [PanelKind; 5] = [
         PanelKind::Sources,
@@ -172,7 +160,6 @@ fn build_left_stack(
     width: u16,
     kinds: &[PanelKind],
     active: PanelKind,
-    _panel_modes: &[(PanelKind, PanelMode); 5],
 ) -> Vec<(PanelKind, Rect)> {
     #[allow(clippy::cast_possible_truncation)]
     let n = kinds.len() as u16;

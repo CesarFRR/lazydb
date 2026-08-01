@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::Rect;
 
-use crate::app::panel::{Panel, PanelKind, PanelMode};
+use crate::app::panel::{Panel, PanelKind};
 use crate::ui::layout::{self, ComputedLayout};
 use crate::ui::widgets::panel::MIN_COL_W;
 use crate::{config, db, keys, query, storage};
@@ -736,24 +736,13 @@ impl App {
     // ── layout ────────────────────────────────────────────────────────
 
     pub fn compute_layout(&mut self, width: u16, height: u16) {
-        let mode_overrides = self.panels.iter().map(|p| (p.kind, p.mode)).collect::<Vec<_>>();
-        let modes: [(PanelKind, PanelMode); 5] = {
-            let mut arr = [(PanelKind::Sources, PanelMode::default()); 5];
-            for (i, &(k, m)) in mode_overrides.iter().enumerate() {
-                if i < 5 {
-                    arr[i] = (k, m);
-                }
-            }
-            arr
-        };
-
         let active_sidebar = if self.active_panel.is_sidebar() {
             self.active_panel
         } else {
             self.last_sidebar_focus
         };
 
-        self.layout = layout::compute(width, height, active_sidebar, self.active_panel, &modes);
+        self.layout = layout::compute(width, height, active_sidebar, self.active_panel);
         self.frame += 1;
 
         // Aplicar resultados de probes de salud y de queries terminadas, y
