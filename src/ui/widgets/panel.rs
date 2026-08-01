@@ -102,6 +102,7 @@ pub fn render_data_table(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
+    data: Option<&crate::db::TableData>,
     items: &[String],
     selected_idx: usize,
     scroll_offset: usize,
@@ -119,8 +120,16 @@ pub fn render_data_table(
 
     let viewport = usize::from(inner.height);
 
-    // Parsear columnas desde la cabecera (items[0])
-    let headers: Vec<&str> = items[0].split(" | ").collect();
+    // ── Fuente de columnas: celdas tipadas (render 2D) o fallback strings ──
+    // `typed` marca si las filas vienen de Row.cells (sin split('|')): un
+    // valor "a | b" dentro de una celda NO debe partirse.
+    let (typed, headers, rows_hint): (bool, Vec<&str>, usize) = match data {
+        Some(data) if data.columns.len() > 1 && !data.rows.is_empty() => {
+            (true, data.columns.iter().map(|c| c.name.as_str()).collect(), data.rows.len())
+        }
+        _ => (false, items[0].split(" | ").collect(), items.len().saturating_sub(1)),
+    };
+
     let col_count = headers.len().max(1);
 
     if col_count == 1 {
@@ -137,8 +146,11 @@ pub fn render_data_table(
         );
     }
 
-    // Ancho disponible para celdas (inner sin bordes)
-    let inner_w = usize::from(inner.width);
+    // Ancho disponible para celdas (inner sin bordes). Se reserva 1 columna
+    // para el `highlight_symbol` ("▎") del TableState: ratatui la añade
+    // siempre que el símbolo está configurado, y sin la reserva la tabla
+    // desbordaría 1 char el borde derecho.
+    let inner_w = usize::from(inner.width.saturating_sub(1));
 
     // ── Ventana de columnas visibles según h_scroll ──
     // Si todas las columnas caben con ancho mínimo → distribuir equitativamente.
@@ -179,11 +191,11 @@ pub fn render_data_table(
         title.to_string()
     };
 
-    // ── Auto-scroll sobre datos (items[1..]) ──
+    // ── Auto-scroll sobre datos ──
     // Usamos salto directo (no animación lineal) para evitar que N filas nuevas
     // tarden N frames en mostrarse. Cuando la selección sale del viewport,
     // el scroll salta inmediatamente a la posición que la mantiene visible.
-    let data_len = items.len().saturating_sub(1);
+    let data_len = rows_hint;
     let data_selected = if selected_idx == 0 {
         0
     } else {
@@ -283,72 +295,42 @@ pub fn render_data_table(
         .collect::<Vec<Cell<'_>>>();
     all_rows.push(Row::new(sep_cells).height(1));
 
-    // Filas de datos (con scroll)
+    // Filas de datos (con scroll). En modo tipado las celdas viajan intactas
+    // (Row.cells, sin split('|')); la selección la marca el TableState con
+    // `highlight_symbol` ("▎"), no el render manual.
     let max_visible = viewport.saturating_sub(3); // spacer + header + separator
-    let visible_data: Vec<&String> = items.iter().skip(1).skip(scroll).take(max_visible).collect();
-    let visible_selected = if selected_idx > 0 {
-        selected_idx.saturating_sub(1).saturating_sub(scroll)
+    let visible_selected: Option<usize> = if selected_idx > 0 {
+        Some(selected_idx.saturating_sub(1).saturating_sub(scroll))
     } else {
-        usize::MAX // sin selección (header enfocado)
+        None // sin selección (header enfocado)
     };
 
-    for (rel_idx, line) in visible_data.iter().enumerate() {
-        let is_selected = rel_idx == visible_selected;
-        let cells: Vec<&str> = line.split(" | ").collect();
-        let row_cells: Vec<Cell<'_>> = (vis_start..vis_end)
-            .map(|i| {
-                let w = cell_widths[i - vis_start];
-                let val = cells.get(i).map_or("", |s| s.trim());
-                let is_first = i == vis_start;
-                #[allow(clippy::let_and_return)]
-                if is_first {
-                    // Primera columna visible con ▸ para selección
-                    let iw = w.saturating_sub(3);
-                    let truncated = truncate_middle(val, iw);
-                    let prefix = if is_selected { "▸" } else { " " };
-                    let text = format!("{prefix}{truncated:<iw$} │");
-                    if is_selected {
-                        Cell::from(Span::styled(
-                            text,
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ))
-                    } else {
-                        Cell::from(text)
-                    }
-                } else if i < vis_end.saturating_sub(1) {
-                    let iw = w.saturating_sub(3);
-                    let truncated = truncate_middle(val, iw);
-                    let text = format!(" {truncated:<iw$} │");
-                    if is_selected {
-                        Cell::from(Span::styled(
-                            text,
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ))
-                    } else {
-                        Cell::from(text)
-                    }
-                } else {
-                    let iw = w.saturating_sub(1);
-                    let truncated = truncate_middle(val, iw);
-                    let text = format!(" {truncated:<iw$}");
-                    if is_selected {
-                        Cell::from(Span::styled(
-                            text,
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ))
-                    } else {
-                        Cell::from(text)
-                    }
-                }
-            })
-            .collect::<Vec<Cell<'_>>>();
-        all_rows.push(Row::new(row_cells));
+    if typed {
+        if let Some(data) = data {
+            for row in data.rows.iter().skip(scroll).take(max_visible) {
+                all_rows.push(Row::new(typed_row_cells(row, vis_start, vis_end, &cell_widths)));
+            }
+        }
+    } else {
+        for line in items.iter().skip(1).skip(scroll).take(max_visible) {
+            let cells: Vec<&str> = line.split(" | ").collect();
+            all_rows.push(Row::new(plain_row_cells(&cells, vis_start, vis_end, &cell_widths)));
+        }
     }
 
     let table = Table::new(all_rows, widths).block(panel_block(&title, focused)).column_spacing(0);
 
-    let mut state = TableState::default().with_selected(None);
-    frame.render_stateful_widget(table, area, &mut state);
+    // ── TableState real: la selección se resalta con ▎ al borde (patrón
+    // lazygit). La fila 0 (spacer) + 1 (header) + 2 (separador) corren
+    // delante de los datos: la selección apunta a `3 + rel`.
+    let mut state = TableState::default().with_selected(visible_selected.map(|rel| 3 + rel));
+    frame.render_stateful_widget(
+        table
+            .highlight_symbol("▎")
+            .row_highlight_style(Style::default().fg(THEME.selection).add_modifier(Modifier::BOLD)),
+        area,
+        &mut state,
+    );
 
     // ── Barra de scroll horizontal ──
     // SOLO si hay columnas ocultas (scroll horizontal activo). Ocupa la fila
@@ -387,6 +369,59 @@ pub fn render_data_table(
     }
 
     scroll
+}
+
+/// Celdas de una fila TIPADA (`Row.cells`): sin `split('|')` — un valor
+/// "a | b" dentro de una celda viaja intacto (el bug que motivó los
+/// modelos de dominio).
+fn typed_row_cells(
+    row: &crate::db::Row,
+    vis_start: usize,
+    vis_end: usize,
+    cell_widths: &[usize],
+) -> Vec<Cell<'static>> {
+    (vis_start..vis_end)
+        .map(|i| {
+            let w = cell_widths[i - vis_start];
+            let val = row.cells.get(i).map_or("", String::as_str);
+            data_cell(val, i, vis_start, vis_end, w)
+        })
+        .collect()
+}
+
+/// Celdas de una fila de texto (fallback: mensajes y vistas no tipadas).
+fn plain_row_cells(
+    cells: &[&str],
+    vis_start: usize,
+    vis_end: usize,
+    cell_widths: &[usize],
+) -> Vec<Cell<'static>> {
+    (vis_start..vis_end)
+        .map(|i| {
+            let w = cell_widths[i - vis_start];
+            let val = cells.get(i).map_or("", |s| s.trim());
+            data_cell(val, i, vis_start, vis_end, w)
+        })
+        .collect()
+}
+
+/// Una celda con padding y separador `│` (el ▎ del highlight queda en la
+/// columna reservada, fuera de la celda).
+fn data_cell(val: &str, i: usize, vis_start: usize, vis_end: usize, w: usize) -> Cell<'static> {
+    Cell::from(data_cell_str(val, i, vis_start, vis_end, w))
+}
+
+/// Texto de la celda (función pura, testeable sin depender del widget).
+fn data_cell_str(val: &str, i: usize, vis_start: usize, vis_end: usize, w: usize) -> String {
+    if i == vis_start || i < vis_end.saturating_sub(1) {
+        let iw = w.saturating_sub(3);
+        let truncated = truncate_middle(val, iw);
+        format!(" {truncated:<iw$} │")
+    } else {
+        let iw = w.saturating_sub(1);
+        let truncated = truncate_middle(val, iw);
+        format!(" {truncated:<iw$}")
+    }
 }
 
 /// Línea compacta sin bordes: `──[1]──Tablas────────────────────────` (ancho completo)
@@ -597,5 +632,37 @@ const fn inner_area_for_iteration(area: Rect) -> Rect {
         y: area.y + 1,
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_row_cells_preserva_valores_con_pipes() {
+        let row = crate::db::Row { cells: vec!["1".to_string(), "a | b".to_string()] };
+        let cells = typed_row_cells(&row, 0, 2, &[12, 12]);
+        assert_eq!(cells.len(), 2);
+        // La celda "a | b" sigue siendo UNA celda: sin split, sin │ interno
+        assert!(data_cell_str(&row.cells[1], 1, 0, 2, 12).contains("a | b"));
+        assert_eq!(data_cell_str(&row.cells[1], 1, 0, 2, 12).matches('│').count(), 0);
+        let _ = cells;
+    }
+
+    #[test]
+    fn plain_row_cells_usa_el_formato_con_separador() {
+        let cells = plain_row_cells(&["1", "ok"], 0, 2, &[12, 12]);
+        assert_eq!(cells.len(), 2);
+        assert!(data_cell_str("1", 0, 0, 2, 12).ends_with('│'));
+        assert!(!data_cell_str("ok", 1, 0, 2, 12).ends_with('│')); // última columna
+        let _ = cells;
+    }
+
+    #[test]
+    fn data_cell_trunca_en_medio_sin_perder_el_borde() {
+        let text = data_cell_str("nombre muy largo de columna", 0, 0, 2, 10);
+        assert!(text.chars().count() <= 11);
+        assert!(text.ends_with('│'));
     }
 }

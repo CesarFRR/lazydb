@@ -78,6 +78,7 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
             frame,
             area,
             &title,
+            app.preview_data.as_ref(),
             items,
             panel.selected_idx,
             panel.scroll_offset.get(),

@@ -574,6 +574,11 @@ pub struct App {
     pub views: Vec<String>,
     pub advanced: Vec<String>,
     pub preview_rows: Vec<String>,
+    /// Celdas TIPADAS del Data tab (última página cargada): la fuente de
+    /// verdad para el render 2D. `None` cuando la vista actual no es una
+    /// tabla (mensajes, SQL, schema). El render usa `preview_rows` solo
+    /// como fallback (List de 1 columna / mensajes).
+    pub preview_data: Option<crate::db::TableData>,
     pub detail_tab: DetailTab,
 
     // ── estado persistente ──
@@ -704,6 +709,7 @@ impl App {
             views: vec![],
             advanced: vec![],
             preview_rows: vec!["Sin conexion SQLite".to_string()],
+            preview_data: None,
             detail_tab: DetailTab::Data,
             should_quit: false,
             is_loading: false,
@@ -1412,6 +1418,7 @@ impl App {
         let object_name = self.selected_object_name();
         if object_name.is_empty() || object_name == "-" {
             self.preview_rows = vec!["Sin objeto seleccionado".to_string()];
+            self.preview_data = None;
             self.total_rows = 0;
             self.preview_loaded_offset = 0;
             self.is_loading = false;
@@ -1442,6 +1449,7 @@ impl App {
                             self.preview_rows = vec![format!("Error SQL: {err}")];
                         }
                     }
+                    self.preview_data = None;
                     self.total_rows = 0;
                     self.preview_loaded_offset = 0;
                     self.is_loading = false;
@@ -1453,6 +1461,7 @@ impl App {
                     Ok(_) => {} // total_rows ya fue actualizado arriba
                     Err(err) => {
                         self.preview_rows = vec![format!("Error contando filas: {err}")];
+                        self.preview_data = None;
                         self.total_rows = 0;
                         self.preview_loaded_offset = 0;
                         self.is_loading = false;
@@ -1471,12 +1480,15 @@ impl App {
                     order_col,
                 ) {
                     Ok(data) => {
-                        // TableData → view-model del Data tab (header + filas)
+                        // Celdas tipadas para el render 2D (TableState +
+                        // highlight_symbol); preview_rows queda como fallback
+                        // (List de 1 columna / mensajes).
                         self.preview_rows = if data.rows.is_empty() {
                             vec!["<sin datos>".to_string()]
                         } else {
                             data.to_lines()
                         };
+                        self.preview_data = Some(data);
                         self.preview_loaded_offset = offset;
                         self.set_selected_idx(
                             PanelKind::Detail,
@@ -1485,6 +1497,7 @@ impl App {
                     }
                     Err(err) => {
                         self.preview_rows = vec![format!("Error obteniendo filas: {err}")];
+                        self.preview_data = None;
                         self.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                     }
@@ -1505,6 +1518,7 @@ impl App {
                             self.preview_rows = vec![format!("Error SQL: {err}")];
                         }
                     }
+                    self.preview_data = None;
                     self.total_rows = 0;
                     self.preview_loaded_offset = 0;
                     self.is_loading = false;
@@ -1514,6 +1528,7 @@ impl App {
 
                 match db::backends::sqlite::table_columns(path, &object_name) {
                     Ok(columns) => {
+                        self.preview_data = None;
                         // ColumnInfo → líneas de presentación del Schema tab
                         self.preview_rows = if columns.is_empty() {
                             vec!["Sin columnas visibles".to_string()]
@@ -1527,27 +1542,33 @@ impl App {
                     }
                     Err(err) => {
                         self.preview_rows = vec![format!("Error schema: {err}")];
+                        self.preview_data = None;
                         self.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                     }
                 }
             }
-            DetailTab::Sql => match db::backends::sqlite::object_sql(path, &object_name) {
-                Ok(sql) => {
-                    self.preview_rows = sql.lines().map(ToString::to_string).collect::<Vec<_>>();
-                    if self.preview_rows.is_empty() {
-                        self.preview_rows = vec!["-- SQL vacio --".to_string()];
+            DetailTab::Sql => {
+                self.preview_data = None;
+                match db::backends::sqlite::object_sql(path, &object_name) {
+                    Ok(sql) => {
+                        self.preview_rows =
+                            sql.lines().map(ToString::to_string).collect::<Vec<_>>();
+                        if self.preview_rows.is_empty() {
+                            self.preview_rows = vec!["-- SQL vacio --".to_string()];
+                        }
+                        self.preview_loaded_offset = 0;
+                        self.set_selected_idx(PanelKind::Detail, 0);
                     }
-                    self.preview_loaded_offset = 0;
-                    self.set_selected_idx(PanelKind::Detail, 0);
+                    Err(err) => {
+                        self.preview_rows = vec![format!("Error SQL: {err}")];
+                        self.preview_loaded_offset = 0;
+                        self.set_selected_idx(PanelKind::Detail, 0);
+                    }
                 }
-                Err(err) => {
-                    self.preview_rows = vec![format!("Error SQL: {err}")];
-                    self.preview_loaded_offset = 0;
-                    self.set_selected_idx(PanelKind::Detail, 0);
-                }
-            },
+            }
             DetailTab::Meta => {
+                self.preview_data = None;
                 self.preview_rows = vec![
                     format!("db_path: {}", self.db_path_display()),
                     format!("db_size: {}", self.db_size_display()),
@@ -1662,6 +1683,13 @@ impl App {
             expanded.extend(data.rows.iter().map(|row| row.to_line(" | ")));
             expanded.extend(self.preview_rows.iter().skip(1).cloned());
             self.preview_rows = expanded;
+
+            // Mantener sincronizadas las celdas tipadas del render 2D
+            if let Some(existing) = self.preview_data.take() {
+                let mut rows = data.rows;
+                rows.extend(existing.rows);
+                self.preview_data = Some(crate::db::TableData { columns: existing.columns, rows });
+            }
 
             // Actualizar offset
             #[allow(clippy::cast_possible_truncation)]
@@ -1888,6 +1916,7 @@ impl App {
         self.views.clear();
         self.advanced.clear();
         self.preview_rows = vec!["Sin conexion SQLite".to_string()];
+        self.preview_data = None;
         self.total_rows = 0;
         self.preview_loaded_offset = 0;
         self.current_page = 0;
