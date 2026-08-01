@@ -606,6 +606,18 @@ pub struct App {
     /// Canal de resultados de probes en segundo plano (tx/rx).
     probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
     probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
+
+    // ── query runner (COUNT(*) real, cancelable) ──
+    /// Generación de la última query lanzada: los resultados que llegan con
+    /// una generación vieja se descartan (stale data). Se incrementa al
+    /// lanzar una query nueva, al limpiar o al desconectar: cancela de
+    /// facto cualquier tarea en vuelo.
+    query_gen: u64,
+    /// Canal de resultados del query runner: generación + SQL + resultado.
+    query_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::CountMsg>>,
+    query_tx: Option<tokio::sync::mpsc::UnboundedSender<query::CountMsg>>,
+    /// Contador de frames para el spinner del status bar.
+    pub frame: usize,
     pub keymap: keys::Keymap,
     pub show_actions_menu: bool,
     pub actions_menu_idx: usize,
@@ -651,6 +663,7 @@ impl App {
         let ui_config = config::load_ui_config();
         let source_tab = SourceTab::All;
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let panels = [
             Panel::new_sidebar(PanelKind::Sources),
@@ -671,6 +684,10 @@ impl App {
             probing: HashSet::new(),
             probe_rx: Some(probe_rx),
             probe_tx: Some(probe_tx),
+            query_gen: 0,
+            query_rx: Some(query_rx),
+            query_tx: Some(query_tx),
+            frame: 0,
             // usize::MAX: el primer frame detecta la selección inicial (item 0)
             // y la comprueba al arrancar.
             last_probed_idx: usize::MAX,
@@ -732,12 +749,14 @@ impl App {
         };
 
         self.layout = layout::compute(width, height, active_sidebar, self.active_panel, &modes);
+        self.frame += 1;
 
-        // Aplicar resultados de probes de salud terminados y disparar los
-        // probes que correspondan según el layout del frame actual (tick por
-        // frame). Va después del cálculo para conocer la altura real del
-        // panel de Sources (ventana visible).
+        // Aplicar resultados de probes de salud y de queries terminadas, y
+        // disparar los probes que correspondan según el layout del frame
+        // actual (tick por frame). Va después del cálculo para conocer la
+        // altura real del panel de Sources (ventana visible).
         self.poll_probe_results();
+        self.poll_query_results();
     }
 
     // ── helpers de paneles ────────────────────────────────────────────
@@ -1664,7 +1683,7 @@ impl App {
     // ── query ─────────────────────────────────────────────────────────
 
     fn execute_count_query(&mut self) {
-        let Some(path) = self.db_path.as_deref() else {
+        let Some(path) = self.db_path.clone() else {
             self.status = "No hay DB conectada".to_string();
             return;
         };
@@ -1682,29 +1701,64 @@ impl App {
 
         let sql = format!("SELECT COUNT(*) FROM \"{}\";", object.replace('"', "\"\""));
 
-        self.query_state = query::QueryState::Running;
-        self.status = "Ejecutando query...".to_string();
+        // Generación nueva: cualquier resultado en vuelo de queries anteriores
+        // queda marcado como stale y se descarta al llegar.
+        self.query_gen += 1;
+        let generation = self.query_gen;
+        let Some(tx) = self.query_tx.clone() else { return };
 
-        match std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("sqlite3 \"{path}\" \"{sql}\""))
-            .output()
-        {
-            Ok(output) => {
-                let result = String::from_utf8_lossy(&output.stdout);
-                let count: String = result.trim().to_string();
-                self.query_results = vec![format!("COUNT(*) = {count}"), format!("SQL: {sql}")];
-                self.query_state = query::QueryState::Done(self.query_results.clone());
-                self.status = format!("Query completada: {count} filas");
-            }
+        self.query_state = query::QueryState::Running;
+        self.status = "Contando filas...".to_string();
+
+        tokio::spawn(async move {
+            let res = query::count_query_results(&path, &sql).await;
+            let _ = tx.send((generation, sql, res));
+        });
+    }
+
+    /// Aplica un resultado de count en el estado. Devuelve `None` si era
+    /// stale (generación vieja). Pura para poder testear la cancelación
+    /// sin App.
+    fn apply_count_result(
+        query_gen: u64,
+        generation: u64,
+        sql: &str,
+        res: Result<u32, String>,
+    ) -> Option<(query::QueryState, String)> {
+        if generation != query_gen {
+            return None; // stale: resultado de una query que ya no importa
+        }
+        let (state, status) = match res {
+            Ok(count) => (
+                query::QueryState::Done(vec![format!("COUNT(*) = {count}"), format!("SQL: {sql}")]),
+                format!("Query completada: {count} filas"),
+            ),
             Err(e) => {
-                self.query_state = query::QueryState::Error(e.to_string());
-                self.status = format!("Error ejecutando query: {e}");
+                let msg = format!("Error contando filas: {e}");
+                (query::QueryState::Error(msg.clone()), msg)
             }
+        };
+        Some((state, status))
+    }
+
+    fn poll_query_results(&mut self) {
+        let Some(rx) = self.query_rx.as_mut() else { return };
+        while let Ok((generation, sql, res)) = rx.try_recv() {
+            let Some((state, status)) =
+                Self::apply_count_result(self.query_gen, generation, &sql, res)
+            else {
+                continue; // stale: descartar
+            };
+            self.query_results =
+                if let query::QueryState::Done(rows) = &state { rows.clone() } else { Vec::new() };
+            self.query_state = state;
+            self.status = status;
         }
     }
 
     fn clear_query_state(&mut self) {
+        // Invalidar cualquier count en vuelo antes de limpiar
+        self.query_gen += 1;
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
         self.status = "Query limpia".to_string();
@@ -1825,6 +1879,8 @@ impl App {
         self.preview_loaded_offset = 0;
         self.current_page = 0;
         self.detail_tab = DetailTab::Data;
+        // Invalidar cualquier query en vuelo: su resultado ya no aplica
+        self.query_gen += 1;
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
         self.sources = Self::build_sources(&self.state, self.source_tab, None, &self.health);
@@ -3346,5 +3402,37 @@ mod tests {
         assert_eq!(App::skip_section_idx(&items, 2, -1), 1);
         // Borde inferior: se queda en el último entry
         assert_eq!(App::skip_section_idx(&items, 4, 1), 4);
+    }
+
+    // ── query runner: cancelación por generación ──────────────────────
+
+    #[test]
+    fn apply_count_result_descarta_resultados_stale() {
+        // Generación vieja (query reemplazada o limpiada) → None, no aplica
+        let res = App::apply_count_result(5, 4, "SELECT COUNT(*) FROM t;", Ok(42));
+        assert_eq!(res, None, "resultado stale debe descartarse");
+
+        // Generación actual → Done con filas y status
+        let (state, status) = App::apply_count_result(5, 5, "SELECT COUNT(*) FROM t;", Ok(42))
+            .expect("resultado actual");
+        assert_eq!(
+            state,
+            query::QueryState::Done(vec![
+                "COUNT(*) = 42".to_string(),
+                "SQL: SELECT COUNT(*) FROM t;".to_string(),
+            ])
+        );
+        assert_eq!(status, "Query completada: 42 filas");
+
+        // Error en generación actual → Error con mensaje, sin panics
+        let (state, status) = App::apply_count_result(
+            5,
+            5,
+            "SELECT COUNT(*) FROM nope;",
+            Err("no such table".into()),
+        )
+        .expect("resultado actual");
+        assert!(matches!(state, query::QueryState::Error(e) if e.contains("no such table")));
+        assert_eq!(status, "Error contando filas: no such table");
     }
 }

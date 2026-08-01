@@ -8,6 +8,11 @@ use ratatui::{
 
 use crate::app::controller::DetailTab;
 use crate::app::{App, PanelKind};
+use crate::query::QueryState;
+
+/// Spinner ASCII/Unicode para operaciones en segundo plano (patrón lazy:
+/// la UI jamás se congela, y el estado en curso siempre es visible).
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 // ---------------------------------------------------------------------------
 // Render principal
@@ -98,16 +103,22 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
 // ---------------------------------------------------------------------------
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // Feedback inmediato del query runner: spinner + estado mientras corre
+    let status = if app.query_state == QueryState::Running {
+        let spin = SPINNER[app.frame % SPINNER.len()];
+        format!("{spin} {}", app.status)
+    } else {
+        app.status.clone()
+    };
+
     if area.width >= 110 {
         let shortcuts = format!(
-            "tab: foco | ↑↓: seleccion | ←→: sidebar | []: tabs | space: toggle | 1-5: panel | rueda: scroll | shift+rueda: cols | x: menu | {}",
-            app.status
+            "tab: foco | ↑↓: selección | ←→: sidebar | []: tabs | space: toggle | 1-5: panel | rueda: scroll | shift+rueda: cols | x: menu | {status}",
         );
         frame.render_widget(Paragraph::new(shortcuts), area);
     } else {
         let shortcuts = format!(
-            "tab foco | ↑↓ mover | ←→ detalle | space toggle | rueda | shift+rueda cols | {}",
-            app.status
+            "tab foco | ↑↓ mover | ←→ detalle | space toggle | rueda | shift+rueda cols | {status}",
         );
         frame.render_widget(Paragraph::new(shortcuts), area);
     }
