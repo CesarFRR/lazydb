@@ -275,6 +275,24 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
   El smoke test de la UI (`smoke_flujo_ui_completo`) replica el flujo completo
   (normalize_path → resolver → tablas/vistas/índices/triggers/avanzados).
 
+### ✅ Inspector de fila + tipos avanzados DuckDB (HECHO, 2026-08-02)
+
+- **Panic "The statement was not executed yet"**: `table_data_rows` (inspector de fila)
+  llamaba `stmt.column_count()` ANTES de ejecutar la query → panic en duckdb-rs.
+  Ahora obtiene el nº de columnas del catálogo (`column_names(...).len()`), igual que
+  `table_rows_sorted`. **Lección**: en duckdb-rs NUNCA tocar `column_count()`/
+  `column_names()` del Statement sin haber ejecutado; sacar la metadata del catálogo.
+- **Tipos avanzados ya no son placeholders**: `cell_value_to_string` ahora renderiza
+  - Timestamp/Date32/Time64 → fecha civil real (algoritmo `civil_from_days` de Hinnant,
+    sin chrono) con fracción `.ffffff` cuando aplica
+  - Interval → `Xm Yd HH:MM:SS` (partes no nulas)
+  - Enum → valor del diccionario vía `ValueRef::as_str()`
+  - Blob → `0x<hex>` · Geometry → `WKB[nB]` · List → `<list[n]>` (longitud real)
+  - Struct/Map/Union/Array → placeholder (requieren Arrow API; pendiente)
+- Tests: `render_fechas_y_horas_usa_fecha_civil` (epoch real verificada con `date +%s`,
+  incluye fecha pre-1970) + smoke ampliado con el path del inspector sobre ambos `.duckdb`
+  reales → 87 verdes.
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |

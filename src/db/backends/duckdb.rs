@@ -146,7 +146,9 @@ pub fn table_data_rows(
     let sql = format!("SELECT * FROM \"{escaped}\" LIMIT {limit} OFFSET {offset}");
     let mut stmt = conn.prepare(&sql)?;
 
-    let col_count = stmt.column_count();
+    // duckdb-rs: column_count() panica si la query no se ejecutó aún.
+    // El número de columnas se obtiene del catálogo (mismo orden que SELECT *).
+    let col_count = column_names(path, table_name)?.len();
 
     let rows = stmt.query_map([], |row| {
         let mut values = Vec::new();
@@ -368,20 +370,139 @@ pub fn cell_value_to_string(row: &duckdb::Row<'_>, i: usize) -> String {
         Ok(ValueRef::Double(v)) => v.to_string(),
         Ok(ValueRef::Decimal(v)) => v.to_string(),
         Ok(ValueRef::Text(t)) => String::from_utf8_lossy(t).into_owned(),
-        Ok(ValueRef::Blob(_)) => "<blob>".to_string(),
-        Ok(ValueRef::Date32(_)) => "<date>".to_string(),
-        Ok(ValueRef::Time64(..)) => "<time>".to_string(),
-        Ok(ValueRef::Timestamp(..)) => "<timestamp>".to_string(),
-        Ok(ValueRef::Interval { .. }) => "<interval>".to_string(),
-        Ok(ValueRef::List(..)) => "<list>".to_string(),
-        Ok(ValueRef::Enum(..)) => "<enum>".to_string(),
-        Ok(ValueRef::Struct(..)) => "<struct>".to_string(),
-        Ok(ValueRef::Map(..)) => "<map>".to_string(),
-        Ok(ValueRef::Union(..)) => "<union>".to_string(),
-        Ok(ValueRef::Array(..)) => "<array>".to_string(),
+        Ok(ValueRef::Blob(b)) => format!("0x{}", hex(b)),
+        Ok(ValueRef::Geometry(b)) => format!("WKB[{}B]", b.len()),
+        Ok(ValueRef::Date32(d)) => {
+            format!("{y:04}-{:02}-{:02}", month(d), day(d), y = year(d))
+        }
+        Ok(ValueRef::Time64(tu, v)) => time_to_string(tu, v),
+        Ok(ValueRef::Timestamp(tu, v)) => timestamp_to_string(tu, v),
+        Ok(ValueRef::Interval { months, days, nanos }) => interval_to_string(months, days, nanos),
+        Ok(ValueRef::Enum(..)) => row
+            .get_ref(i)
+            .ok()
+            .and_then(|r| r.as_str().ok())
+            .map_or_else(|| "<enum>".to_string(), ToOwned::to_owned),
+        Ok(ValueRef::List(l, i)) => format!("<list[{}]>", list_len(l, i)),
+        Ok(ValueRef::Struct(_, _)) => "<struct>".to_string(),
+        Ok(ValueRef::Map(_, _)) => "<map>".to_string(),
+        Ok(ValueRef::Union(_, _)) => "<union>".to_string(),
+        Ok(ValueRef::Array(_, _)) => "<array>".to_string(),
         // ValueRef es non-exhaustive en duckdb 1.10505: variantes futuras
         Ok(_) => "<otro>".to_string(),
         Err(e) => format!("<error: {e}>"),
+    }
+}
+
+/// Bytes en hexadecimal compacto.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut acc, b| {
+        acc.push_str(&format!("{b:02x}"));
+        acc
+    })
+}
+
+/// Días desde 1970-01-01 → mes (1-12). Algoritmo `civil_from_days` (Hinnant).
+fn month(days: i32) -> u32 {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(0)
+}
+
+/// Días desde 1970-01-01 → día del mes (1-31).
+fn day(days: i32) -> u32 {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    u32::try_from(d).unwrap_or(0)
+}
+
+/// Convierte el tick de Time64 (hora del día) a HH:MM:SS(.ffff).
+fn time_to_string(tu: duckdb::types::TimeUnit, v: i64) -> String {
+    let ticks_per_sec = match tu {
+        duckdb::types::TimeUnit::Second => 1,
+        duckdb::types::TimeUnit::Millisecond => 1_000,
+        duckdb::types::TimeUnit::Microsecond => 1_000_000,
+        duckdb::types::TimeUnit::Nanosecond => 1_000_000_000,
+    };
+    let total = v.div_euclid(ticks_per_sec);
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    let frac = v.rem_euclid(ticks_per_sec);
+    let frac_str =
+        if frac > 0 { format!(".{:06}", frac * 1_000_000 / ticks_per_sec) } else { String::new() };
+    format!("{h:02}:{m:02}:{s:02}{frac_str}")
+}
+
+/// Timestamp → `YYYY-MM-DD HH:MM:SS(.ffff)` (usando el tick como UTC; la
+/// fecha civil se deriva con `civil_from_days`).
+fn timestamp_to_string(tu: duckdb::types::TimeUnit, v: i64) -> String {
+    let ticks_per_sec = match tu {
+        duckdb::types::TimeUnit::Second => 1,
+        duckdb::types::TimeUnit::Millisecond => 1_000,
+        duckdb::types::TimeUnit::Microsecond => 1_000_000,
+        duckdb::types::TimeUnit::Nanosecond => 1_000_000_000,
+    };
+    let seconds = v.div_euclid(ticks_per_sec);
+    #[allow(clippy::cast_possible_truncation)]
+    let days = seconds.div_euclid(86_400) as i32;
+    let y = year(days);
+    let frac = v.rem_euclid(ticks_per_sec);
+    let frac_str =
+        if frac > 0 { format!(".{:06}", frac * 1_000_000 / ticks_per_sec) } else { String::new() };
+    // Hora del día: se restan los días completos antes de pasar a time_to_string.
+    let day_seconds = (seconds - i64::from(days) * 86_400) * ticks_per_sec;
+    format!(
+        "{y:04}-{:02}-{:02} {}{frac_str}",
+        month(days),
+        day(days),
+        time_to_string(tu, day_seconds),
+    )
+}
+
+/// Días desde 1970-01-01 → año.
+const fn year(days: i32) -> i32 {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    yoe + era * 400
+}
+
+/// Intervalo → `Xm Yd HH:MM:SS` (partes no nulas), estilo duckdb CLI.
+fn interval_to_string(months: i32, days: i32, nanos: i64) -> String {
+    let total_secs = nanos.div_euclid(1_000_000_000);
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    let mut parts = Vec::new();
+    if months != 0 {
+        parts.push(format!("{months}m"));
+    }
+    if days != 0 {
+        parts.push(format!("{days}d"));
+    }
+    if h != 0 || m != 0 || s != 0 {
+        parts.push(format!("{h:02}:{m:02}:{s:02}"));
+    }
+    if parts.is_empty() { "0".to_string() } else { parts.join(" ") }
+}
+
+/// Longitud de una lista/array de arrow en la posición `i` (número de
+/// elementos de la sub-lista, no de filas del array).
+fn list_len(list: duckdb::types::ListType<'_>, i: usize) -> usize {
+    match list {
+        duckdb::types::ListType::Regular(arr) => usize::try_from(arr.value_length(i)).unwrap_or(0),
+        duckdb::types::ListType::Large(arr) => usize::try_from(arr.value_length(i)).unwrap_or(0),
     }
 }
 
@@ -558,6 +679,27 @@ mod tests {
         cleanup();
     }
 
+    #[test]
+    fn render_fechas_y_horas_usa_fecha_civil() {
+        use duckdb::types::TimeUnit;
+        // 2026-08-03 01:13:22 (epoch seconds, verificado con date +%s)
+        let epoch = 1_785_719_602_i64;
+        let s = timestamp_to_string(TimeUnit::Second, epoch);
+        assert_eq!(s, "2026-08-03 01:13:22", "got: {s}");
+
+        // Fechas antes de 1970 (negativos)
+        let s = timestamp_to_string(TimeUnit::Second, -1);
+        assert_eq!(s, "1969-12-31 23:59:59", "got: {s}");
+
+        // Date32: 20668 días → 2026-08-03
+        let s = format!("{y:04}-{:02}-{:02}", month(20668), day(20668), y = year(20668));
+        assert_eq!(s, "2026-08-03", "got: {s}");
+
+        // Intervalo legible
+        assert_eq!(interval_to_string(2, 3, 3_661_000_000_000), "2m 3d 01:01:01");
+        assert_eq!(interval_to_string(0, 0, 0), "0");
+    }
+
     /// Smoke test contra la DB de prueba real del usuario. Se ejecuta con
     /// `cargo test -- --ignored --nocapture` (requiere el archivo en disco).
     #[test]
@@ -619,6 +761,22 @@ mod tests {
             match adapter.list_advanced_objects() {
                 Ok(adv) => println!("  AVANZADOS: {adv:?}"),
                 Err(err) => println!("  ERROR REAL advanced: {err:?}"),
+            }
+
+            // Path exacto del inspector de fila (panic "statement not executed"):
+            // table_data_rows debe funcionar sobre TODAS las tablas del archivo.
+            if let Ok(tables) = adapter.list_objects_by_type("table") {
+                for t in tables {
+                    match crate::db::backends::duckdb::table_data_rows(&normalized, &t, 2, 0) {
+                        Ok(rows) => {
+                            println!("  inspector {t}: {} filas", rows.len());
+                            if let Some(row) = rows.first() {
+                                println!("    {row:?}");
+                            }
+                        }
+                        Err(err) => println!("  ERROR REAL inspector {t}: {err:?}"),
+                    }
+                }
             }
         }
     }
