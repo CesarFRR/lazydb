@@ -368,6 +368,28 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
     scroll → imposible desincronizar.
   - → 90 verdes.
 
+### ✅ avPag/rePag = mover K filas (no "página estricta") + scroll infinito suave (HECHO, 2026-08-02)
+
+- **Bug reportado**: con la rueda, la selección llegaba al final del buffer y saltaba a la
+  "primera fila de la página nueva" (cambio de página fantasma); rePag/prepend hacía el
+  "página atrás" (fila 160 → 124). avPag/rePag además RECARGABAN todo el preview
+  (`refresh_preview_from_selected_object`) en vez de moverse por el contenido.
+- **Idea del usuario**: avPag/rePag nunca debió ser estricto — solo avanza/retrocede K
+  filas (K = las que caben en pantalla) y se adapta al contenido actual con clamp:
+  - mín. fila 1 (nunca el header), máx. última fila del buffer cargado
+  - `move_selection_by_page(down)`: K = rect del Detail − 5 (bordes + spacer/header/sep),
+    mismo cálculo que el render; en los bordes del buffer → scroll infinito
+- **Scroll infinito suave** (la causa del salto): el append/prepend ya NO salta la
+  selección:
+  - `scroll_down_infinite`: las filas nuevas quedan debajo, la selección quieta (el
+    siguiente paso ↓/rueda/avPag avanza a ellas de a 1)
+  - `scroll_up_infinite`: la selección se desplaza +n (las filas nuevas se anteponen) →
+    la MISMA fila global queda visible, sin salto visual
+  - Esto aplica a rueda, ↑/↓ y avPag/rePag por igual → el "cambio de página" fantasma
+    desaparece de la rueda; avPag/rePag se sienten como scroll rápido de K filas
+- Test `pagina_mueve_k_filas_con_clamp_al_contenido` (K dinámico del layout, clamp
+  superior e inferior, sin recarga) → 91 verdes.
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |

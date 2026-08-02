@@ -1092,6 +1092,43 @@ impl App {
         }
     }
 
+    /// avPag/rePag en el Data tab: avanza/retrocede `K` filas, donde K = las
+    /// filas que caben en pantalla. Sin concepto de "página estricta": se
+    /// adapta al contenido actual con clamp a los bordes del buffer cargado
+    /// (mínimo fila 1, nunca el header; máximo la última fila cargada). En
+    /// los bordes, el scroll infinito carga más contenido SIN saltar la
+    /// selección (append la deja quieta, prepend la desplaza +n).
+    fn move_selection_by_page(&mut self, down: bool) {
+        let len = self.preview_rows.len();
+        if len <= 1 {
+            return;
+        }
+        // Filas visibles del Data tab = rect del Detail − bordes (2) −
+        // (spacer + header + separador, 3). Mismo cálculo que el render.
+        let k = {
+            let rect = self
+                .layout
+                .panels
+                .iter()
+                .find(|(kind, _)| *kind == PanelKind::Detail)
+                .map(|(_, r)| *r)
+                .unwrap_or_default();
+            usize::from(rect.height.saturating_sub(5)).max(1)
+        };
+        let cur = self.selected_idx(PanelKind::Detail);
+        let last = len.saturating_sub(1);
+        let target =
+            if down { cur.saturating_add(k).min(last) } else { cur.saturating_sub(k).max(1) };
+        self.set_selected_idx(PanelKind::Detail, target);
+
+        // Bordes del buffer: cargar más contenido (la selección no salta)
+        if down && target == last {
+            self.scroll_down_infinite();
+        } else if !down && target == 1 && self.preview_loaded_offset > 0 {
+            self.scroll_up_infinite();
+        }
+    }
+
     fn shift_index_on_vec_len(current: &mut usize, len: usize, step: isize) {
         if len == 0 {
             *current = 0;
@@ -1660,8 +1697,12 @@ impl App {
     // ── scroll infinito (append/prepend) ─────────────────────────────
 
     /// Carga la siguiente página de datos y la agrega a `preview_rows`.
-    /// Solo para tabla de datos (`DetailTab::Data`). Actualiza la selección
-    /// para que apunte a la primera fila recién cargada (continuidad hacia abajo).
+    /// Solo para tabla de datos (`DetailTab::Data`).
+    ///
+    /// La selección NO se mueve: las filas nuevas quedan debajo del buffer y
+    /// el siguiente paso de navegación (tecla ↓, rueda o avPag) avanza a
+    /// ellas de forma natural. Antes la selección saltaba a la primera fila
+    /// nueva ("cambio de página" fantasma con la rueda).
     fn scroll_down_infinite(&mut self) {
         if self.query_mode {
             return; // resultado de query libre: sin scroll infinito
@@ -1703,18 +1744,16 @@ impl App {
                 self.is_loading = false;
                 return;
             }
-            let old_len = self.preview_rows.len();
             self.preview_rows.extend(data.rows.iter().map(|row| row.to_line(" | ")));
-            // La selección va a la primera fila nueva (continuidad: se avanzó 1 paso)
-            self.set_selected_idx(PanelKind::Detail, old_len);
         }
         self.is_loading = false;
     }
 
     /// Carga la página anterior de datos y la antepone a `preview_rows`.
-    /// Solo para tabla de datos (`DetailTab::Data`). Actualiza `preview_loaded_offset`
-    /// y la selección para que apunte a la última fila recién cargada
-    /// (continuidad hacia arriba).
+    /// Solo para tabla de datos (`DetailTab::Data`). Actualiza
+    /// `preview_loaded_offset` y desplaza la selección +n (las filas nuevas
+    /// quedan ARRIBA) para mantener la MISMA fila global visible — sin salto
+    /// visual ("página atrás" fantasma).
     fn scroll_up_infinite(&mut self) {
         if self.query_mode {
             return; // resultado de query libre: sin scroll infinito
@@ -1773,9 +1812,10 @@ impl App {
                 self.preview_loaded_offset -= n as u32;
             }
 
-            // La selección va a la última fila recién cargada
-            // (el ítem justo antes del antiguo primer dato)
-            self.set_selected_idx(PanelKind::Detail, n);
+            // La selección se desplaza +n para mantener la misma fila global
+            // (las filas nuevas se anteponen; la vista no salta).
+            let cur = self.selected_idx(PanelKind::Detail);
+            self.set_selected_idx(PanelKind::Detail, cur.saturating_add(n));
         }
         self.is_loading = false;
     }
@@ -2850,23 +2890,12 @@ impl App {
             keys::AppAction::MoveDown => self.move_selection(1),
             keys::AppAction::PrevPage => {
                 if self.active_panel == PanelKind::Detail && self.detail_tab == DetailTab::Data {
-                    let current_row = self.preview_loaded_offset
-                        + self.selected_idx(PanelKind::Detail) as u32
-                        - 1;
-                    let new_row = current_row.saturating_sub(self.rows_per_page);
-                    self.current_page = new_row / self.rows_per_page;
-                    self.refresh_preview_from_selected_object();
+                    self.move_selection_by_page(false);
                 }
             }
             keys::AppAction::NextPage => {
                 if self.active_panel == PanelKind::Detail && self.detail_tab == DetailTab::Data {
-                    let current_row = self.preview_loaded_offset
-                        + self.selected_idx(PanelKind::Detail) as u32
-                        - 1;
-                    let new_row =
-                        (current_row + self.rows_per_page).min(self.total_rows.saturating_sub(1));
-                    self.current_page = new_row / self.rows_per_page;
-                    self.refresh_preview_from_selected_object();
+                    self.move_selection_by_page(true);
                 }
             }
             keys::AppAction::JumpToDetail => self.jump_to_detail(),
@@ -3979,6 +4008,51 @@ mod tests {
         let mut app = app_con_error();
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(app.error.is_some(), "navegación no debe cerrar el popup");
+    }
+
+    /// avPag/rePag = mover K filas (K = filas visibles en pantalla), con
+    /// clamp a los bordes del buffer cargado. Nada de "primera fila de la
+    /// página siguiente" ni recarga del preview.
+    #[tokio::test]
+    async fn pagina_mueve_k_filas_con_clamp_al_contenido() {
+        let mut app = App::new();
+        app.detail_tab = DetailTab::Data;
+        // Buffer: header + 40 filas cargadas (de 250 totales)
+        app.preview_rows = std::iter::once("col".to_string())
+            .chain((1..=40).map(|i| format!("fila {i}")))
+            .collect();
+        app.total_rows = 250;
+        app.preview_loaded_offset = 100;
+        app.compute_layout(120, 40);
+        let k = {
+            let rect = app
+                .layout
+                .panels
+                .iter()
+                .find(|(kind, _)| *kind == PanelKind::Detail)
+                .map(|(_, r)| *r)
+                .unwrap_or_default();
+            usize::from(rect.height.saturating_sub(5)).max(1)
+        };
+
+        // avPag: 1 + K (dentro del buffer) — sin recargar nada
+        app.set_selected_idx(PanelKind::Detail, 1);
+        app.move_selection_by_page(true);
+        assert_eq!(app.selected_idx(PanelKind::Detail), 1 + k);
+        assert_eq!(app.preview_loaded_offset, 100, "no debe recargar el preview");
+
+        // avPag: sobrepasa el final del buffer → clamp a la última fila
+        app.move_selection_by_page(true);
+        assert_eq!(app.selected_idx(PanelKind::Detail), 40, "clamp al final del buffer");
+
+        // rePag: retrocede K
+        app.move_selection_by_page(false);
+        assert_eq!(app.selected_idx(PanelKind::Detail), 40 - k);
+
+        // rePag en la fila 1: clamp (nunca el header, fila 0)
+        app.set_selected_idx(PanelKind::Detail, 1);
+        app.move_selection_by_page(false);
+        assert_eq!(app.selected_idx(PanelKind::Detail), 1, "clamp a la fila 1");
     }
 
     // ── input SQL (`:` popup + historial persistente) ────────────────
