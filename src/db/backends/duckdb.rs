@@ -3,8 +3,8 @@ use duckdb::{Connection, OptionalExt, types::ValueRef};
 use crate::db::{Column, ColumnInfo, DbError, Row, TableData};
 
 /// Lista objetos por tipo ('table', 'view', 'index', 'trigger').
-/// DuckDB expone el catálogo vía information_schema (tablas/vistas) y
-/// duckdb_indexes()/duckdb_triggers() para los avanzados.
+/// `DuckDB` expone el catálogo vía `information_schema` (tablas/vistas) y
+/// `duckdb_indexes()/duckdb_triggers()` para los avanzados.
 pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>, DbError> {
     let conn = open_read_only(path)?;
     let sql = match object_type {
@@ -56,8 +56,8 @@ pub fn list_advanced_objects(path: &str) -> Result<Vec<String>, DbError> {
     Ok(out)
 }
 
-/// DDL de un objeto. DuckDB guarda el SQL original en duckdb_tables() /
-/// duckdb_views() (no hay sqlite_master).
+/// DDL de un objeto. `DuckDB` guarda el SQL original en `duckdb_tables()` /
+/// `duckdb_views()` (no hay `sqlite_master`).
 pub fn object_sql(path: &str, object_name: &str) -> Result<String, DbError> {
     let conn = open_read_only(path)?;
 
@@ -225,9 +225,9 @@ pub fn table_row_count(path: &str, table_name: &str) -> Result<u32, DbError> {
     Ok(count as u32)
 }
 
-/// Foreign keys declaradas de una tabla. DuckDB NO soporta
-/// `PRAGMA foreign_key_list`; el catálogo está en duckdb_constraints() y
-/// las columnas son de tipo List → las leemos con array_to_string().
+/// Foreign keys declaradas de una tabla. `DuckDB` NO soporta
+/// `PRAGMA foreign_key_list`; el catálogo está en `duckdb_constraints()` y
+/// las columnas son de tipo List → las leemos con `array_to_string()`.
 /// `to = None` significa "la PK de la tabla referenciada".
 #[allow(dead_code)]
 pub fn foreign_keys(path: &str, table_name: &str) -> Result<Vec<crate::db::ForeignKey>, DbError> {
@@ -267,7 +267,7 @@ pub fn foreign_keys(path: &str, table_name: &str) -> Result<Vec<crate::db::Forei
 /// Offset 1-based de la primera fila donde `col == value` (para posicionar
 /// el FK Jump en la tabla referenciada). `None` si no existe tal fila.
 ///
-/// DuckDB no tiene rowid: usamos ROW_NUMBER() sobre el scan natural.
+/// `DuckDB` no tiene rowid: usamos `ROW_NUMBER()` sobre el scan natural.
 #[allow(dead_code)]
 pub fn row_offset_of(
     path: &str,
@@ -294,13 +294,52 @@ pub fn row_offset_of(
     Ok(rn.map(|n| n as u32))
 }
 
-/// Apertura read-only: DuckDB usa Config::access_mode(ReadOnly) en vez de
-/// OpenFlags como rusqlite.
+/// Apertura read-only: `DuckDB` usa `Config::access_mode(ReadOnly)` en vez de
+/// `OpenFlags` como rusqlite.
 fn open_read_only(path: &str) -> Result<Connection, DbError> {
     let config = duckdb::Config::default()
         .access_mode(duckdb::AccessMode::ReadOnly)
         .map_err(|err| DbError::Open(format!("config {path}: {err}")))?;
     Connection::open_with_flags(path, config).map_err(|err| DbError::Open(format!("{path}: {err}")))
+}
+
+/// Query libre del usuario (modal `:`), read-only, con tope `limit`.
+/// Devuelve las filas formateadas `celda | celda`.
+pub fn query_free(path: &str, sql: &str, limit: u32) -> Result<Vec<String>, DbError> {
+    let conn = open_read_only(path)?;
+    let mut stmt = conn.prepare(sql)?;
+
+    // duckdb-rs: column_count() panica si la query no se ejecutó → primero
+    // `query()` (ejecuta). El count se pide vía `rows.as_ref()` para no
+    // romper el borrow del stmt (ver doc de duckdb column.rs).
+    let mut rows = stmt.query([])?;
+    let col_count = rows.as_ref().expect("stmt").column_count();
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        if out.len() >= limit as usize {
+            break;
+        }
+        let mut row_str = String::new();
+        for i in 0..col_count {
+            if i > 0 {
+                row_str.push_str(" | ");
+            }
+            row_str.push_str(&cell_value_to_string(row, i));
+        }
+        out.push(row_str);
+    }
+    Ok(out)
+}
+
+/// `SELECT COUNT(*)` real sobre un SQL arbitrario (`DuckDB` lo optimiza).
+pub fn count_free(path: &str, sql: &str) -> Result<u32, DbError> {
+    let conn = open_read_only(path)?;
+    let mut stmt = conn.prepare(sql)?;
+    let n: i64 = stmt.query_row([], |row| row.get(0))?;
+    #[allow(clippy::cast_sign_loss)]
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(n as u32)
 }
 
 /// Convierte una celda a String según el tipo de valor almacenado.
@@ -507,16 +546,16 @@ mod tests {
         let cols = table_columns(path.to_str().unwrap(), "t").expect("columnas");
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].name, "id");
-        assert_eq!(cols[0].notnull, false);
+        assert!(!cols[0].notnull);
         assert_eq!(cols[1].name, "note");
-        assert_eq!(cols[1].notnull, false);
+        assert!(!cols[1].notnull);
         cleanup();
     }
 
     /// Smoke test contra la DB de prueba real del usuario. Se ejecuta con
     /// `cargo test -- --ignored --nocapture` (requiere el archivo en disco).
     #[test]
-    #[ignore]
+    #[ignore = "requiere /home/cesar/dev/lazydb/fw2-aai_Latn.duckdb en disco"]
     fn smoke_db_real_usuario() {
         let path = "/home/cesar/dev/lazydb/fw2-aai_Latn.duckdb";
         let tables = list_objects_by_type(path, "table").expect("tablas");

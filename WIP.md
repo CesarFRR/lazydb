@@ -238,6 +238,22 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 - Los tipos del driver pueden diferir (bool vs int en PRAGMA, List en constraints)
 - `column_names()` del Statement panica si la query no se ejecutó (distinto de rusqlite)
 
+### ✅ DuckDB integrado en la UI (HECHO, 2026-08-02)
+
+- **Trait `DbAdapter` ampliado** al contrato completo que el controller usaba directo contra
+  sqlite: `column_names`, `table_data_rows`, `table_rows_sorted`, `foreign_keys`,
+  `row_offset_of`, `query(sql, limit)` y `count(sql)` (query libre del modal `:`).
+  Ahora es el ÚNICO punto de acceso a datos desde la UI (16 call sites migrados).
+- `connect_sqlite` (ahora genérico) resuelve el backend por extensión vía `db::resolver`.
+- `query.rs` (modal `:`) despacha por extensión: `resolve_backend` + `spawn_blocking`.
+  Añadidos `query_free`/`count_free` a sqlite.rs y duckdb.rs (duckdb: `column_count()`
+  solo tras ejecutar `query()`, vía `rows.as_ref()` por el borrow).
+- **Panel de fuentes**: `scan_cwd_databases` detecta `.duckdb`/`.ddb` además de
+  `.db`/`.sqlite`/`.sqlite3`; `connect_selected_source` acepta las extensiones nuevas;
+  la marca `D` ya existía en `db_type_mark`. El smoke test `#[ignore]` abre
+  `fw2-aai_Latn.duckdb` completo desde la UI (tablas/vistas/índices/datos/DDL/FK).
+- 4 tests nuevos (count duckdb, query duckdb, query error, scan cwd) → 86 verdes.
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |

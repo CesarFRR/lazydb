@@ -288,6 +288,42 @@ fn open_read_only(path: &str) -> Result<Connection, DbError> {
         .map_err(|err| DbError::Open(format!("{path}: {err}")))
 }
 
+/// Query libre del usuario (modal `:`), read-only, con tope `limit`.
+/// Devuelve las filas formateadas `celda | celda`.
+pub fn query_free(path: &str, sql: &str, limit: u32) -> Result<Vec<String>, DbError> {
+    let conn = open_read_only(path)?;
+    let mut stmt = conn.prepare(sql)?;
+    let col_count = stmt.column_count();
+
+    let rows = stmt.query_map([], |row| {
+        let mut row_str = String::new();
+        for i in 0..col_count {
+            if i > 0 {
+                row_str.push_str(" | ");
+            }
+            row_str.push_str(&cell_value_to_string(row, i));
+        }
+        Ok(row_str)
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        if out.len() >= limit as usize {
+            break;
+        }
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// `SELECT COUNT(*)` real sobre un SQL arbitrario (`SQLite` lo optimiza
+/// internamente; no materializa filas).
+pub fn count_free(path: &str, sql: &str) -> Result<u32, DbError> {
+    let conn = open_read_only(path)?;
+    let mut stmt = conn.prepare(sql)?;
+    Ok(stmt.query_row([], |row| row.get(0))?)
+}
+
 /// Convierte una celda a String según el tipo de valor almacenado
 /// (entero, real, texto, nulo, blob).
 ///

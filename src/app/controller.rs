@@ -291,7 +291,10 @@ fn source_host_port(url: &str) -> Option<(String, u16)> {
 fn probe_source(path: &str) -> bool {
     match source_kind(path) {
         SourceKind::File => {
-            let file = path.strip_prefix("sqlite://").unwrap_or(path);
+            let file = path
+                .strip_prefix("sqlite://")
+                .or_else(|| path.strip_prefix("duckdb://"))
+                .unwrap_or(path);
             std::fs::metadata(file).is_ok_and(|meta| meta.is_file())
         }
         SourceKind::Localhost | SourceKind::Online => {
@@ -529,8 +532,9 @@ impl SourceList<'_> {
 }
 
 /// Escanea el directorio de trabajo actual (donde se ejecuta `cargo run` /
-/// lazydb) buscando archivos de base de datos `SQLite`: `*.db`, `*.sqlite` y
-/// `*.sqlite3`. Devuelve los paths completos ordenados alfabéticamente.
+/// lazydb) buscando archivos de base de datos locales: `*.db`, `*.sqlite`,
+/// `*.sqlite3` (`SQLite`) y `*.duckdb`, `*.ddb` (`DuckDB`). Devuelve los paths
+/// completos ordenados alfabéticamente.
 fn scan_cwd_databases() -> Vec<String> {
     let Ok(cwd) = std::env::current_dir() else {
         return Vec::new();
@@ -543,10 +547,12 @@ fn scan_cwd_databases() -> Vec<String> {
         .filter(|e| {
             let path = e.path();
             path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| matches!(ext, "db" | "sqlite" | "sqlite3"))
+                && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+                    matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "db" | "sqlite" | "sqlite3" | "duckdb" | "ddb"
+                    )
+                })
         })
         .filter_map(|e| e.path().to_str().map(str::to_string))
         .collect();
@@ -1368,9 +1374,17 @@ impl App {
         let path = crate::paths::normalize_path(path);
         self.is_loading = true;
         self.status = format!("Conectando a {path}...");
-        let tables = db::backends::sqlite::list_objects_by_type(&path, "table");
-        let views = db::backends::sqlite::list_objects_by_type(&path, "view");
-        let advanced = db::backends::sqlite::list_advanced_objects(&path);
+
+        // Backend resuelto por extensión: sqlite (.db/.sqlite) o duckdb (.duckdb/.ddb)
+        let Some(adapter) = db::resolver::resolve_backend(&path) else {
+            self.is_loading = false;
+            self.show_error("No se pudo abrir la base", &format!("{path}: fuente no soportada"));
+            tracing::error!(path = %path, "fuente no soportada por el resolver");
+            return;
+        };
+        let tables = adapter.list_objects_by_type("table");
+        let views = adapter.list_objects_by_type("view");
+        let advanced = adapter.list_advanced_objects();
 
         if let (Ok(tables), Ok(views), Ok(advanced)) = (tables, views, advanced) {
             let path_str = path.clone();
@@ -1405,9 +1419,9 @@ impl App {
             self.is_loading = false;
             self.show_error(
                 "No se pudo abrir la base",
-                &format!("{path}: no se pudo leer sqlite_master"),
+                &format!("{path}: no se pudo leer el catálogo"),
             );
-            tracing::error!(path = %path, "no se pudo abrir: sqlite_master ilegible");
+            tracing::error!(path = %path, "no se pudo abrir: catálogo ilegible");
         }
     }
 
@@ -1471,9 +1485,16 @@ impl App {
             return;
         }
 
+        // Backend resuelto por extensión: todas las lecturas del preview
+        // (filas, schema, DDL, count) pasan por el adapter.
+        let Some(adapter) = db::resolver::resolve_backend(path) else {
+            self.is_loading = false;
+            return;
+        };
+
         // Siempre refrescar total_rows para tablas/vistas (no Advanced)
         if self.object_section != ObjectSection::Advanced {
-            if let Ok(count) = db::backends::sqlite::table_row_count(path, &object_name) {
+            if let Ok(count) = adapter.table_row_count(&object_name) {
                 self.total_rows = count;
             }
         }
@@ -1482,7 +1503,7 @@ impl App {
             DetailTab::Data => {
                 if self.object_section == ObjectSection::Advanced {
                     // Para índices/triggers: mostrar el SQL DDL
-                    match db::backends::sqlite::object_sql(path, &object_name) {
+                    match adapter.object_sql(&object_name) {
                         Ok(sql) => {
                             self.preview_rows =
                                 sql.lines().map(ToString::to_string).collect::<Vec<_>>();
@@ -1503,7 +1524,7 @@ impl App {
                     return;
                 }
 
-                match db::backends::sqlite::table_row_count(path, &object_name) {
+                match adapter.table_row_count(&object_name) {
                     Ok(_) => {} // total_rows ya fue actualizado arriba
                     Err(err) => {
                         self.preview_rows = vec![format!("Error contando filas: {err}")];
@@ -1519,13 +1540,8 @@ impl App {
 
                 let offset = self.current_page.saturating_mul(self.rows_per_page);
                 let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-                match db::backends::sqlite::table_rows_sorted(
-                    path,
-                    &object_name,
-                    self.rows_per_page,
-                    offset,
-                    order_col,
-                ) {
+                match adapter.table_rows_sorted(&object_name, self.rows_per_page, offset, order_col)
+                {
                     Ok(data) => {
                         // Celdas tipadas para el render 2D (TableState +
                         // highlight_symbol); preview_rows queda como fallback
@@ -1554,7 +1570,7 @@ impl App {
             DetailTab::Schema => {
                 if self.object_section == ObjectSection::Advanced {
                     // Schema de índice/trigger = su SQL DDL
-                    match db::backends::sqlite::object_sql(path, &object_name) {
+                    match adapter.object_sql(&object_name) {
                         Ok(sql) => {
                             self.preview_rows =
                                 sql.lines().map(ToString::to_string).collect::<Vec<_>>();
@@ -1575,7 +1591,7 @@ impl App {
                     return;
                 }
 
-                match db::backends::sqlite::table_columns(path, &object_name) {
+                match adapter.table_columns(&object_name) {
                     Ok(columns) => {
                         self.preview_data = None;
                         // ColumnInfo → líneas de presentación del Schema tab
@@ -1600,7 +1616,7 @@ impl App {
             }
             DetailTab::Sql => {
                 self.preview_data = None;
-                match db::backends::sqlite::object_sql(path, &object_name) {
+                match adapter.object_sql(&object_name) {
                     Ok(sql) => {
                         self.preview_rows =
                             sql.lines().map(ToString::to_string).collect::<Vec<_>>();
@@ -1672,14 +1688,12 @@ impl App {
         self.status = format!("Cargando más filas (offset {next_offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
+        let Some(adapter) = db::resolver::resolve_backend(path) else {
+            self.is_loading = false;
+            return;
+        };
         #[allow(clippy::cast_possible_truncation)]
-        if let Ok(data) = crate::db::backends::sqlite::table_rows_sorted(
-            path,
-            &object,
-            limit,
-            next_offset as u32,
-            order_col,
-        ) {
+        if let Ok(data) = adapter.table_rows_sorted(&object, limit, next_offset as u32, order_col) {
             // data.rows son las filas de datos nuevas (sin header: ya tenemos
             // el nuestro en preview_rows[0])
             if data.rows.is_empty() {
@@ -1724,9 +1738,11 @@ impl App {
         self.status = format!("Cargando filas anteriores (offset {offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-        if let Ok(data) =
-            crate::db::backends::sqlite::table_rows_sorted(path, &object, limit, offset, order_col)
-        {
+        let Some(adapter) = db::resolver::resolve_backend(path) else {
+            self.is_loading = false;
+            return;
+        };
+        if let Ok(data) = adapter.table_rows_sorted(&object, limit, offset, order_col) {
             // data.rows son los datos nuevos (el header ya está en index 0)
             let n = data.rows.len(); // cantidad de filas nuevas
             if n == 0 {
@@ -2229,15 +2245,17 @@ impl App {
         if object.is_empty() || object == "-" {
             return;
         }
-        let Ok(columns) = crate::db::backends::sqlite::column_names(path, &object) else {
+        let Some(adapter) = db::resolver::resolve_backend(path) else {
+            return;
+        };
+        let Ok(columns) = adapter.column_names(&object) else {
             return;
         };
 
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1); // skip header
         #[allow(clippy::cast_possible_truncation)]
         let offset = self.preview_loaded_offset + row_idx as u32;
-        let Ok(rows) = crate::db::backends::sqlite::table_data_rows(path, &object, 1, offset)
-        else {
+        let Ok(rows) = adapter.table_data_rows(&object, 1, offset) else {
             return;
         };
 
@@ -2478,7 +2496,10 @@ impl App {
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1);
         let Some(row) = data.rows.get(row_idx) else { return false };
 
-        let Ok(fks) = db::backends::sqlite::foreign_keys(path, &object) else {
+        let Some(adapter) = db::resolver::resolve_backend(path) else {
+            return false;
+        };
+        let Ok(fks) = adapter.foreign_keys(&object) else {
             return false;
         };
         if fks.is_empty() {
@@ -2503,7 +2524,7 @@ impl App {
         let to_col = match fk.to {
             Some(to) if !to.is_empty() => to,
             _ => {
-                let Ok(cols) = db::backends::sqlite::table_columns(path, &fk.table) else {
+                let Ok(cols) = adapter.table_columns(&fk.table) else {
                     return false;
                 };
                 let Some(pk) = cols.iter().find(|c| c.pk).map(|c| c.name.clone()) else {
@@ -2514,8 +2535,7 @@ impl App {
         };
 
         // Posición de la fila referenciada (1-based) para cargar la página
-        let Ok(Some(idx)) = db::backends::sqlite::row_offset_of(path, &fk.table, &to_col, &value)
-        else {
+        let Ok(Some(idx)) = adapter.row_offset_of(&fk.table, &to_col, &value) else {
             self.status =
                 format!("FK {}.{} = {value}: fila no encontrada en {}", object, fk.from, fk.table);
             return false;
@@ -2524,10 +2544,16 @@ impl App {
         // Cambiar al objeto referenciado (recargando tablas si no estaba)
         if !self.tables.contains(&fk.table) {
             if let Some(path) = self.db_path.as_deref() {
-                if let Ok(tables) = db::backends::sqlite::list_objects_by_type(path, "table") {
-                    self.tables = tables;
-                    self.sources =
-                        Self::build_sources(&self.state, self.source_tab, Some(path), &self.health);
+                if let Some(adapter) = db::resolver::resolve_backend(path) {
+                    if let Ok(tables) = adapter.list_objects_by_type("table") {
+                        self.tables = tables;
+                        self.sources = Self::build_sources(
+                            &self.state,
+                            self.source_tab,
+                            Some(path),
+                            &self.health,
+                        );
+                    }
                 }
             }
         }
@@ -2584,9 +2610,13 @@ impl App {
                 self.connect_sqlite(&path);
             }
             s if s.starts_with('/')
-                || std::path::Path::new(s)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db")) =>
+                || std::path::Path::new(s).extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("db")
+                        || ext.eq_ignore_ascii_case("sqlite")
+                        || ext.eq_ignore_ascii_case("sqlite3")
+                        || ext.eq_ignore_ascii_case("duckdb")
+                        || ext.eq_ignore_ascii_case("ddb")
+                }) =>
             {
                 self.connect_sqlite(s);
             }
@@ -3989,5 +4019,44 @@ mod tests {
         let (state, rows) = App::apply_user_query_result(&Err(err));
         assert!(matches!(state, query::QueryState::Error(_)));
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn scan_cwd_detecta_db_y_duckdb() {
+        // El scan lee el cwd real del proceso: creamos un dir temp y corremos
+        // el scan con cwd cambiado (los tests corren en paralelo, así que
+        // cambiamos cwd dentro del test con un guard de restauración).
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("lazydb_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("crear dir temp");
+        std::fs::write(dir.join("a.db"), b"x").expect("db");
+        std::fs::write(dir.join("b.duckdb"), b"x").expect("duckdb");
+        std::fs::write(dir.join("c.ddb"), b"x").expect("ddb");
+        std::fs::write(dir.join("nota.txt"), b"x").expect("txt");
+
+        let original = std::env::current_dir().expect("cwd actual");
+        let guard = CwdGuard(original);
+        std::env::set_current_dir(&dir).expect("cambiar cwd");
+
+        let found = scan_cwd_databases();
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // paths completos (absolutos) ordenados alfabéticamente
+        assert_eq!(
+            found,
+            vec![
+                dir.join("a.db").to_string_lossy().into_owned(),
+                dir.join("b.duckdb").to_string_lossy().into_owned(),
+                dir.join("c.ddb").to_string_lossy().into_owned(),
+            ]
+        );
     }
 }

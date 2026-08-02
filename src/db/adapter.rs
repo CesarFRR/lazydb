@@ -2,7 +2,7 @@
 // No tiene dependencias de UI; es el contrato de acceso a datos.
 // Habla en modelos tipados (Row/Column/TableData), nunca en strings
 // formateados: ese es el consenso que todos los backends deben respetar.
-use crate::db::{Column, ColumnInfo, DbError, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
 
 #[allow(dead_code)]
 pub trait DbAdapter: Send + Sync {
@@ -12,6 +12,36 @@ pub trait DbAdapter: Send + Sync {
     fn table_columns(&self, table_name: &str) -> Result<Vec<ColumnInfo>, DbError>;
     fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError>;
     fn table_row_count(&self, table_name: &str) -> Result<u32, DbError>;
+
+    // ── extras que el controller usa directo (inspector, FK Jump, DDL) ──
+    fn column_names(&self, table_name: &str) -> Result<Vec<Column>, DbError>;
+    fn table_data_rows(
+        &self,
+        table_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Row>, DbError>;
+    fn table_rows_sorted(
+        &self,
+        table_name: &str,
+        limit: u32,
+        offset: u32,
+        order_col: Option<(&str, bool)>,
+    ) -> Result<TableData, DbError>;
+    fn foreign_keys(&self, table_name: &str) -> Result<Vec<ForeignKey>, DbError>;
+    fn row_offset_of(
+        &self,
+        table_name: &str,
+        col: &str,
+        value: &str,
+    ) -> Result<Option<u32>, DbError>;
+
+    // ── query libre del usuario (modal `:`) ──
+    /// Ejecuta un SQL arbitrario read-only y devuelve las filas formateadas
+    /// (`celda | celda`), con tope `limit` (culling: nunca materializar todo).
+    fn query(&self, sql: &str, limit: u32) -> Result<Vec<String>, DbError>;
+    /// `SELECT COUNT(*)` sobre un SQL arbitrario (el backend lo optimiza).
+    fn count(&self, sql: &str) -> Result<u32, DbError>;
 }
 
 /// Datos adicionales del contrato que algunos consumidores necesitan
