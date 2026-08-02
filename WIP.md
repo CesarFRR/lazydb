@@ -212,6 +212,32 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 
 ## FASE 2 — Multi-backend local
 
+### ✅ DuckDB backend (HECHO, 2026-08-02)
+
+- Crate `duckdb 1.4.5` con feature `bundled` (API estilo rusqlite, tal como previó la tabla de drivers)
+- `src/db/backends/duckdb.rs` replica el patrón de `sqlite.rs` (funciones puras path → Result):
+  - `list_objects_by_type` vía `information_schema.tables/views` + `duckdb_indexes()/duckdb_triggers()`
+    (filtrando `table_type = 'BASE TABLE'` para que las vistas no aparezcan como tablas)
+  - `object_sql` vía `duckdb_tables()`/`duckdb_views()` (DuckDB guarda el SQL original en el catálogo)
+  - `column_names`/`table_columns` vía `PRAGMA table_info` — OJO: `notnull`/`pk` son **BOOLEAN** en DuckDB
+  - `table_rows[_sorted]`, `table_row_count`, `table_data_rows` (mismo LIMIT/OFFSET que sqlite)
+  - `foreign_keys` vía `duckdb_constraints()` + `array_to_string()` — NO existe `PRAGMA foreign_key_list`
+    en DuckDB; las columnas de constraints son `varchar[]` y hay que aplanarlas
+  - `row_offset_of` con `ROW_NUMBER() OVER ()` (DuckDB no tiene rowid)
+  - `cell_value_to_string` con todas las variantes de `ValueRef` de arrow (Boolean, UTinyInt..UBigInt,
+    HugeInt, Decimal, Date32, Time64, Timestamp, Interval, List, Enum, Struct, Map, Union, Array);
+    tipos compuestos → `<list>`/`<struct>`/etc.
+  - Apertura **read-only** con `Config::access_mode(AccessMode::ReadOnly)` (no hay OpenFlags)
+- `src/db/backends/duckdb_adapter.rs` implementa `DbAdapter` (misma delegación que SqliteAdapter)
+- Resolver ampliado: `duckdb://` + extensiones `.duckdb`/`.ddb` → DuckdbAdapter
+- 9 tests + 1 smoke test `#[ignore]` contra `/home/cesar/dev/lazydb/fw2-aai_Latn.duckdb` (tabla `data`
+  con 432 filas, PK compuesta `(dump VARCHAR, id UUID)`; DDL, filas y tipos verificados)
+
+**Notas para próximos backends (lecciones DuckDB):**
+- No asumir PRAGMAs de SQLite: verificar con la CLI real antes (`duckdb file.duckdb "PRAGMA..."`)
+- Los tipos del driver pueden diferir (bool vs int en PRAGMA, List en constraints)
+- `column_names()` del Statement panica si la query no se ejecutó (distinto de rusqlite)
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |

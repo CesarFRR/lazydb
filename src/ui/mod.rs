@@ -283,9 +283,8 @@ fn render_query_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Filas 1..N: historial (estilo fish; la entrada activa queda resaltada
     // con inversión fg=bg / bg=selection)
     let footer_y = inner.y + inner.height.saturating_sub(1);
-    for (row_y, (i, sql)) in (inner.y + 1..).zip(
-        app.state.query_history.iter().take(8).enumerate(),
-    ) {
+    for (row_y, (i, sql)) in (inner.y + 1..).zip(app.state.query_history.iter().take(8).enumerate())
+    {
         if row_y >= footer_y {
             break;
         }

@@ -121,9 +121,10 @@ mod tests {
         }
     }
 
-    fn tmp_tree() -> (TempDir, PathBuf) {
-        // Crea: root/a (repo con .git) / b / c
-        let dir = std::env::temp_dir().join(format!("lazydb_cfg_{}", std::process::id()));
+    fn tmp_tree(name: &str) -> (TempDir, PathBuf) {
+        // Crea: root/a (repo con .git) / b / c — con subdir único por test
+        // para que los tests en paralelo no se pisen el árbol.
+        let dir = std::env::temp_dir().join(format!("lazydb_cfg_{}_{}", std::process::id(), name));
         let root = dir.join("root");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(root.join("a/b/c")).expect("árbol");
@@ -133,7 +134,7 @@ mod tests {
 
     #[test]
     fn find_project_config_subiendo_desde_el_fondo() {
-        let (t, root) = tmp_tree();
+        let (t, root) = tmp_tree("find");
         fs::write(root.join("a/b/lazydb.toml"), "[ui]\nrows_per_page = 25\n").expect("cfg");
 
         let found = find_project_config_from(&root.join("a/b/c")).expect("encontrar config");
@@ -143,7 +144,7 @@ mod tests {
 
     #[test]
     fn no_escapa_de_la_raiz_del_repo() {
-        let (t, root) = tmp_tree();
+        let (t, root) = tmp_tree("noescape");
         // La config está FUERA del repo (root/lazydb.toml): no debe verse
         fs::write(root.join("lazydb.toml"), "").expect("cfg");
         assert_eq!(find_project_config_from(&root.join("a/b/c")), None);

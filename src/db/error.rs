@@ -29,6 +29,12 @@ impl From<rusqlite::Error> for DbError {
     }
 }
 
+impl From<duckdb::Error> for DbError {
+    fn from(err: duckdb::Error) -> Self {
+        Self::Sqlite(err.to_string())
+    }
+}
+
 impl From<std::io::Error> for DbError {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err.to_string())
