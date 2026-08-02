@@ -1111,4 +1111,66 @@ mod tests {
             }
         }
     }
+
+    /// Smoke de archivos de datos locales (filosofía lazy: parquet/csv/json/
+    /// geojson/gpkg). Requiere los archivos de prueba en /tmp/opencode
+    /// (generados con la CLI duckdb) y red la primera vez para `spatial`.
+    /// Se ejecuta con `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requiere archivos de prueba en /tmp/opencode + red para spatial"]
+    fn smoke_archivos_de_datos() {
+        let base = "/tmp/opencode";
+        for file in ["datos.parquet", "datos.csv", "datos.json", "lugares.geojson", "ciudades.gpkg"]
+        {
+            let path = format!("{base}/{file}");
+            let dataset = crate::db::backends::file::dataset_name(&path);
+            println!("=== {path} ===");
+            let adapter = crate::db::resolver::resolve_backend(&path)
+                .expect("resolver debe reconocer el archivo");
+            match adapter.list_objects_by_type("table") {
+                Ok(tables) => println!("  TABLAS: {tables:?}"),
+                Err(err) => {
+                    println!("  ERROR REAL: {err:?}");
+                    continue;
+                }
+            }
+            match adapter.table_row_count(&dataset) {
+                Ok(n) => println!("  COUNT: {n}"),
+                Err(err) => println!("  ERROR COUNT: {err:?}"),
+            }
+            match adapter.column_names(&dataset) {
+                Ok(cols) => println!("  COLUMNAS: {cols:?}"),
+                Err(err) => println!("  ERROR COLUMNAS: {err:?}"),
+            }
+            match adapter.table_rows(&dataset, 2, 0) {
+                Ok(data) => {
+                    for row in &data.rows {
+                        println!("    row: {row:?}");
+                    }
+                }
+                Err(err) => println!("  ERROR ROWS: {err:?}"),
+            }
+            match adapter.object_sql(&dataset) {
+                Ok(sql) => println!("  DDL: {sql}"),
+                Err(err) => println!("  ERROR DDL: {err:?}"),
+            }
+            match crate::db::backends::file::table_data_rows_pretty(&path, 1, 0) {
+                Ok(rows) => {
+                    if let Some(row) = rows.first() {
+                        println!("  INSPECTOR: {row:?}");
+                    }
+                }
+                Err(err) => println!("  ERROR INSPECTOR: {err:?}"),
+            }
+            // Query libre (pop-up de SQL) contra el dataset virtual.
+            match crate::db::backends::file::query_free(
+                &path,
+                &format!("SELECT count(*) AS n FROM \"{dataset}\""),
+                5,
+            ) {
+                Ok(rows) => println!("  QUERY LIBRE: {rows:?}"),
+                Err(err) => println!("  ERROR QUERY LIBRE: {err:?}"),
+            }
+        }
+    }
 }

@@ -390,6 +390,46 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 - Test `pagina_mueve_k_filas_con_clamp_al_contenido` (K dinámico del layout, clamp
   superior e inferior, sin recarga) → 91 verdes.
 
+### ✅ Archivos de datos locales — parquet/csv/json/geojson/gpkg (HECHO, 2026-08-02)
+
+- **Filosofía**: el usuario quiere TODOS los archivos locales "que entren en la filosofía"
+  (parquet, csv, tsv, json, jsonl, ndjson, geojson, gpkg) — **sin configuración**, autodiscover
+  en el panel Fuentes. Un archivo = un dataset virtual (una "tabla" con el nombre del stem).
+- **Backend**: `src/db/backends/file.rs` + `file_adapter.rs` implementan el contrato
+  `DbAdapter` delegando en DuckDB **in-memory** con vistas virtuales:
+  - `open_dataset(path)` → `Connection::open_in_memory()`, INSTALL/LOAD `spatial` bajo demanda
+    (solo para geojson/gpkg), `CREATE VIEW "<stem>" AS SELECT * FROM <lector>`.
+  - Lectores nativos por extensión:
+    - `.parquet` / `.pq` → `read_parquet`
+    - `.csv` → `read_csv_auto`
+    - `.tsv` → `read_csv_auto(delim='\t')`
+    - `.json` → `read_json_auto`
+    - `.jsonl` / `.ndjson` → `read_json_auto(format='newline_delimited')`
+    - `.geojson` / `.gpkg` → `st_read` (requiere extensión `spatial`; `read_geojson` NO existe)
+  - Metadata (columnas, count) vía catálogo (`information_schema.columns`, `COUNT(*)`).
+  - Datos: reusa `cell_value_to_string` / `cell_value_to_pretty` de duckdb.rs →
+    tipos avanzados, compuestos expandidos, JSON pretty, geometría como WKB, TODO igual que
+    el backend DuckDB nativo.
+  - `object_sql` expone la DDL real de la vista virtual (para el modal `;`).
+  - `query_free`/`count_free` para SQL libre del usuario (modal `:`).
+- **Adapter**: `FileAdapter` expone un único objeto `"table"` = `dataset_name(path)`;
+  "view"/"index"/"trigger" → `[]`; FKs vacías; `row_offset_of` → `None`.
+- **Resolución**: `db::resolver::resolve_backend` → `kind_for(path)` → `FileAdapter`.
+- **Panel Fuentes**: `scan_cwd_databases` incluye todas las extensiones; `db_type_mark`
+  añade marcas `C` (csv), `T` (tsv), `P` (parquet/pq), `J` (json/jsonl/ndjson), `G` (geojson/gpkg).
+  El handler `Enter/click` en `handle_sidebar_click` acepta las extensiones (delega al resolver).
+- **Tests**: 2 unitarios (`kind_y_nombre_se_deducen_de_la_extension`,
+  `object_sql_muestra_la_vista_virtual`, `dataset_virtual_lee_un_csv_temporal`) + 1 smoke
+  `#[ignore]` (`smoke_archivos_de_datos`) contra archivos reales en `/tmp/opencode/`
+  (parquet, csv, json, geojson, gpkg — 3 filas cada uno, geojson/gpkg con 3 features).
+  Total: 94 tests verdes + 3 ignored.
+- **Known issue**: `table_rows` / `table_data_rows_pretty` sobre **geojson** fallan con
+  `TransactionContext::ActiveTransaction called without active transaction` (bug interno
+  de duckdb-rs con `st_read` + queries de datos en la misma conexión que ya cargó
+  `spatial`). Catálogo (count, columnas) y query libre SÍ funcionan. gpkg no afectado.
+  Workaround: usar el modal `:` con SQL sobre el dataset (`SELECT * FROM "lugares"`).
+
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |

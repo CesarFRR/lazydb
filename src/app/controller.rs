@@ -337,6 +337,11 @@ fn db_type_mark(value: &str) -> char {
         let ext = std::path::Path::new(value).extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext.to_ascii_lowercase().as_str() {
             "duckdb" | "ddb" => 'D',
+            "csv" => 'C',
+            "tsv" => 'T',
+            "parquet" | "pq" => 'P',
+            "json" | "jsonl" | "ndjson" => 'J',
+            "geojson" | "gpkg" => 'G',
             _ => '▣',
         }
     }
@@ -345,10 +350,11 @@ fn db_type_mark(value: &str) -> char {
 // ── formato de items del panel Fuentes ─────────────────────────────────
 // Cada item es un string plano con marcas que el render colorea:
 //   sección:   "\u{1}LABEL"          (marcador interno, no visible)
-//   entry:     [● ][✗ ]<★|▣|D|M|P|⊙ ><texto>
+//   entry:     [● ][✗ ]<★|▣|D|M|P|⊙|C|T|J|G ><texto>
 //                     ● = conectada, ✗ = con problemas (sin marca = bien),
 //                     ★ = favorito, ▣ = sqlite, D = duckdb, M = mysql,
-//                     P = postgres, ⊙ = endpoint genérico
+//                     P = postgres, ⊙ = endpoint genérico,
+//                     C = csv, T = tsv, J = json(jsonl), G = geojson/gpkg
 // Los favoritos van al inicio de la lista sin sección propia (la ★ basta).
 // Los favoritos usan "name => path"; el resto muestra el path directo.
 
@@ -368,7 +374,8 @@ fn is_source_section(item: &str) -> bool {
 fn strip_source_marks(mut item: &str) -> &str {
     loop {
         let mut stripped = false;
-        for mark in ["● ", "★ ", "✗ ", "▣ ", "D ", "M ", "P ", "⊙ "] {
+        for mark in ["● ", "★ ", "✗ ", "▣ ", "D ", "M ", "P ", "⊙ ", "C ", "T ", "J ", "G "]
+        {
             if let Some(rest) = item.strip_prefix(mark) {
                 item = rest;
                 stripped = true;
@@ -536,8 +543,9 @@ impl SourceList<'_> {
 
 /// Escanea el directorio de trabajo actual (donde se ejecuta `cargo run` /
 /// lazydb) buscando archivos de base de datos locales: `*.db`, `*.sqlite`,
-/// `*.sqlite3` (`SQLite`) y `*.duckdb`, `*.ddb` (`DuckDB`). Devuelve los paths
-/// completos ordenados alfabéticamente.
+/// `*.sqlite3` (`SQLite`), `*.duckdb`, `*.ddb` (`DuckDB`) y archivos de datos
+/// (`*.csv`, `*.tsv`, `*.parquet`, `*.json`, `*.jsonl`, `*.geojson`,
+/// `*.gpkg`). Devuelve los paths completos ordenados alfabéticamente.
 fn scan_cwd_databases() -> Vec<String> {
     let Ok(cwd) = std::env::current_dir() else {
         return Vec::new();
@@ -553,7 +561,19 @@ fn scan_cwd_databases() -> Vec<String> {
                 && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
                     matches!(
                         ext.to_ascii_lowercase().as_str(),
-                        "db" | "sqlite" | "sqlite3" | "duckdb" | "ddb"
+                        "db" | "sqlite"
+                            | "sqlite3"
+                            | "duckdb"
+                            | "ddb"
+                            | "csv"
+                            | "tsv"
+                            | "parquet"
+                            | "pq"
+                            | "json"
+                            | "jsonl"
+                            | "ndjson"
+                            | "geojson"
+                            | "gpkg"
                     )
                 })
         })
@@ -2661,6 +2681,7 @@ impl App {
                         || ext.eq_ignore_ascii_case("sqlite3")
                         || ext.eq_ignore_ascii_case("duckdb")
                         || ext.eq_ignore_ascii_case("ddb")
+                        || crate::db::backends::file::kind_for(s).is_some()
                 }) =>
             {
                 self.connect_sqlite(s);
