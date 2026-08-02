@@ -195,6 +195,11 @@ pub fn render_data_table(
     // Usamos salto directo (no animación lineal) para evitar que N filas nuevas
     // tarden N frames en mostrarse. Cuando la selección sale del viewport,
     // el scroll salta inmediatamente a la posición que la mantiene visible.
+    //
+    // Se aplica SIEMPRE (enfocado o no): si no, la rueda sobre un panel NO
+    // enfocado mueve `selected_idx` (row 152/250 en el status) pero la vista
+    // queda congelada porque el scroll nunca acompaña (y al volver el foco la
+    // vista salta de golpe — "cambia de página" fantasma).
     let data_len = rows_hint;
     let data_selected = if selected_idx == 0 {
         0
@@ -205,7 +210,7 @@ pub fn render_data_table(
     let vp_data = viewport.saturating_sub(3); // filas de datos visibles
     let max_scroll = data_len.saturating_sub(vp_data);
 
-    let scroll = if focused && data_len > 0 && vp_data > 0 {
+    let scroll = if data_len > 0 && vp_data > 0 {
         if data_selected >= scroll_offset.saturating_add(vp_data) {
             // Selección salió por abajo → mostrar al final del viewport
             (data_selected.saturating_sub(vp_data).saturating_add(1)).min(max_scroll)
@@ -515,15 +520,14 @@ fn render_expanded(
 
     let viewport = usize::from(inner.height);
 
-    // Auto-scroll suave: solo mueve 1 línea cuando la selección sale del viewport
-    let scroll = if focused {
-        if selected_idx >= scroll_offset.saturating_add(viewport) {
-            scroll_offset.saturating_add(1)
-        } else if selected_idx < scroll_offset {
-            scroll_offset.saturating_sub(1)
-        } else {
-            scroll_offset
-        }
+    // Auto-scroll suave: solo mueve 1 línea cuando la selección sale del
+    // viewport. Se aplica SIEMPRE (enfocado o no): la rueda sobre un panel no
+    // enfocado también debe mover la vista con la selección (ver
+    // `render_data_table`).
+    let scroll = if selected_idx >= scroll_offset.saturating_add(viewport) {
+        scroll_offset.saturating_add(1)
+    } else if selected_idx < scroll_offset {
+        scroll_offset.saturating_sub(1)
     } else {
         scroll_offset
     };

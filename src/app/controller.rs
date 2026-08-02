@@ -2934,15 +2934,19 @@ impl App {
                 self.move_selection(1);
             }
         } else {
-            // Panel NO enfocado: solo desplazar vista sin cambiar foco
+            // Panel NO enfocado: mover la selección del panel hovered (sin
+            // cambiar el foco). El scroll de la vista lo ajusta el render en
+            // cada frame (panel.rs) para seguir a la selección — no se toca
+            // aquí para que la vista y el cursor nunca se desincronicen
+            // (antes el scroll manual solo bajaba en una dirección: la vista
+            // se congelaba mientras el status avanzaba de fila, y al volver
+            // el foco la vista "saltaba de página").
             let items_len = self.items_len_for(target);
             let old_idx = self.selected_idx(target);
 
-            // Actualizar scroll y selección
             {
                 let p = self.panel_mut(target);
                 if up {
-                    p.scroll_offset.set(p.scroll_offset.get().saturating_sub(1));
                     p.selected_idx =
                         p.selected_idx.saturating_sub(1).min(items_len.saturating_sub(1));
                 } else {

@@ -19,7 +19,7 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 // Render principal
 // ---------------------------------------------------------------------------
 
-pub fn render(frame: &mut Frame<'_>, app: &App) {
+pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
 
     if area.height < 3 || area.width < 12 {
@@ -45,7 +45,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             area,
             &format!("▸ {}", app.selected_object()),
             &app.row_inspector_pairs,
-            &app.inspector_scroll,
+            &mut app.inspector_scroll,
             70,
             70,
         );
@@ -69,12 +69,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     // Popup de error global (modal rojo, encima de todo — Enter/Esc/q cierra)
     if let Some(err) = &app.error {
         let title = format!(" ✗ {}", err.title);
+        let mut scratch = crate::ui::widgets::modal::ModalScroll::default();
         widgets::modal::render_lines(
             frame,
             area,
             &title,
             &[Line::from(err.body.as_str())],
-            &crate::ui::widgets::modal::ModalScroll::default(),
+            &mut scratch,
             70,
             40,
             Some(Style::default().fg(crate::ui::theme::THEME.error)),
@@ -191,7 +192,7 @@ fn render_actions_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
 // Help (modal overlay: bindings reales agrupados)
 // ---------------------------------------------------------------------------
 
-fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     use ratatui::text::Line;
 
     let sections = app.keymap.help_sections();
@@ -232,7 +233,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         area,
         "Ayuda (bindings reales — ?/esc cerrar)",
         &lines,
-        &app.help_scroll,
+        &mut app.help_scroll,
         58,
         80,
         None,

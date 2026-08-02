@@ -341,6 +341,33 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
   `render_texto_json_se_formatea_pretty` (JSON válido → pretty; texto normal y JSON
   roto intactos) → 89 verdes.
 
+### ✅ Fix scroll fantasma del modal + vista congelada del Data tab (HECHO, 2026-08-02)
+
+- **Bug 1 — "scroll fantasma" del inspector**: `ModalScroll::scroll_down()` sumaba
+  SIN límite superior; el render clampeaba el dibujo pero el ESTADO seguía creciendo
+  más allá del final. Al hacer scroll up, el contenido "tardaba" en moverse: consumía
+  el excedente fantasma antes de bajar (los mismos ticks que se hicieron scroll down
+  desde el límite).
+  - **Fix**: `ModalScroll::clamp_to(max)` — el render (`render_lines`/`render_table`)
+    clampea el offset DEL ESTADO cada frame (`&mut ModalScroll`), no solo el dibujo.
+    Cobertura total: inspector, ayuda y popup de error. El estado nunca queda sucio.
+  - `render_help`/`ui::render` pasan a `&mut App` (el render ahora corrige estado).
+  - Test `clamp_elimina_scroll_fantasma` (100 scrolls down → clamp a max → scroll up
+    reacciona al instante).
+- **Bug 2 — panel Datos congelado** (desde el rediseño de fuentes): rueda sobre el
+  panel Data con el foco en otro panel → `selected_idx` avanzaba (status "row 152/250")
+  pero la vista no bajaba. Y al volver el foco, la vista saltaba de golpe ("cambia de
+  página" fantasma, el item seleccionado aparecía abajo).
+  - **Causa raíz**: el auto-scroll de `render_data_table` y `render` solo aplicaba con
+    `if focused`; la rama "panel NO enfocado" de `on_scroll` ajustaba `scroll_offset`
+    a mano solo al SUBIR (nunca al bajar) → desincronización acumulada selección↔vista.
+  - **Fix**: el auto-scroll del render se aplica SIEMPRE (la vista sigue a la selección
+    estilo lazygit, saltos de a 1 para teclas/rueda; saltos de página solo con
+    rePag/avPag que es el comportamiento esperado). Se eliminó la manipulación manual
+    de `scroll_offset` en `on_scroll` — el render es la ÚNICA fuente de verdad del
+    scroll → imposible desincronizar.
+  - → 90 verdes.
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |

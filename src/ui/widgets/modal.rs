@@ -40,6 +40,15 @@ impl ModalScroll {
         self.offset = self.offset.saturating_add(n);
     }
 
+    /// Clampea el offset al máximo real del contenido. Lo llama el render en
+    /// cada frame (anti "scroll fantasma": si el offset creció más allá del
+    /// final, el scroll up consumiría ese excedente antes de moverse).
+    #[must_use]
+    pub fn clamp_to(&mut self, max: usize) -> usize {
+        self.offset = self.offset.min(max);
+        self.offset
+    }
+
     #[allow(clippy::missing_const_for_fn)]
     pub fn reset(&mut self) {
         self.offset = 0;
@@ -55,7 +64,7 @@ pub fn render(
     area: Rect,
     title: &str,
     lines: &[String],
-    scroll: &ModalScroll,
+    scroll: &mut ModalScroll,
     width_pct: u16,
     height_pct: u16,
 ) -> Rect {
@@ -119,13 +128,18 @@ pub fn expand_pairs(
 /// El scrollbar se dibuja DENTRO del modal (última columna del inner), no en
 /// el borde: así el hit-testing del drag es inequívoco (columna interior del
 /// modal → scroll del modal; fuera → paneles).
+///
+/// Recibe `&mut ModalScroll`: el render CLAMPEA el offset del estado al máximo
+/// real del contenido. Sin esto, el offset puede crecer más allá del final
+/// (rueda/teclas) y al hacer scroll hacia arriba el contenido "tarda" en
+/// moverse (scroll fantasma: consume el excedente antes de bajar).
 #[allow(clippy::too_many_arguments)]
 pub fn render_lines(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     lines: &[Line<'_>],
-    scroll: &ModalScroll,
+    scroll: &mut ModalScroll,
     width_pct: u16,
     height_pct: u16,
     border_style: Option<Style>,
@@ -141,8 +155,10 @@ pub fn render_lines(
     let inner = inner_area(rect);
     let visible = usize::from(inner.height.max(1));
 
-    // Clamp: nunca dejar el offset más allá del contenido
-    let offset = scroll.offset.min(lines.len().saturating_sub(visible));
+    // Clamp: nunca dejar el offset más allá del contenido. Se corrige TAMBIÉN
+    // el estado (no solo el dibujo) para que el scroll up reaccione al
+    // instante (sin scroll fantasma acumulado).
+    let offset = scroll.clamp_to(lines.len().saturating_sub(visible));
 
     // Truncar líneas al offset
     let visible_lines: Vec<Line<'_>> = lines.iter().skip(offset).take(visible).cloned().collect();
@@ -183,12 +199,15 @@ pub(crate) const fn inner_area(area: Rect) -> Rect {
 /// El scrollbar se dibuja DENTRO del modal (última columna del inner) y el
 /// `TableState` usa `with_offset` con el MISMO offset del scrollbar manual:
 /// así la tabla y la barra nunca divergen.
+///
+/// Recibe `&mut ModalScroll` por el mismo motivo que `render_lines`: el
+/// render clampea el offset del estado al máximo real (anti scroll fantasma).
 pub fn render_table(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     pairs: &[(String, String)],
-    scroll: &ModalScroll,
+    scroll: &mut ModalScroll,
     width_pct: u16,
     height_pct: u16,
 ) -> Rect {
@@ -215,8 +234,9 @@ pub fn render_table(
 
     let content_len = rows.len().saturating_add(1); // +1 header
     let visible = usize::from(inner.height.max(1));
-    // Clamp: mismo offset para tabla y scrollbar → sincronía exacta
-    let offset = scroll.offset.min(content_len.saturating_sub(visible));
+    // Clamp: mismo offset para tabla y scrollbar → sincronía exacta. También
+    // corrige el estado (anti scroll fantasma, ver `render_lines`).
+    let offset = scroll.clamp_to(content_len.saturating_sub(visible));
 
     let widths = [Constraint::Length(key_w), Constraint::Length(val_w)];
     let table = Table::new(rows, widths)
@@ -235,4 +255,34 @@ pub fn render_table(
     }
 
     inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModalScroll;
+
+    /// El scroll fantasma: offset que creció más allá del contenido debe
+    /// volver al máximo real con el clamp (para que scroll up reaccione
+    /// al instante, sin consumir el excedente).
+    #[test]
+    fn clamp_elimina_scroll_fantasma() {
+        let mut s = ModalScroll::default();
+        // Contenido: 10 líneas, viewport 5 → max offset 5.
+        for _ in 0..100 {
+            s.scroll_down();
+        }
+        assert_eq!(s.clamp_to(5), 5, "el excedente acumulado se corrige");
+        assert_eq!(s.offset, 5);
+
+        // Ya clampeado: scroll down no puede volver a inflar el offset
+        // (el render lo corregirá igual, pero el estado queda sano).
+        s.scroll_down();
+        assert_eq!(s.clamp_to(5), 5);
+        assert_eq!(s.offset, 5);
+
+        // Scroll up desde el máximo reacciona de inmediato
+        s.scroll_up();
+        assert_eq!(s.clamp_to(5), 4);
+        assert_eq!(s.offset, 4);
+    }
 }
