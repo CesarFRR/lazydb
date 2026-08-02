@@ -2255,7 +2255,9 @@ impl App {
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1); // skip header
         #[allow(clippy::cast_possible_truncation)]
         let offset = self.preview_loaded_offset + row_idx as u32;
-        let Ok(rows) = adapter.table_data_rows(&object, 1, offset) else {
+        // Celdas expandidas (multilínea): los tipos compuestos de DuckDB
+        // (list/struct/map/union/array) se muestran completos en el modal.
+        let Ok(rows) = adapter.table_data_rows_pretty(&object, 1, offset) else {
             return;
         };
 

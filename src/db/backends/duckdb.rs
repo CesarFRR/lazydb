@@ -141,6 +141,28 @@ pub fn table_data_rows(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<Row>, DbError> {
+    rows_impl(path, table_name, limit, offset, false)
+}
+
+/// Filas con celdas expandidas (multilínea) para el inspector de fila: los
+/// tipos compuestos se muestran completos (list/struct/map/union/array).
+#[allow(dead_code)]
+pub fn table_data_rows_pretty(
+    path: &str,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Row>, DbError> {
+    rows_impl(path, table_name, limit, offset, true)
+}
+
+fn rows_impl(
+    path: &str,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+    pretty: bool,
+) -> Result<Vec<Row>, DbError> {
     let conn = open_read_only(path)?;
     let escaped = table_name.replace('"', "\"\"");
     let sql = format!("SELECT * FROM \"{escaped}\" LIMIT {limit} OFFSET {offset}");
@@ -153,7 +175,9 @@ pub fn table_data_rows(
     let rows = stmt.query_map([], |row| {
         let mut values = Vec::new();
         for i in 0..col_count {
-            values.push(cell_value_to_string(row, i));
+            let cell =
+                if pretty { cell_value_to_pretty(row, i) } else { cell_value_to_string(row, i) };
+            values.push(cell);
         }
         Ok(Row { cells: values })
     })?;
@@ -392,6 +416,137 @@ pub fn cell_value_to_string(row: &duckdb::Row<'_>, i: usize) -> String {
         Ok(_) => "<otro>".to_string(),
         Err(e) => format!("<error: {e}>"),
     }
+}
+
+/// Celda expandida (multilínea) para el inspector de fila: convierte el
+/// `ValueRef` a `Value` owned y renderiza recursivamente los compuestos
+/// (list/struct/map/union/array) con indentación. Los escalares usan el
+/// mismo formato que `cell_value_to_string`.
+pub fn cell_value_to_pretty(row: &duckdb::Row<'_>, i: usize) -> String {
+    match row.get_ref(i) {
+        Ok(v) => value_to_pretty(&v.to_owned(), 0),
+        Err(e) => format!("<error: {e}>"),
+    }
+}
+
+/// Render recursivo de un `Value` owned. `indent` es la profundidad actual;
+/// los compuestos emiten `\n` + indentación por nivel.
+fn value_to_pretty(v: &duckdb::types::Value, indent: usize) -> String {
+    use duckdb::types::Value;
+    match v {
+        Value::Null => "[NULL]".to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::TinyInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::HugeInt(n) => n.to_string(),
+        Value::UHugeInt(n) => n.to_string(),
+        Value::UTinyInt(n) => n.to_string(),
+        Value::USmallInt(n) => n.to_string(),
+        Value::UInt(n) => n.to_string(),
+        Value::UBigInt(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Double(n) => n.to_string(),
+        Value::Decimal(n) => n.to_string(),
+        Value::Text(t) => t.clone(),
+        Value::Blob(b) => format!("0x{}", hex(b)),
+        Value::Geometry(b) => format!("WKB[{}B]", b.len()),
+        Value::Date32(d) => format!("{y:04}-{:02}-{:02}", month(*d), day(*d), y = year(*d)),
+        Value::Time64(tu, t) => time_to_string(*tu, *t),
+        Value::Timestamp(tu, t) => timestamp_to_string(*tu, *t),
+        Value::Interval { months, days, nanos } => interval_to_string(*months, *days, *nanos),
+        Value::Enum(s) => s.clone(),
+        Value::List(items) | Value::Array(items) => compound_to_pretty(items, indent, '[', ']'),
+        Value::Struct(map) => named_map_to_pretty(map, indent),
+        Value::Map(map) => map_to_pretty(map, indent),
+        Value::Union(inner) => {
+            format!("<union>\n{}", value_to_pretty(inner, indent + 1))
+        }
+        // Value es non-exhaustive: variantes futuras
+        _ => "<otro>".to_string(),
+    }
+}
+
+/// Lista/Array → `[elem, ...]` con un elemento por línea si hay más de uno.
+fn compound_to_pretty(
+    items: &[duckdb::types::Value],
+    indent: usize,
+    open: char,
+    close: char,
+) -> String {
+    if items.is_empty() {
+        return format!("{open}{close}");
+    }
+    let pad = "  ".repeat(indent + 1);
+    let mut out = format!("{open}\n");
+    for (i, item) in items.iter().enumerate() {
+        out.push_str(&pad);
+        out.push_str(&value_to_pretty(item, indent + 1));
+        if i + 1 < items.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(&"  ".repeat(indent));
+    out.push(close);
+    out
+}
+
+/// Struct → `{ nombre: valor, ... }` con un campo por línea.
+fn named_map_to_pretty(
+    map: &duckdb::types::OrderedMap<String, duckdb::types::Value>,
+    indent: usize,
+) -> String {
+    if map.iter().next().is_none() {
+        return "{}".to_string();
+    }
+    let pad = "  ".repeat(indent + 1);
+    let mut out = String::from("{\n");
+    let mut first = true;
+    for (k, v) in map.iter() {
+        if !first {
+            out.push(',');
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(&pad);
+        out.push_str(k);
+        out.push_str(": ");
+        out.push_str(&value_to_pretty(v, indent + 1));
+    }
+    out.push('\n');
+    out.push_str(&"  ".repeat(indent));
+    out.push('}');
+    out
+}
+
+/// Map → `{ clave: valor, ... }` (claves también pueden ser compuestas).
+fn map_to_pretty(
+    map: &duckdb::types::OrderedMap<duckdb::types::Value, duckdb::types::Value>,
+    indent: usize,
+) -> String {
+    if map.iter().next().is_none() {
+        return "{}".to_string();
+    }
+    let pad = "  ".repeat(indent + 1);
+    let mut out = String::from("{\n");
+    let mut first = true;
+    for (k, v) in map.iter() {
+        if !first {
+            out.push(',');
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(&pad);
+        out.push_str(&value_to_pretty(k, indent + 1));
+        out.push_str(": ");
+        out.push_str(&value_to_pretty(v, indent + 1));
+    }
+    out.push('\n');
+    out.push_str(&"  ".repeat(indent));
+    out.push('}');
+    out
 }
 
 /// Bytes en hexadecimal compacto.
@@ -775,6 +930,28 @@ mod tests {
                             }
                         }
                         Err(err) => println!("  ERROR REAL inspector {t}: {err:?}"),
+                    }
+                }
+            }
+
+            // Inspector expandido: celdas multilínea con compuestos completos.
+            if let Ok(tables) = adapter.list_objects_by_type("table") {
+                for t in tables {
+                    match crate::db::backends::duckdb::table_data_rows_pretty(&normalized, &t, 1, 0)
+                    {
+                        Ok(rows) => {
+                            if let Some(row) = rows.first() {
+                                for (ci, cell) in row.cells.iter().enumerate() {
+                                    if cell.contains('\n') {
+                                        println!("  EXPANDIDO {t} col{ci}:");
+                                        for line in cell.split('\n') {
+                                            println!("    | {line}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => println!("  ERROR REAL expandido {t}: {err:?}"),
                     }
                 }
             }

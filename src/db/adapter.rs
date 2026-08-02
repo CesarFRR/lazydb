@@ -28,6 +28,17 @@ pub trait DbAdapter: Send + Sync {
         offset: u32,
         order_col: Option<(&str, bool)>,
     ) -> Result<TableData, DbError>;
+    /// Filas para el inspector de fila, con celdas "expandidas": los tipos
+    /// compuestos (list/struct/map/union/array) se renderizan completos y
+    /// multilínea. Default: celdas compactas (sqlite no tiene compuestos).
+    fn table_data_rows_pretty(
+        &self,
+        table_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Row>, DbError> {
+        self.table_data_rows(table_name, limit, offset)
+    }
     fn foreign_keys(&self, table_name: &str) -> Result<Vec<ForeignKey>, DbError>;
     fn row_offset_of(
         &self,

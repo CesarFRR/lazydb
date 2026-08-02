@@ -155,11 +155,19 @@ pub fn render_table(
     let header =
         Row::new(["Columna", "Valor"]).style(Style::default().fg(THEME.selection)).height(1);
 
-    // Expandir pares en filas: valor largo → múltiples filas
+    // Expandir pares en filas: valor largo → múltiples filas. Primero se
+    // respetan los saltos de línea explícitos (valores expandidos del
+    // inspector: structs/maps/lists multilínea) y luego se hace wrap.
     let mut rows: Vec<Row<'_>> = Vec::new();
     for (k, v) in pairs {
         let key = crate::ui::widgets::panel::truncate_middle(k, key_w as usize);
-        let val_lines = crate::ui::widgets::panel::wrap_text(v, val_w as usize);
+        let mut val_lines: Vec<String> = Vec::new();
+        for part in v.split('\n') {
+            val_lines.extend(crate::ui::widgets::panel::wrap_text(part, val_w as usize));
+        }
+        if val_lines.is_empty() {
+            val_lines.push(String::new());
+        }
         for (i, line) in val_lines.into_iter().enumerate() {
             let col0 = if i == 0 { key.clone() } else { String::new() };
             rows.push(Row::new(vec![col0, line]));

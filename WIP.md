@@ -293,6 +293,24 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
   incluye fecha pre-1970) + smoke ampliado con el path del inspector sobre ambos `.duckdb`
   reales → 87 verdes.
 
+### ✅ Tipos compuestos expandidos en el inspector de fila (HECHO, 2026-08-02)
+
+- **Idea del usuario**: los placeholders `<struct>`/`<map>`/`<union>`/`<array>` no caben
+  en una celda, pero el inspector de fila (modal con scroll) sí tiene espacio → mostrar
+  el contenido COMPLETO con indentación al navegar filas con ↑/↓.
+- `cell_value_to_pretty(row, i)` → `ValueRef::to_owned()` → `value_to_pretty` recursivo:
+  - List/Array → `[elem, ...]` un elemento por línea (anidado funciona)
+  - Struct → `{ campo: valor, ... }` con indentación por nivel (structs anidados ok)
+  - Map → `{ clave: valor, ... }`
+  - Union → `<union>` + contenido indentado
+  - Escalares → mismo formato que `cell_value_to_string`
+- Contrato: nuevo método `DbAdapter::table_data_rows_pretty` (default delega al compacto;
+  sqlite no cambia). El controller lo usa SOLO en `refresh_row_inspector`.
+- Modal `render_table` ahora parte por `\n` explícito ANTES de `wrap_text` (los valores
+  expandidos son multilínea; sin esto se rompía el wrap por caracteres).
+- Smoke ampliado: `estructuras_complejas` de `mi_test_db.duckdb` muestra list de listas,
+  struct con struct anidado (contacto), map y union expandidos.
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |
