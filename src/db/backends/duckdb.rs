@@ -3,8 +3,12 @@ use duckdb::{Connection, OptionalExt, types::ValueRef};
 use crate::db::{Column, ColumnInfo, DbError, Row, TableData};
 
 /// Lista objetos por tipo ('table', 'view', 'index', 'trigger').
-/// `DuckDB` expone el catálogo vía `information_schema` (tablas/vistas) y
-/// `duckdb_indexes()/duckdb_triggers()` para los avanzados.
+/// `DuckDB` expone el catálogo vía `information_schema` (tablas) y
+/// `duckdb_views()`/`duckdb_indexes()` para el resto. Desde 1.5.x:
+/// - las vistas internas (`duckdb_*`, `sqlite_master`, ...) viven en schema
+///   `main` y se filtran con la columna `internal` de `duckdb_views()`;
+/// - los triggers ya NO existen en el motor (`duckdb_triggers()` fue removida),
+///   por lo que "trigger" devuelve siempre una lista vacía.
 pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>, DbError> {
     let conn = open_read_only(path)?;
     let sql = match object_type {
@@ -14,16 +18,17 @@ pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>
                     ORDER BY table_name"
         }
         "view" => {
-            "SELECT table_name FROM information_schema.views
-                   WHERE table_schema = 'main'
-                   ORDER BY table_name"
+            "SELECT view_name FROM duckdb_views()
+                    WHERE schema_name = 'main' AND NOT internal
+                    ORDER BY view_name"
         }
         "index" => {
             "SELECT index_name FROM duckdb_indexes()
                     WHERE schema_name = 'main'
                     ORDER BY index_name"
         }
-        "trigger" => "SELECT trigger_name FROM duckdb_triggers() ORDER BY trigger_name",
+        // DuckDB 1.5.x no soporta triggers (duckdb_triggers() ya no existe).
+        "trigger" => return Ok(Vec::new()),
         other => return Err(DbError::Sqlite(format!("tipo de objeto no soportado: {other}"))),
     };
 
@@ -38,12 +43,11 @@ pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>
 }
 
 /// Objetos avanzados (índices y triggers) en formato `tipo:nombre`.
+/// Solo índices: `DuckDB` 1.5.x eliminó los triggers.
 pub fn list_advanced_objects(path: &str) -> Result<Vec<String>, DbError> {
     let conn = open_read_only(path)?;
     let mut stmt = conn.prepare(
         "SELECT 'index:' || index_name FROM duckdb_indexes() WHERE schema_name = 'main'
-         UNION ALL
-         SELECT 'trigger:' || trigger_name FROM duckdb_triggers()
          ORDER BY 1",
     )?;
 
@@ -579,5 +583,43 @@ mod tests {
         }
         let fks = foreign_keys(path, "data").expect("fks");
         println!("FKs de data: {fks:?}");
+    }
+
+    /// Smoke test replicando el flujo EXACTO de la UI (`normalize_path` +
+    /// resolver + catálogo) sobre ambos archivos reales del usuario, con el
+    /// error real visible si algo falla.
+    #[test]
+    #[ignore = "requiere los .duckdb del usuario en disco"]
+    fn smoke_flujo_ui_completo() {
+        for path in [
+            "/home/cesar/dev/lazydb/fw2-aai_Latn.duckdb",
+            "/home/cesar/dev/lazydb/mi_test_db.duckdb",
+        ] {
+            println!("=== {path} ===");
+            let normalized = crate::paths::normalize_path(path);
+            println!("normalize_path → {normalized}");
+            let adapter = crate::db::resolver::resolve_backend(&normalized)
+                .expect("resolver debe reconocer duckdb");
+            match adapter.list_objects_by_type("table") {
+                Ok(tables) => println!("  TABLAS: {tables:?}"),
+                Err(err) => println!("  ERROR REAL: {err:?}"),
+            }
+            match adapter.list_objects_by_type("view") {
+                Ok(views) => println!("  VISTAS: {views:?}"),
+                Err(err) => println!("  ERROR REAL views: {err:?}"),
+            }
+            match adapter.list_objects_by_type("index") {
+                Ok(idx) => println!("  ÍNDICES: {idx:?}"),
+                Err(err) => println!("  ERROR REAL index: {err:?}"),
+            }
+            match adapter.list_objects_by_type("trigger") {
+                Ok(trg) => println!("  TRIGGERS: {trg:?}"),
+                Err(err) => println!("  ERROR REAL trigger: {err:?}"),
+            }
+            match adapter.list_advanced_objects() {
+                Ok(adv) => println!("  AVANZADOS: {adv:?}"),
+                Err(err) => println!("  ERROR REAL advanced: {err:?}"),
+            }
+        }
     }
 }

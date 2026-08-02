@@ -258,6 +258,23 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
   `fw2-aai_Latn.duckdb` completo desde la UI (tablas/vistas/índices/datos/DDL/FK).
 - 4 tests nuevos (count duckdb, query duckdb, query error, scan cwd) → 86 verdes.
 
+### ✅ Fix "catálogo ilegible" DuckDB 1.5 (HECHO, 2026-08-02)
+
+- **Síntoma**: tras el bump a duckdb 1.10505 (lib 1.5.5), la UI seguía fallando con
+  "no se pudo leer el catálogo" en TODOS los `.duckdb`, aunque el smoke test de tablas pasaba.
+- **Causa raíz**: `connect_sqlite` exige que tablas+vistas+avanzados devuelvan `Ok` los
+  tres. En 1.5.x, `duckdb_triggers()` **ya no existe** (DuckDB eliminó los triggers del
+  motor) → `list_advanced_objects` fallaba siempre → todo el connect abortaba.
+  El smoke test solo probaba tablas: por eso pasaba mientras la UI fallaba.
+- **Fix**: `list_advanced_objects` ahora solo lista índices; "trigger" devuelve `[]`.
+- **Bonus encontrado**: en 1.5.x las vistas internas (`duckdb_*`, `sqlite_master`,
+  `pragma_*`) viven en schema `main` (antes `system`) y se colaban en la lista de
+  vistas. Ahora se filtran con `NOT internal` de `duckdb_views()`.
+- **Lección**: verificar SIEMPRE el catálogo completo contra la versión real del motor
+  (`duckdb -c "SELECT ... FROM duckdb_functions() ..."`), no solo la ruta feliz.
+  El smoke test de la UI (`smoke_flujo_ui_completo`) replica el flujo completo
+  (normalize_path → resolver → tablas/vistas/índices/triggers/avanzados).
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |
