@@ -63,12 +63,62 @@ pub fn render(
     render_lines(frame, area, title, &styled, scroll, width_pct, height_pct, None)
 }
 
+/// Geometría centrada del modal. La comparte el render (para dibujar) y el
+/// controller (para el hit-testing del scrollbar interior y del drag).
+#[must_use]
+pub const fn geometry(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
+    let width = area.width.saturating_mul(width_pct) / 100;
+    let height = area.height.saturating_mul(height_pct) / 100;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+/// Ancho de clave y valor dentro del inner del modal (misma fórmula en el
+/// render y en el controller para que el hit-testing del drag coincida).
+#[must_use]
+pub fn table_geometry(inner: Rect) -> (u16, u16) {
+    let key_w = (inner.width.saturating_sub(3) * 40 / 100).max(8);
+    let val_w = inner.width.saturating_sub(key_w).saturating_sub(3);
+    (key_w, val_w)
+}
+
+/// Convierte pares (clave, valor) en filas ya expandidas: un valor
+/// multilínea (expandido por el inspector) se parte en varias filas. Misma
+/// lógica en el render y en el controller (para medir `content_len`).
+pub fn expand_pairs(
+    pairs: &[(String, String)],
+    key_w: usize,
+    val_w: usize,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (k, v) in pairs {
+        let key = crate::ui::widgets::panel::truncate_middle(k, key_w);
+        let mut val_lines: Vec<String> = Vec::new();
+        for part in v.split('\n') {
+            val_lines.extend(crate::ui::widgets::panel::wrap_text(part, val_w));
+        }
+        if val_lines.is_empty() {
+            val_lines.push(String::new());
+        }
+        for (i, line) in val_lines.into_iter().enumerate() {
+            let col0 = if i == 0 { key.clone() } else { String::new() };
+            out.push((col0, line));
+        }
+    }
+    out
+}
+
 /// Renderiza un modal centrado con líneas ya estilizadas (`Line`/`Span`).
 ///
 /// `border_style: None` usa el borde neutro del tema; `Some(style)` permite
 /// colores semánticos (rojo para popups de error, etc.).
 ///
 /// Devuelve el inner rect (área de contenido sin bordes) para cálculos futuros.
+///
+/// El scrollbar se dibuja DENTRO del modal (última columna del inner), no en
+/// el borde: así el hit-testing del drag es inequívoco (columna interior del
+/// modal → scroll del modal; fuera → paneles).
 #[allow(clippy::too_many_arguments)]
 pub fn render_lines(
     frame: &mut Frame<'_>,
@@ -80,11 +130,7 @@ pub fn render_lines(
     height_pct: u16,
     border_style: Option<Style>,
 ) -> Rect {
-    let width = area.width.saturating_mul(width_pct) / 100;
-    let height = area.height.saturating_mul(height_pct) / 100;
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let rect = Rect::new(x, y, width, height);
+    let rect = geometry(area, width_pct, height_pct);
 
     frame.render_widget(Clear, rect);
 
@@ -95,17 +141,23 @@ pub fn render_lines(
     let inner = inner_area(rect);
     let visible = usize::from(inner.height.max(1));
 
+    // Clamp: nunca dejar el offset más allá del contenido
+    let offset = scroll.offset.min(lines.len().saturating_sub(visible));
+
     // Truncar líneas al offset
-    let visible_lines: Vec<Line<'_>> =
-        lines.iter().skip(scroll.offset).take(visible).cloned().collect();
+    let visible_lines: Vec<Line<'_>> = lines.iter().skip(offset).take(visible).cloned().collect();
+
+    // Contenido 1 columna más angosto para dejar sitio al scrollbar interior
+    let content_rect = Rect::new(rect.x, rect.y, rect.width.saturating_sub(1), rect.height);
 
     let paragraph = Paragraph::new(visible_lines).block(block).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, rect);
+    frame.render_widget(paragraph, content_rect);
 
     // Scrollbar manual (misma lógica/estilo que los paneles: thumb de largo
-    // fijo que recorre el 100% del track)
+    // fijo que recorre el 100% del track). area reducida → queda en la última
+    // columna del inner (dentro del modal).
     if lines.len() > visible {
-        crate::ui::widgets::panel::draw_v_scrollbar(frame, rect, lines.len(), scroll.offset);
+        crate::ui::widgets::panel::draw_v_scrollbar(frame, content_rect, lines.len(), offset);
     }
 
     inner
@@ -127,6 +179,10 @@ pub(crate) const fn inner_area(area: Rect) -> Rect {
 // ---------------------------------------------------------------------------
 
 /// Renderiza un modal con tabla 2 columnas. Valores largos se parten en múltiples filas.
+///
+/// El scrollbar se dibuja DENTRO del modal (última columna del inner) y el
+/// `TableState` usa `with_offset` con el MISMO offset del scrollbar manual:
+/// así la tabla y la barra nunca divergen.
 pub fn render_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -136,11 +192,7 @@ pub fn render_table(
     width_pct: u16,
     height_pct: u16,
 ) -> Rect {
-    let width = area.width.saturating_mul(width_pct) / 100;
-    let height = area.height.saturating_mul(height_pct) / 100;
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let rect = Rect::new(x, y, width, height);
+    let rect = geometry(area, width_pct, height_pct);
 
     frame.render_widget(Clear, rect);
 
@@ -149,8 +201,7 @@ pub fn render_table(
         Block::default().title(title.to_string()).borders(Borders::ALL).border_style(border_style);
 
     let inner = inner_area(rect);
-    let key_w = (inner.width.saturating_sub(3) * 40 / 100).max(8);
-    let val_w = inner.width.saturating_sub(key_w).saturating_sub(3);
+    let (key_w, val_w) = table_geometry(inner);
 
     let header =
         Row::new(["Columna", "Valor"]).style(Style::default().fg(THEME.selection)).height(1);
@@ -158,37 +209,29 @@ pub fn render_table(
     // Expandir pares en filas: valor largo → múltiples filas. Primero se
     // respetan los saltos de línea explícitos (valores expandidos del
     // inspector: structs/maps/lists multilínea) y luego se hace wrap.
-    let mut rows: Vec<Row<'_>> = Vec::new();
-    for (k, v) in pairs {
-        let key = crate::ui::widgets::panel::truncate_middle(k, key_w as usize);
-        let mut val_lines: Vec<String> = Vec::new();
-        for part in v.split('\n') {
-            val_lines.extend(crate::ui::widgets::panel::wrap_text(part, val_w as usize));
-        }
-        if val_lines.is_empty() {
-            val_lines.push(String::new());
-        }
-        for (i, line) in val_lines.into_iter().enumerate() {
-            let col0 = if i == 0 { key.clone() } else { String::new() };
-            rows.push(Row::new(vec![col0, line]));
-        }
-    }
+    let expanded = expand_pairs(pairs, key_w as usize, val_w as usize);
+    let rows: Vec<Row<'_>> =
+        expanded.iter().map(|(k, v)| Row::new(vec![k.clone(), v.clone()])).collect();
 
     let content_len = rows.len().saturating_add(1); // +1 header
+    let visible = usize::from(inner.height.max(1));
+    // Clamp: mismo offset para tabla y scrollbar → sincronía exacta
+    let offset = scroll.offset.min(content_len.saturating_sub(visible));
+
     let widths = [Constraint::Length(key_w), Constraint::Length(val_w)];
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
-    let mut state = TableState::default().with_selected(Some(scroll.offset));
-    frame.render_stateful_widget(table, rect, &mut state);
+    let mut state = TableState::default().with_offset(offset).with_selected(Some(offset));
+    // Contenido 1 columna más angosto para dejar sitio al scrollbar interior
+    let content_rect = Rect::new(rect.x, rect.y, rect.width.saturating_sub(1), rect.height);
+    frame.render_stateful_widget(table, content_rect, &mut state);
 
-    // Scrollbar manual (misma lógica/estilo que los paneles: thumb de largo
-    // fijo que recorre el 100% del track)
-    let visible = usize::from(inner.height.max(1));
+    // Scrollbar manual dentro del modal (área reducida → última columna del inner)
     if content_len > visible {
-        crate::ui::widgets::panel::draw_v_scrollbar(frame, rect, content_len, scroll.offset);
+        crate::ui::widgets::panel::draw_v_scrollbar(frame, content_rect, content_len, offset);
     }
 
     inner

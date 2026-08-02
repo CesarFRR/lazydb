@@ -311,6 +311,36 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 - Smoke ampliado: `estructuras_complejas` de `mi_test_db.duckdb` muestra list de listas,
   struct con struct anidado (contacto), map y union expandidos.
 
+### ✅ Formato numpy/pandas + JSON pretty + scrollbar interior del modal (HECHO, 2026-08-02)
+
+- **Regla numpy/pandas (idea del usuario)**: el PRIMER nivel de una lista/array son
+  "filas" → una por línea; los niveles internos van COMPACTOS (una línea). Resultado:
+  - Matriz 2D `[[1,2],[3,4]]` → `[ [1, 2], [3, 4] ]` (2 líneas, no 6)
+  - Lista 1D `[dev, test, v1]` → una sola línea
+  - Matriz 3D → solo el primer nivel en líneas (`[[1, 2], [3, 4]]` inline por fila)
+  - Structs/maps dentro de listas aún se expanden (re-sangrados con `replace('\n', ...)`)
+  - Union: escalar → `union(valor)` inline · compuesto → bloque indentado
+- **JSON strings**: un `Value::Text` que empieza por `{`/`[` se formatea con
+  `serde_json::to_string_pretty` (nueva dependencia `serde_json = "1"`) → `payload_json`
+  de `estructuras_complejas` ya no es una línea kilométrica. Texto normal intacto.
+- **Scrollbar DENTRO del modal** (decisión final del usuario): el scrollbar vive en la
+  última columna del INNER del modal (no en el borde), donde el hit-testing es
+  inequívoco → un click en esa columna SOLO puede significar scroll del modal.
+- `modal.rs` refactorizado con geometría COMPARTIDA entre render y controller:
+  `geometry(area, w_pct, h_pct)` const fn, `table_geometry(inner) -> (key_w, val_w)`
+  const fn (key = `(w-3)*40/100` máx 8), `expand_pairs()` (split por `\n` + wrap) —
+  el controller mide `content_len` con la MISMA fórmula que dibuja el render.
+- `render_lines`/`render_table`: `content_rect = rect - 1 columna` + scrollbar interior
+  (`panel::draw_v_scrollbar`); `render_table` usa `TableState::with_offset(offset)` +
+  `with_selected(Some(offset))` → tabla y scrollbar SIEMPRE sincronizados (el
+  "scroll raro" anterior era el auto-scroll de ratatui divergiendo del scrollbar manual).
+- Drag del scrollbar del modal: `DragState::InspectorScroll { rect, content_len }`
+  (hit-testing con `geometry(70,70)` idéntica al render), jump-to-position + 1:1,
+  misma matemática que los paneles.
+- Tests: `render_compuestos_usa_regla_numpy` (lista 1D, matriz 2D/3D, vacía, union) +
+  `render_texto_json_se_formatea_pretty` (JSON válido → pretty; texto normal y JSON
+  roto intactos) → 89 verdes.
+
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
 | Motor | Crate | Tipo | Estado 2026 | Nota lazydb |

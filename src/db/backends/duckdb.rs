@@ -431,6 +431,11 @@ pub fn cell_value_to_pretty(row: &duckdb::Row<'_>, i: usize) -> String {
 
 /// Render recursivo de un `Value` owned. `indent` es la profundidad actual;
 /// los compuestos emiten `\n` + indentación por nivel.
+///
+/// Regla de listas/arrays (estilo numpy/pandas): el PRIMER nivel de la
+/// estructura son "filas" y se ponen una por línea; todo lo que esté más
+/// adentro se deja compacto en una línea. Así una matriz 2D queda:
+/// `[ [11, 12], [13, 14] ]` → cada fila en su línea.
 fn value_to_pretty(v: &duckdb::types::Value, indent: usize) -> String {
     use duckdb::types::Value;
     match v {
@@ -449,7 +454,8 @@ fn value_to_pretty(v: &duckdb::types::Value, indent: usize) -> String {
         Value::Float(n) => n.to_string(),
         Value::Double(n) => n.to_string(),
         Value::Decimal(n) => n.to_string(),
-        Value::Text(t) => t.clone(),
+        // Text que parece JSON (p.ej. payload_json) → formateado pretty
+        Value::Text(t) => pretty_json_or_plain(t),
         Value::Blob(b) => format!("0x{}", hex(b)),
         Value::Geometry(b) => format!("WKB[{}B]", b.len()),
         Value::Date32(d) => format!("{y:04}-{:02}-{:02}", month(*d), day(*d), y = year(*d)),
@@ -457,39 +463,134 @@ fn value_to_pretty(v: &duckdb::types::Value, indent: usize) -> String {
         Value::Timestamp(tu, t) => timestamp_to_string(*tu, *t),
         Value::Interval { months, days, nanos } => interval_to_string(*months, *days, *nanos),
         Value::Enum(s) => s.clone(),
-        Value::List(items) | Value::Array(items) => compound_to_pretty(items, indent, '[', ']'),
+        Value::List(items) | Value::Array(items) => list_to_pretty(items, indent),
         Value::Struct(map) => named_map_to_pretty(map, indent),
         Value::Map(map) => map_to_pretty(map, indent),
         Value::Union(inner) => {
-            format!("<union>\n{}", value_to_pretty(inner, indent + 1))
+            // Escalar → inline `union(v)`; compuesto → `union` + bloque.
+            if is_compound(inner) {
+                format!("<union>\n{}", value_to_pretty(inner, indent + 1))
+            } else {
+                format!("union({})", value_compact(inner))
+            }
         }
         // Value es non-exhaustive: variantes futuras
         _ => "<otro>".to_string(),
     }
 }
 
-/// Lista/Array → `[elem, ...]` con un elemento por línea si hay más de uno.
-fn compound_to_pretty(
-    items: &[duckdb::types::Value],
-    indent: usize,
-    open: char,
-    close: char,
-) -> String {
-    if items.is_empty() {
-        return format!("{open}{close}");
+/// ¿El valor tiene estructura interna (lista/struct/map/union)?
+const fn is_compound(v: &duckdb::types::Value) -> bool {
+    matches!(
+        v,
+        duckdb::types::Value::List(_)
+            | duckdb::types::Value::Array(_)
+            | duckdb::types::Value::Struct(_)
+            | duckdb::types::Value::Map(_)
+            | duckdb::types::Value::Union(_)
+    )
+}
+
+/// Render COMPACTO (una sola línea, sin `\n`): para filas de matrices y
+/// valores dentro de listas/structs que deben quedar inline.
+fn value_compact(v: &duckdb::types::Value) -> String {
+    use duckdb::types::Value;
+    match v {
+        Value::Null => "[NULL]".to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::TinyInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::HugeInt(n) => n.to_string(),
+        Value::UHugeInt(n) => n.to_string(),
+        Value::UTinyInt(n) => n.to_string(),
+        Value::USmallInt(n) => n.to_string(),
+        Value::UInt(n) => n.to_string(),
+        Value::UBigInt(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Double(n) => n.to_string(),
+        Value::Decimal(n) => n.to_string(),
+        Value::Text(t) => pretty_json_or_plain(t),
+        Value::Blob(b) => format!("0x{}", hex(b)),
+        Value::Geometry(b) => format!("WKB[{}B]", b.len()),
+        Value::Date32(d) => format!("{y:04}-{:02}-{:02}", month(*d), day(*d), y = year(*d)),
+        Value::Time64(tu, t) => time_to_string(*tu, *t),
+        Value::Timestamp(tu, t) => timestamp_to_string(*tu, *t),
+        Value::Interval { months, days, nanos } => interval_to_string(*months, *days, *nanos),
+        Value::Enum(s) => s.clone(),
+        Value::List(items) | Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(value_compact).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        Value::Struct(map) => {
+            let inner: Vec<String> =
+                map.iter().map(|(k, val)| format!("{k}: {}", value_compact(val))).collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Value::Map(map) => {
+            let inner: Vec<String> = map
+                .iter()
+                .map(|(k, val)| format!("{}: {}", value_compact(k), value_compact(val)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Value::Union(inner) => format!("union({})", value_compact(inner)),
+        _ => "<otro>".to_string(),
     }
+}
+
+/// Texto que parece JSON (empieza por `{` o `[`) → pretty de `serde_json`.
+/// Cualquier otro texto se devuelve tal cual.
+fn pretty_json_or_plain(t: &str) -> String {
+    let trimmed = t.trim();
+    let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+    if looks_json {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+                return pretty;
+            }
+        }
+    }
+    t.to_string()
+}
+
+/// Lista/Array → primer nivel en "filas" (una por línea); los elementos que
+/// son a su vez compuestos se dejan compactos en su línea (numpy style).
+fn list_to_pretty(items: &[duckdb::types::Value], indent: usize) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    // Todos escalares → una sola línea (p.ej. [11, 12, 13])
+    if items.iter().all(|v| !is_compound(v)) {
+        let inner: Vec<String> = items.iter().map(value_compact).collect();
+        return format!("[{}]", inner.join(", "));
+    }
+    // Hay compuestos: cada elemento es una "fila" en su propia línea
     let pad = "  ".repeat(indent + 1);
-    let mut out = format!("{open}\n");
+    let mut out = String::from("[\n");
     for (i, item) in items.iter().enumerate() {
         out.push_str(&pad);
-        out.push_str(&value_to_pretty(item, indent + 1));
+        // Elemento compuesto anidado → compacto (matriz K>1: lo interno sin
+        // saltos); struct/map sí se expanden porque son legibles así.
+        match item {
+            duckdb::types::Value::List(_) | duckdb::types::Value::Array(_) => {
+                out.push_str(&value_compact(item));
+            }
+            _ => {
+                let rendered = value_to_pretty(item, indent + 1);
+                // Sangrar las líneas internas para que la fila quede alineada
+                let rendered = rendered.replace('\n', &format!("\n{pad}"));
+                out.push_str(&rendered);
+            }
+        }
         if i + 1 < items.len() {
             out.push(',');
         }
         out.push('\n');
     }
     out.push_str(&"  ".repeat(indent));
-    out.push(close);
+    out.push(']');
     out
 }
 
@@ -853,6 +954,59 @@ mod tests {
         // Intervalo legible
         assert_eq!(interval_to_string(2, 3, 3_661_000_000_000), "2m 3d 01:01:01");
         assert_eq!(interval_to_string(0, 0, 0), "0");
+    }
+
+    #[test]
+    fn render_compuestos_usa_regla_numpy() {
+        use duckdb::types::Value;
+
+        // Lista 1D de escalares → una línea (etiquetas)
+        let v = Value::List(vec![
+            Value::Text("dev".into()),
+            Value::Text("test".into()),
+            Value::Text("v1".into()),
+        ]);
+        assert_eq!(value_to_pretty(&v, 0), "[dev, test, v1]");
+
+        // Matriz 2D → cada fila en su línea, elementos internos compactos
+        let v = Value::List(vec![
+            Value::List(vec![Value::Int(1), Value::Int(2)]),
+            Value::List(vec![Value::Int(3), Value::Int(4)]),
+        ]);
+        assert_eq!(value_to_pretty(&v, 0), "[\n  [1, 2],\n  [3, 4]\n]");
+
+        // Matriz 3D → solo el primer nivel en líneas
+        let v = Value::List(vec![
+            Value::List(vec![
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+                Value::List(vec![Value::Int(3), Value::Int(4)]),
+            ]),
+            Value::List(vec![
+                Value::List(vec![Value::Int(5), Value::Int(6)]),
+                Value::List(vec![Value::Int(7), Value::Int(8)]),
+            ]),
+        ]);
+        assert_eq!(value_to_pretty(&v, 0), "[\n  [[1, 2], [3, 4]],\n  [[5, 6], [7, 8]]\n]");
+
+        // Lista vacía
+        assert_eq!(value_to_pretty(&Value::List(vec![]), 0), "[]");
+
+        // Union con escalar → inline; con compuesto → bloque
+        assert_eq!(
+            value_to_pretty(&Value::Union(Box::new(Value::Text("texto_7".into()))), 0),
+            "union(texto_7)"
+        );
+    }
+
+    #[test]
+    fn render_texto_json_se_formatea_pretty() {
+        // Texto que parece JSON → pretty (serde_json)
+        let s = r#"{"a":1,"b":[1,2]}"#;
+        assert_eq!(pretty_json_or_plain(s), "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ]\n}");
+
+        // Texto normal → tal cual
+        assert_eq!(pretty_json_or_plain("Código-1"), "Código-1");
+        assert_eq!(pretty_json_or_plain("no es json {abierto"), "no es json {abierto");
     }
 
     /// Smoke test contra la DB de prueba real del usuario. Se ejecuta con

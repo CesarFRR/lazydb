@@ -84,11 +84,14 @@ pub enum InputMode {
 
 /// Estado de arrastre del mouse sobre una barra de scroll (click + drag).
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::enum_variant_names)] // todas las variantes son barras de scroll
 enum DragState {
     /// Arrastrando la barra de scroll horizontal del Data tab
     HScroll,
     /// Arrastrando el scrollbar vertical de un panel
     VScroll(PanelKind),
+    /// Arrastrando el scrollbar interior del modal del inspector de fila
+    InspectorScroll { rect: Rect, content_len: usize },
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3155,6 +3158,9 @@ impl App {
     /// Punto de entrada para clicks de mouse (Down). Decide si el click cae
     /// sobre una barra de scroll (inicia drag) o se procesa como click normal.
     pub fn on_mouse_down(&mut self, x: u16, y: u16, width: u16, height: u16) {
+        if self.try_start_inspector_scroll_drag(x, y, width, height) {
+            return;
+        }
         if self.try_start_h_scroll_drag(x, y, width, height) {
             return;
         }
@@ -3171,6 +3177,13 @@ impl App {
             return;
         };
         match drag {
+            DragState::InspectorScroll { rect, content_len } => {
+                let viewport = usize::from(rect.height.saturating_sub(2));
+                let max_scroll = content_len.saturating_sub(viewport);
+                let (_, track) = v_scroll_thumb_geometry(rect.height, content_len, viewport);
+                let rel = f32::from(y.saturating_sub(rect.y));
+                self.apply_inspector_drag(rel, max_scroll, track);
+            }
             DragState::HScroll => {
                 if let Some(&(_, rect)) =
                     self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
@@ -3267,6 +3280,58 @@ impl App {
         )]
         let new = (pct * max_start as f32).round() as usize;
         self.panel_mut(PanelKind::Detail).h_scroll.set(new.min(max_start));
+    }
+
+    /// ¿El click está sobre el scrollbar INTERIOR del modal del inspector?
+    /// El scrollbar vive en la última columna del inner (dentro del modal):
+    /// un click ahí solo puede significar scroll del modal, sin ambigüedad
+    /// con los scrollbars de los paneles de detrás.
+    #[allow(clippy::cast_precision_loss)]
+    fn try_start_inspector_scroll_drag(&mut self, x: u16, y: u16, width: u16, height: u16) -> bool {
+        if !self.show_row_inspector || width < 40 || height < 10 {
+            return false;
+        }
+        let rect = crate::ui::widgets::modal::geometry(Rect::new(0, 0, width, height), 70, 70);
+        // Última columna del inner (el modal se dibuja con borde: el scrollbar
+        // interior está en rect.x + rect.width - 2).
+        let sb_x = rect.x.saturating_add(rect.width).saturating_sub(2);
+        if x != sb_x || y <= rect.y || y >= rect.y.saturating_add(rect.height).saturating_sub(1) {
+            return false;
+        }
+
+        let inner = crate::ui::widgets::modal::inner_area(rect);
+        let (key_w, val_w) = crate::ui::widgets::modal::table_geometry(inner);
+        let expanded = crate::ui::widgets::modal::expand_pairs(
+            &self.row_inspector_pairs,
+            key_w as usize,
+            val_w as usize,
+        );
+        let content_len = expanded.len().saturating_add(1); // +1 header
+        let viewport = usize::from(inner.height.max(1));
+        if content_len <= viewport {
+            return false; // sin scrollbar visible
+        }
+        let max_scroll = content_len.saturating_sub(viewport);
+        let (thumb_h, track) = v_scroll_thumb_geometry(rect.height, content_len, viewport);
+
+        // Jump-to-position: thumb centrado bajo el cursor, luego 1:1
+        let rel = f32::from(y.saturating_sub(rect.y));
+        self.drag = Some(DragState::InspectorScroll { rect, content_len });
+        self.apply_inspector_drag(rel - thumb_h as f32 / 2.0, max_scroll, track);
+        true
+    }
+
+    /// Convierte la Y del mouse en offset del scroll del inspector.
+    /// Mapeo 1:1 (ver `apply_v_drag`).
+    fn apply_inspector_drag(&mut self, rel: f32, max_scroll: usize, track: f32) {
+        let pct = (rel / track.max(1.0)).clamp(0.0, 1.0);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let new = (pct * max_scroll as f32).round() as usize;
+        self.inspector_scroll.offset = new.min(max_scroll);
     }
 
     /// ¿El click está sobre el scrollbar vertical (última columna) de un panel?
