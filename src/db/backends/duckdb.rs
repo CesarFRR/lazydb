@@ -375,6 +375,8 @@ pub fn cell_value_to_string(row: &duckdb::Row<'_>, i: usize) -> String {
         Ok(ValueRef::Map(..)) => "<map>".to_string(),
         Ok(ValueRef::Union(..)) => "<union>".to_string(),
         Ok(ValueRef::Array(..)) => "<array>".to_string(),
+        // ValueRef es non-exhaustive en duckdb 1.10505: variantes futuras
+        Ok(_) => "<otro>".to_string(),
         Err(e) => format!("<error: {e}>"),
     }
 }

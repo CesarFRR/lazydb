@@ -237,6 +237,10 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 - No asumir PRAGMAs de SQLite: verificar con la CLI real antes (`duckdb file.duckdb "PRAGMA..."`)
 - Los tipos del driver pueden diferir (bool vs int en PRAGMA, List en constraints)
 - `column_names()` del Statement panica si la query no se ejecutó (distinto de rusqlite)
+- ⚠️ **FORMATO NO BACKWARD-COMPATIBLE**: un `.duckdb` creado por una versión X NO lo abre
+  un crate embebido de versión < X (DuckDB 1.4.5 no lee archivos de 1.5.x → "catálogo
+  ilegible"). Regla: el crate `duckdb` debe ir siempre a la última (~1.10505 ≈ CLI 1.5.x).
+  Verificar antes: `duckdb --version` de la CLI del sistema vs `cargo search duckdb`.
 
 ### ✅ DuckDB integrado en la UI (HECHO, 2026-08-02)
 
