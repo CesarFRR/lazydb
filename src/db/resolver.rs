@@ -4,12 +4,13 @@ use crate::db::adapter::DbAdapter;
 use crate::db::backends::duckdb_adapter::DuckdbAdapter;
 use crate::db::backends::file_adapter::FileAdapter;
 use crate::db::backends::mysql_adapter::MysqlAdapter;
+use crate::db::backends::postgres_adapter::PostgresAdapter;
 use crate::db::backends::sqlite_adapter::SqliteAdapter;
 
 /// Devuelve un adaptador para la fuente indicada o None si no se puede resolver.
 /// Detecta paths locales (*.db → sqlite, *.duckdb/*.ddb → duckdb,
 /// *.csv/*.parquet/*.json/*.geojson/*.gpkg → archivo de datos) o URLs
-/// con prefijo `sqlite://` / `duckdb://`.
+/// con prefijo `sqlite://` / `duckdb://` / `mysql://` / `postgres://`.
 #[allow(dead_code)]
 pub fn resolve_backend(source: &str) -> Option<Box<dyn DbAdapter>> {
     if let Some(rest) = source.strip_prefix("sqlite://") {
@@ -22,6 +23,10 @@ pub fn resolve_backend(source: &str) -> Option<Box<dyn DbAdapter>> {
 
     if source.starts_with("mysql://") {
         return MysqlAdapter::new(source).map(|a| Box::new(a) as Box<dyn DbAdapter>).ok();
+    }
+
+    if source.starts_with("postgres://") {
+        return PostgresAdapter::new(source).map(|a| Box::new(a) as Box<dyn DbAdapter>).ok();
     }
 
     if let Some(ext) = std::path::Path::new(source).extension() {

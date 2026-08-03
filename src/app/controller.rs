@@ -369,12 +369,14 @@ fn is_source_section(item: &str) -> bool {
     item.starts_with(SOURCE_SECTION_MARK)
 }
 
-/// ¿La URL `mysql://` incluye una base de datos explícita (`.../bd`)?
-/// Las URLs de `scan_local_servers` llegan sin BD: son servidores.
-fn mysql_url_has_database(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("mysql://") else {
-        return false;
-    };
+/// ¿La URL `mysql://` o `postgres://` incluye una base de datos explícita
+/// (`.../bd`)? Las URLs de `scan_local_servers` llegan sin BD: son servidores.
+fn server_url_has_database(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("mysql://")
+        .or_else(|| url.strip_prefix("postgres://"))
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .unwrap_or_default();
     // `host`, `host:puerto`, `user:pass@host:puerto` → sin `/` = sin BD.
     // Con `/bd` → hay base.
     rest.contains('/') && !rest.ends_with('/')
@@ -1507,7 +1509,7 @@ impl App {
             let host = url.strip_prefix("mysql://").unwrap_or(url);
             format!("mysql://root@{host}")
         };
-        let result = crate::db::backends::mysql::block_on(async {
+        let result = crate::db::rt::block_on(async {
             let (pool, db_name) = crate::db::backends::mysql::connect(&url_root)?;
             let dbs = crate::db::backends::mysql::list_databases(&pool)?;
             Ok::<(String, Vec<String>), crate::db::DbError>((db_name, dbs))
@@ -1545,7 +1547,7 @@ impl App {
             |host_port| format!("mysql://{user}:{buffer}@{host_port}"),
         );
         self.status = format!("Autenticando en {server_url}...");
-        let result = crate::db::backends::mysql::block_on(async {
+        let result = crate::db::rt::block_on(async {
             let (pool, _db_name) = crate::db::backends::mysql::connect(&url)?;
             let dbs = crate::db::backends::mysql::list_databases(&pool)?;
             Ok::<Vec<String>, crate::db::DbError>(dbs)
@@ -1565,6 +1567,77 @@ impl App {
         }
     }
 
+    /// Conexión a nivel de servidor `PostgreSQL`. Prueba primero `postgres`
+    /// SIN contraseña (instalaciones locales con trust/auth peer); si falla,
+    /// abre el prompt de contraseña con user `postgres` por defecto.
+    fn connect_postgres_server(&mut self, url: &str) {
+        self.status = format!("Conectando a {url}...");
+        // Normalizamos `postgresql://` → `postgres://` (el crate solo entiende
+        // el segundo). OJO: NO probar con user vacío (el peer auth de Postgres
+        // usa el user del SO); probar el superuser local `postgres`.
+        let scheme_normalized = if url.starts_with("postgresql://") {
+            url.replacen("postgresql://", "postgres://", 1)
+        } else {
+            url.to_string()
+        };
+        let host = scheme_normalized.strip_prefix("postgres://").unwrap_or(&scheme_normalized);
+        let url_postgres = format!("postgres://postgres@{host}");
+        let result = crate::db::rt::block_on(async {
+            let (pool, db_name) = crate::db::backends::postgres::connect(&url_postgres)?;
+            let dbs = crate::db::backends::postgres::list_databases(&pool)?;
+            Ok::<(String, Vec<String>), crate::db::DbError>((db_name, dbs))
+        });
+        match result {
+            Ok((db_name, dbs)) if dbs.is_empty() => {
+                self.status =
+                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+            }
+            Ok((_db_name, dbs)) => {
+                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.db_picker =
+                    Some(DbPickerState { server_url: scheme_normalized.clone(), dbs, idx: 0 });
+            }
+            Err(err) => {
+                tracing::warn!(url = %url, error = ?err, "servidor postgres sin acceso, pidiendo contraseña");
+                self.status = String::new();
+                self.password_prompt = Some(PasswordPromptState {
+                    server_url: scheme_normalized,
+                    user: "postgres".to_string(),
+                    buffer: String::new(),
+                });
+            }
+        }
+    }
+
+    /// Intenta conectar a la URL postgres con `user:password` recién
+    /// tipeados. Si la conexión va, lista las bases y abre el picker.
+    fn connect_postgres_server_with_password(&mut self, prompt: PasswordPromptState) {
+        let PasswordPromptState { server_url, user, buffer } = prompt;
+        let url = server_url.strip_prefix("postgres://").map_or_else(
+            || server_url.clone(),
+            |host_port| format!("postgres://{user}:{buffer}@{host_port}"),
+        );
+        self.status = format!("Autenticando en {server_url}...");
+        let result = crate::db::rt::block_on(async {
+            let (pool, _db_name) = crate::db::backends::postgres::connect(&url)?;
+            let dbs = crate::db::backends::postgres::list_databases(&pool)?;
+            Ok::<Vec<String>, crate::db::DbError>(dbs)
+        });
+        match result {
+            Ok(dbs) if dbs.is_empty() => {
+                self.status = format!("Servidor {server_url}: sin bases de usuario");
+            }
+            Ok(dbs) => {
+                self.status = format!("Servidor {server_url}: elige una base ({})", dbs.len());
+                self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
+            }
+            Err(err) => {
+                tracing::warn!(url = %server_url, error = ?err, "credenciales postgres rechazadas");
+                self.show_error("No se pudo autenticar", &err.to_string());
+            }
+        }
+    }
+
     /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
     fn connect_sqlite(&mut self, path: &str) {
@@ -1572,6 +1645,9 @@ impl App {
         // (`mysql://`, `duckdb://` remotos) no se tocan.
         let path = if path.starts_with('/') || path.starts_with("mysql://") {
             path.to_string()
+        } else if path.starts_with("postgresql://") {
+            // El crate solo entiende `postgres://`; unificar el alias aquí.
+            path.replacen("postgresql://", "postgres://", 1)
         } else {
             crate::paths::normalize_path(path)
         };
@@ -1579,8 +1655,14 @@ impl App {
         // URL mysql:// SIN base → conexión a nivel de SERVIDOR: listar los
         // esquemas (SHOW DATABASES) y dejar que el usuario elija. Las URLs
         // detectadas por `scan_local_servers` llegan sin `/bd`.
-        if path.starts_with("mysql://") && !mysql_url_has_database(&path) {
+        if path.starts_with("mysql://") && !server_url_has_database(&path) {
             self.connect_mysql_server(&path);
+            return;
+        }
+        if (path.starts_with("postgres://") || path.starts_with("postgresql://"))
+            && !server_url_has_database(&path)
+        {
+            self.connect_postgres_server(&path);
             return;
         }
         self.is_loading = true;
@@ -2204,7 +2286,11 @@ impl App {
             }
             KeyCode::Enter => {
                 let prompt = std::mem::take(&mut self.password_prompt).expect("estado presente");
-                self.connect_mysql_server_with_password(prompt);
+                if prompt.server_url.starts_with("postgres://") {
+                    self.connect_postgres_server_with_password(prompt);
+                } else {
+                    self.connect_mysql_server_with_password(prompt);
+                }
             }
             KeyCode::Backspace => {
                 state.buffer.pop();
@@ -2902,6 +2988,9 @@ impl App {
                 self.status = "Buscador de archivos .db no implementado todavia".to_string();
             }
             s if s.starts_with("mysql://") => {
+                self.connect_sqlite(s);
+            }
+            s if s.starts_with("postgres://") || s.starts_with("postgresql://") => {
                 self.connect_sqlite(s);
             }
             s if s.contains(" => ") => {
@@ -3843,16 +3932,22 @@ mod tests {
     }
 
     #[test]
-    fn mysql_url_has_database_distingue_servidor_de_bd() {
+    fn server_url_has_database_distingue_servidor_de_bd() {
         // URLs de scan_local_servers: servidor sin base
-        assert!(!mysql_url_has_database("mysql://127.0.0.1:3306"));
-        assert!(!mysql_url_has_database("mysql://127.0.0.1"));
-        assert!(!mysql_url_has_database("mysql://root:root@127.0.0.1:3306"));
+        assert!(!server_url_has_database("mysql://127.0.0.1:3306"));
+        assert!(!server_url_has_database("mysql://127.0.0.1"));
+        assert!(!server_url_has_database("mysql://root:root@127.0.0.1:3306"));
         // Con base explícita
-        assert!(mysql_url_has_database("mysql://127.0.0.1:3306/lazydb_demo"));
-        assert!(mysql_url_has_database("mysql://root:root@127.0.0.1:3306/lazydb_demo"));
-        // No-mysql no entra en el flujo
-        assert!(!mysql_url_has_database("/tmp/x.db"));
+        assert!(server_url_has_database("mysql://127.0.0.1:3306/lazydb_demo"));
+        assert!(server_url_has_database("mysql://root:root@127.0.0.1:3306/lazydb_demo"));
+        // PostgreSQL: mismo contrato, ambos prefijos
+        assert!(!server_url_has_database("postgres://127.0.0.1:5432"));
+        assert!(!server_url_has_database("postgresql://127.0.0.1"));
+        assert!(!server_url_has_database("postgres://postgres:secret@127.0.0.1:5432"));
+        assert!(server_url_has_database("postgres://127.0.0.1:5432/sakila"));
+        assert!(server_url_has_database("postgresql://user:pw@localhost:5432/mydb"));
+        // No-servidor no entra en el flujo
+        assert!(!server_url_has_database("/tmp/x.db"));
     }
 
     #[test]

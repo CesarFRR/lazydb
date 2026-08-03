@@ -481,6 +481,44 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
     `LAZYDB_MYSQL_SERVER_URL`): picker muestra `[lazydb_demo, test]`, elegir `lazydb_demo`
     carga tablas (`categories`) + vista (`view_order_summary`) → verdes.
 
+### ✅ Backend PostgreSQL + flujo servidor (HECHO, 2026-08-03)
+
+- **Crate `tokio-postgres` + `deadpool-postgres`**: `src/db/backends/postgres.rs` +
+  `postgres_adapter.rs` siguiendo el patrón de mysql (async core, wrap con `block_on`
+  compartido). Pure Rust, protocolo wire v3, sin FFI.
+- **`simple_query` para tipos avanzados**: `client.query()` usa formato binario y
+  `try_get::<Option<&str>>` falla con uuid/jsonb/point/arrays/enums/tstzrange → se
+  muestran como `<uuid>` etc. La solución: `simple_query` SIEMPRE pide formato texto → el
+  servidor envía todo formateado (UUID como `dc7c6392-...`, jsonb como `{"os":"macOS"}`,
+  arrays como `{rust}`, point `(x,y)`, timestamptz ISO). Sin cascadas manuales.
+- `connect(url)` → `(Pool, String)` con BD opcional (`.get_dbname()`).
+  `list_databases` = `SELECT datname FROM pg_database WHERE datistemplate = false`
+  (excluye `template0`/`template1`, incluye `postgres`).
+- Catálogo: tablas/vistas/índices vía `information_schema` + `pg_indexes` (triggers → `[]`).
+  `object_sql`: vistas → `pg_get_viewdef`; tablas → CREATE TABLE reconstruido desde
+  `information_schema.columns` + PK de `table_constraints`.
+- **`rt.rs` compartido**: `block_on` extraído de `mysql.rs` a `src/db/rt.rs` para reusarlo
+  en ambos backends y futuros (mongo, redis).
+- **Flujo servidor** (controller.rs):
+  - `connect_sqlite`: normaliza `postgresql://` → `postgres://`; detecta `postgres://` sin
+    BD via `server_url_has_database()` (renombrado de `mysql_url_has_database`).
+  - `connect_postgres_server(url)`: prueba `postgres://postgres@host:port` (superuser
+    por defecto; sin password → pg_hba conf "trust" en localhost típico) →
+    `list_databases` → picker. Si falla → password_prompt con user `postgres`.
+  - `connect_postgres_server_with_password`: construye `postgres://user:pass@host`.
+  - `connect_selected_source` ahora dispatchea `postgres://` y `postgresql://` (el bug que
+    causaba "no pasa nada" al Enter sobre el ítem detectado).
+  - `handle_password_prompt_key` → detecta esquema postgres y llama a
+    `connect_postgres_server_with_password`.
+- **Resolver**: `postgres://` → `PostgresAdapter`. `From` impls para
+  `tokio_postgres::Error` y `deadpool_postgres::PoolError` en `error.rs`.
+- **Detector de servidores** (`servers.rs`): ya escaneaba puerto 5432 → aparece automático
+  como `postgres://127.0.0.1:5432` en el panel Fuentes.
+- Smoke `#[ignore]` `smoke_postgres_localhost` (env `LAZYDB_POSTGRES_URL`) + smoke de
+  tipos avanzados `smoke_tipos_avanzados_user_profiles` (uuid, enum, text[], point, jsonb,
+  tstzrange, timestamptz verdes) → verdes.
+- Clippy 0 + fmt OK + 103 tests verdes (7 ignored).
+
 
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 

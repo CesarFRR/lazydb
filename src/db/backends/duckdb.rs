@@ -1302,7 +1302,7 @@ mod tests {
                     Ok(dbs) => println!("  BASES: {dbs:?}"),
                     Err(err) => println!("  ERROR BASES: {err:?}"),
                 }
-                let _ = crate::db::backends::mysql::block_on(pool.disconnect());
+                let _ = crate::db::rt::block_on(pool.disconnect());
             }
             Err(err) => println!("  ERROR SERVER CONNECT: {err:?}"),
         }

@@ -53,6 +53,18 @@ impl From<mysql_async::Error> for DbError {
     }
 }
 
+impl From<tokio_postgres::Error> for DbError {
+    fn from(err: tokio_postgres::Error) -> Self {
+        Self::Sqlite(format!("PostgreSQL: {err}"))
+    }
+}
+
+impl From<deadpool_postgres::PoolError> for DbError {
+    fn from(err: deadpool_postgres::PoolError) -> Self {
+        Self::Sqlite(format!("PostgreSQL (pool): {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

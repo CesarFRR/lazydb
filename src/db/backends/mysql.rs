@@ -4,42 +4,10 @@
 //! larga duración (TCP) y se comparte entre todas las queries de una misma
 //! fuente. El adapter (`mysql_adapter.rs`) mantiene la pool lazy-init.
 
+use crate::db::rt::block_on;
 use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
 use mysql_async::prelude::*;
 use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Row as MysqlRow, Value};
-
-// ── Runtime ───────────────────────────────────────────────────────────
-//
-// El trait `DbAdapter` es síncrono, pero `mysql_async` es async. Cada
-// función pública bloquea con `block_on`. La app corre sobre
-// `#[tokio::main]`, así que YA existe un runtime cuando llamamos a estas
-// funciones síncronas. Intentar crear OUTRO runtime dentro de uno activo
-// lanza "Cannot start a runtime from within a runtime". Por eso
-// `block_on` reutiliza el runtime actual si lo hay (`Handle::current`), y
-// solo crea uno nuevo como respaldo cuando se llama fuera de tokio (por
-// ejemplo, desde el binario en CI o desde `#[tokio::test]` externo).
-
-static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
-fn fallback_runtime() -> &'static tokio::runtime::Runtime {
-    #[allow(clippy::unwrap_used)]
-    RUNTIME
-        .get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap())
-}
-
-pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        // Ya estamos dentro de un runtime (el de #[tokio::main] de la app) y
-        // muy probablemente DENTRO de un contexto async (el event loop corre
-        // en el main future). Para bloquear sin abrir un runtime anidado ni
-        // "bloquear el worker thread", usamos `block_in_place` + block_on: es
-        // la forma segura de hacer E/S bloqueante dentro de un runtime
-        // multi-thread.
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(f)),
-        // Fuera de cualquier runtime (CI, tests async externos): usar el nuestro.
-        Err(_) => fallback_runtime().block_on(f),
-    }
-}
 
 // ── Conexión ──────────────────────────────────────────────────────────
 
@@ -481,7 +449,7 @@ mod tests {
         });
         drop(rt);
         // Fuera de runtime (caso: smoke por env var, #[test] normal): tampoco.
-        let x = crate::db::backends::mysql::block_on(async { 7 });
+        let x = crate::db::rt::block_on(async { 7 });
         assert_eq!(x, 7);
     }
 }

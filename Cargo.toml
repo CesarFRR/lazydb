@@ -24,6 +24,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 duckdb = { version = "1.10505.0", features = ["bundled"] }
 fallible-streaming-iterator = "0.1.9"
 mysql_async = "0.37.0"
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
 
 [lints.rust]
 unsafe_code = "forbid"

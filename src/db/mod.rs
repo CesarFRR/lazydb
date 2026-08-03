@@ -3,6 +3,7 @@ pub mod backends;
 pub mod error;
 pub mod model;
 pub mod resolver;
+pub mod rt;
 pub mod servers;
 pub mod service;
 
