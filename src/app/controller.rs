@@ -369,6 +369,17 @@ fn is_source_section(item: &str) -> bool {
     item.starts_with(SOURCE_SECTION_MARK)
 }
 
+/// ¿La URL `mysql://` incluye una base de datos explícita (`.../bd`)?
+/// Las URLs de `scan_local_servers` llegan sin BD: son servidores.
+fn mysql_url_has_database(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("mysql://") else {
+        return false;
+    };
+    // `host`, `host:puerto`, `user:pass@host:puerto` → sin `/` = sin BD.
+    // Con `/bd` → hay base.
+    rest.contains('/') && !rest.ends_with('/')
+}
+
 /// Quita las marcas decorativas (● ★ ▣ ⊙, combinables: "● ★ x") de un item de
 /// Fuentes y devuelve el dato real (path o "name => path" para favoritos).
 fn strip_source_marks(mut item: &str) -> &str {
@@ -514,7 +525,17 @@ impl SourceList<'_> {
         }
     }
 
-    fn add_detected(&mut self) {
+    fn add_detected(&mut self, detected_servers: &[String]) {
+        // Servidores SQL locales detectados por puerto (escaneo cacheable)
+        if !detected_servers.is_empty() {
+            self.section("SERVIDORES LOCALES");
+            for server in detected_servers {
+                if !self.seen.contains(server) {
+                    self.entry(server, None);
+                }
+            }
+        }
+
         // DBs SQLite de la carpeta actual (donde se ejecuta lazydb)
         let scanned = scan_cwd_databases();
         let fresh: Vec<String> =
@@ -606,6 +627,28 @@ pub struct QueryInputState {
     pub history_idx: Option<usize>,
 }
 
+/// Pick de base de datos de un servidor MySQL/MariaDB detectado: lista de
+/// esquemas (`SHOW DATABASES`) a elegir con ↑/↓ + Enter.
+pub struct DbPickerState {
+    /// URL del servidor SIN base (p. ej. `mysql://127.0.0.1:3306`)
+    pub server_url: String,
+    /// Bases disponibles (orden que las devuelve el servidor)
+    pub dbs: Vec<String>,
+    /// Índice del esquema seleccionado
+    pub idx: usize,
+}
+
+/// Prompt de contraseña de un servidor detectado (modal de entrada de texto
+/// sin historial; Enter envía, Esc cancela).
+pub struct PasswordPromptState {
+    /// URL del servidor SIN base y SIN credenciales (p. ej. `mysql://127.0.0.1:3306`)
+    pub server_url: String,
+    /// Usuario asumido para autenticar (por defecto `root` en localhost)
+    pub user: String,
+    /// Password tipeado (chars enmascarados en pantalla)
+    pub buffer: String,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     // ── sistema de paneles ──
@@ -617,6 +660,10 @@ pub struct App {
 
     // ── datos de los paneles ──
     pub sources: Vec<String>,
+    /// Servidores SQL locales detectados por puerto (cacheados en `new`:
+    /// el escaneo es bloqueante y no debe repetirse en cada render). Cada
+    /// entrada es una URL sin credenciales, p. ej. `mysql://127.0.0.1:3306`.
+    pub detected_servers: Vec<String>,
     pub source_tab: SourceTab,
     pub tables: Vec<String>,
     pub views: Vec<String>,
@@ -687,6 +734,11 @@ pub struct App {
     /// Popup de input SQL (`:`): `Some` = abierto. El historial persistente
     /// vive en `state.query_history` (storage).
     pub query_input: Option<QueryInputState>,
+    /// Pick de base de datos de un servidor detectado (modal ↑/↓ + Enter):
+    /// `Some` = eligiendo esquema al que conectarse.
+    pub db_picker: Option<DbPickerState>,
+    /// Prompt de contraseña de un servidor detectado (modal de entrada).
+    pub password_prompt: Option<PasswordPromptState>,
     /// El preview muestra el resultado de una query libre del usuario (no el
     /// objeto seleccionado). Los scrolls infinitos y refreshes lo respetan.
     pub query_mode: bool,
@@ -730,6 +782,11 @@ impl App {
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
         let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Detección de servidores SQL locales: bloqueante (E/S de red), por
+        // eso se cachea UNA vez en el arranque. Timeout corto por puerto.
+        let detected_servers =
+            crate::db::servers::scan_local_servers(std::time::Duration::from_millis(300));
+
         tracing::debug!(
             recents = state.recents.len(),
             keymap = %keymap.binding_count(),
@@ -749,8 +806,15 @@ impl App {
             active_panel: PanelKind::Sources,
             last_sidebar_focus: PanelKind::Sources,
             layout: ComputedLayout::default(),
-            sources: Self::build_sources(&state, source_tab, None, &HashMap::new()),
+            sources: Self::build_sources(
+                &state,
+                source_tab,
+                None,
+                &HashMap::new(),
+                &detected_servers,
+            ),
             source_tab,
+            detected_servers,
             health: HashMap::new(),
             probing: HashSet::new(),
             probe_rx: Some(probe_rx),
@@ -791,6 +855,8 @@ impl App {
             help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             error: None,
             query_input: None,
+            db_picker: None,
+            password_prompt: None,
             query_mode: false,
             last_click_time: 0,
             last_click_kind: None,
@@ -961,6 +1027,7 @@ impl App {
                     self.source_tab,
                     self.db_path.as_deref(),
                     &self.health,
+                    &self.detected_servers,
                 );
             }
         }
@@ -1281,6 +1348,7 @@ impl App {
         source_tab: SourceTab,
         connected: Option<&str>,
         health: &HashMap<String, bool>,
+        detected_servers: &[String],
     ) -> Vec<String> {
         let mut list = SourceList {
             state,
@@ -1295,12 +1363,12 @@ impl App {
             SourceTab::All => {
                 list.add_favs(SourceFilter::All);
                 list.add_recents(SourceFilter::All);
-                list.add_detected();
+                list.add_detected(detected_servers);
             }
             SourceTab::Local => {
                 list.add_favs(SourceFilter::Local);
                 list.add_recents(SourceFilter::Local);
-                list.add_detected();
+                list.add_detected(detected_servers);
             }
             SourceTab::Online => {
                 list.add_favs(SourceFilter::Online);
@@ -1318,6 +1386,7 @@ impl App {
             self.source_tab,
             self.db_path.as_deref(),
             &self.health,
+            &self.detected_servers,
         );
         self.set_selected_idx(PanelKind::Sources, 0);
     }
@@ -1424,14 +1493,96 @@ impl App {
         }
     }
 
-    // ── conexión SQLite ───────────────────────────────────────────────
+    // ── conexión SQLite / servidores ──────────────────────────────────
 
+    /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
+    /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
+    fn connect_mysql_server(&mut self, url: &str) {
+        self.status = format!("Conectando a {url}...");
+        // Conexión a nivel de servidor: primero probamos `root` SIN
+        // contraseña (el caso típico de instalaciones locales sin auth).
+        // Importante: NO usar la URL tal cual (user vacío → la cuenta
+        // anónima de MariaDB solo ve la BD `test`), sino root explícito.
+        let url_root = {
+            let host = url.strip_prefix("mysql://").unwrap_or(url);
+            format!("mysql://root@{host}")
+        };
+        let result = crate::db::backends::mysql::block_on(async {
+            let (pool, db_name) = crate::db::backends::mysql::connect(&url_root)?;
+            let dbs = crate::db::backends::mysql::list_databases(&pool)?;
+            Ok::<(String, Vec<String>), crate::db::DbError>((db_name, dbs))
+        });
+        match result {
+            Ok((db_name, dbs)) if dbs.is_empty() => {
+                self.status =
+                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+            }
+            Ok((_db_name, dbs)) => {
+                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
+            }
+            Err(err) => {
+                // Sin acceso (auth o red): pedir contraseña. El usuario
+                // asumido es `root` en localhost.
+                tracing::warn!(url = %url, error = ?err, "servidor sin acceso, pidiendo contraseña");
+                self.status = String::new();
+                self.password_prompt = Some(PasswordPromptState {
+                    server_url: url.to_string(),
+                    user: "root".to_string(),
+                    buffer: String::new(),
+                });
+            }
+        }
+    }
+
+    /// Intenta conectar a la URL con `user:password` recién tipeados. Si la
+    /// conexión va, lista las bases y abre el picker.
+    fn connect_mysql_server_with_password(&mut self, prompt: PasswordPromptState) {
+        let PasswordPromptState { server_url, user, buffer } = prompt;
+        // Construye `mysql://user:pass@host:port` a partir de `mysql://host:port`
+        let url = server_url.strip_prefix("mysql://").map_or_else(
+            || server_url.clone(),
+            |host_port| format!("mysql://{user}:{buffer}@{host_port}"),
+        );
+        self.status = format!("Autenticando en {server_url}...");
+        let result = crate::db::backends::mysql::block_on(async {
+            let (pool, _db_name) = crate::db::backends::mysql::connect(&url)?;
+            let dbs = crate::db::backends::mysql::list_databases(&pool)?;
+            Ok::<Vec<String>, crate::db::DbError>(dbs)
+        });
+        match result {
+            Ok(dbs) if dbs.is_empty() => {
+                self.status = format!("Servidor {server_url}: sin bases de usuario");
+            }
+            Ok(dbs) => {
+                self.status = format!("Servidor {server_url}: elige una base ({})", dbs.len());
+                self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
+            }
+            Err(err) => {
+                tracing::warn!(url = %server_url, error = ?err, "credenciales rechazadas");
+                self.show_error("No se pudo autenticar", &err.to_string());
+            }
+        }
+    }
+
+    /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
+    /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
     fn connect_sqlite(&mut self, path: &str) {
-        // Choke point de normalización: cualquier ruta que entre aquí queda
-        // canónica (absoluta, sin ./ ni ..), igual que la que produce el
-        // escaneo. Sin esto la misma DB aparece duplicada en Fuentes y la
-        // marca ● de "conectada" nunca coincide (relativo vs absoluto).
-        let path = crate::paths::normalize_path(path);
+        // Choke point de normalización: solo para rutas de archivo. Las URLs
+        // (`mysql://`, `duckdb://` remotos) no se tocan.
+        let path = if path.starts_with('/') || path.starts_with("mysql://") {
+            path.to_string()
+        } else {
+            crate::paths::normalize_path(path)
+        };
+
+        // URL mysql:// SIN base → conexión a nivel de SERVIDOR: listar los
+        // esquemas (SHOW DATABASES) y dejar que el usuario elija. Las URLs
+        // detectadas por `scan_local_servers` llegan sin `/bd`.
+        if path.starts_with("mysql://") && !mysql_url_has_database(&path) {
+            self.connect_mysql_server(&path);
+            return;
+        }
         self.is_loading = true;
         self.status = format!("Conectando a {path}...");
 
@@ -1450,10 +1601,16 @@ impl App {
             let path_str = path.clone();
             self.state.add_recent(path_str);
             let _ = self.state.save();
-            self.sources =
-                Self::build_sources(&self.state, self.source_tab, Some(&path), &self.health);
+            self.sources = Self::build_sources(
+                &self.state,
+                self.source_tab,
+                Some(&path),
+                &self.health,
+                &self.detected_servers,
+            );
 
             self.db_path = Some(path.clone());
+            // `db_size_bytes` solo aplica a bds de archivo (mysql:// no es path)
             self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
             self.tables = tables;
             self.views = views;
@@ -2036,6 +2193,63 @@ impl App {
         }
     }
 
+    /// Teclas del prompt de contraseña (servidor detectado): Esc cancela,
+    /// Enter autentica, el resto alimenta el buffer enmascarado.
+    fn handle_password_prompt_key(&mut self, key: KeyEvent) {
+        let Some(state) = self.password_prompt.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => {
+                self.password_prompt = None;
+                self.status = "Conexión al servidor cancelada".to_string();
+            }
+            KeyCode::Enter => {
+                let prompt = std::mem::take(&mut self.password_prompt).expect("estado presente");
+                self.connect_mysql_server_with_password(prompt);
+            }
+            KeyCode::Backspace => {
+                state.buffer.pop();
+            }
+            KeyCode::Char(c) => state.buffer.push(c),
+            _ => {}
+        }
+    }
+
+    /// Teclas del picker de base de datos: ↑/↓ navegan, Enter conecta a la
+    /// base seleccionada, Esc/Esc cancela el modal.
+    fn handle_db_picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.db_picker = None;
+                self.status = "Selección de base cancelada".to_string();
+            }
+            KeyCode::Up => {
+                if let Some(p) = self.db_picker.as_mut() {
+                    p.idx = p.idx.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(p) = self.db_picker.as_mut() {
+                    let last = p.dbs.len().saturating_sub(1);
+                    p.idx = (p.idx + 1).min(last);
+                }
+            }
+            KeyCode::Enter => {
+                let Some(picker) = self.db_picker.take() else { return };
+                let Some(db) = picker.dbs.get(picker.idx).cloned() else {
+                    self.status = "No hay bases para elegir".to_string();
+                    return;
+                };
+                let mut url = picker.server_url;
+                if !url.ends_with('/') {
+                    url.push('/');
+                }
+                url.push_str(&db);
+                self.connect_sqlite(&url);
+            }
+            _ => {}
+        }
+    }
+
     /// ↑/↓ sobre el historial (estilo fish): rellena el buffer con la query
     /// seleccionada; en `step = 0` (↓) vuelve hacia la query nueva.
     fn query_history_select(&mut self, step: usize) {
@@ -2069,7 +2283,13 @@ impl App {
 
         self.state.add_query_history(&sql);
         let _ = self.state.save();
-        self.sources = Self::build_sources(&self.state, self.source_tab, Some(&path), &self.health);
+        self.sources = Self::build_sources(
+            &self.state,
+            self.source_tab,
+            Some(&path),
+            &self.health,
+            &self.detected_servers,
+        );
 
         tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query_gen + 1);
         self.query_gen += 1;
@@ -2120,6 +2340,7 @@ impl App {
             self.source_tab,
             self.db_path.as_deref(),
             &self.health,
+            &self.detected_servers,
         );
         self.status = format!("Favorito guardado: {favorite_name}");
     }
@@ -2158,6 +2379,7 @@ impl App {
             self.source_tab,
             self.db_path.as_deref(),
             &self.health,
+            &self.detected_servers,
         );
     }
 
@@ -2197,6 +2419,7 @@ impl App {
                 self.source_tab,
                 self.db_path.as_deref(),
                 &self.health,
+                &self.detected_servers,
             );
             self.status = format!("Fuente olvidada: {path}");
         }
@@ -2219,7 +2442,13 @@ impl App {
         self.query_gen += 1;
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
-        self.sources = Self::build_sources(&self.state, self.source_tab, None, &self.health);
+        self.sources = Self::build_sources(
+            &self.state,
+            self.source_tab,
+            None,
+            &self.health,
+            &self.detected_servers,
+        );
         self.set_focus(PanelKind::Sources);
         self.set_selected_idx(PanelKind::Sources, 0);
         self.status = "Base de datos cerrada".to_string();
@@ -2499,6 +2728,7 @@ impl App {
             self.source_tab,
             self.db_path.as_deref(),
             &self.health,
+            &self.detected_servers,
         );
 
         let ui_config = config::Config::load().ui;
@@ -2617,6 +2847,7 @@ impl App {
                             self.source_tab,
                             Some(path),
                             &self.health,
+                            &self.detected_servers,
                         );
                     }
                 }
@@ -2670,6 +2901,9 @@ impl App {
             "Buscar archivo .db" => {
                 self.status = "Buscador de archivos .db no implementado todavia".to_string();
             }
+            s if s.starts_with("mysql://") => {
+                self.connect_sqlite(s);
+            }
             s if s.contains(" => ") => {
                 let path = s.split_once(" => ").map(|(_, p)| p.to_string()).unwrap_or_default();
                 self.connect_sqlite(&path);
@@ -2717,6 +2951,12 @@ impl App {
             self.show_actions_menu = false;
             self.actions_menu_idx = 0;
             self.status = String::new();
+        } else if self.password_prompt.is_some() {
+            self.password_prompt = None;
+            self.status = String::new();
+        } else if self.db_picker.is_some() {
+            self.db_picker = None;
+            self.status = String::new();
         } else {
             self.should_quit = true;
         }
@@ -2743,6 +2983,18 @@ impl App {
         // incluidos chars no mapeados a ninguna acción) ──
         if self.query_input.is_some() {
             self.handle_query_input_key(key);
+            return;
+        }
+
+        // ── prompt de contraseña (modal de servidor detectado) ──
+        if self.password_prompt.is_some() {
+            self.handle_password_prompt_key(key);
+            return;
+        }
+
+        // ── pick de base de datos (modal de servidor detectado) ──
+        if self.db_picker.is_some() {
+            self.handle_db_picker_key(key);
             return;
         }
 
@@ -3591,6 +3843,19 @@ mod tests {
     }
 
     #[test]
+    fn mysql_url_has_database_distingue_servidor_de_bd() {
+        // URLs de scan_local_servers: servidor sin base
+        assert!(!mysql_url_has_database("mysql://127.0.0.1:3306"));
+        assert!(!mysql_url_has_database("mysql://127.0.0.1"));
+        assert!(!mysql_url_has_database("mysql://root:root@127.0.0.1:3306"));
+        // Con base explícita
+        assert!(mysql_url_has_database("mysql://127.0.0.1:3306/lazydb_demo"));
+        assert!(mysql_url_has_database("mysql://root:root@127.0.0.1:3306/lazydb_demo"));
+        // No-mysql no entra en el flujo
+        assert!(!mysql_url_has_database("/tmp/x.db"));
+    }
+
+    #[test]
     fn source_path_extrae_el_dato_real() {
         assert_eq!(source_path_of("★ one => /a/one.db"), "/a/one.db");
         assert_eq!(source_path_of("● ▣ /tmp/x.db"), "/tmp/x.db");
@@ -3610,7 +3875,7 @@ mod tests {
     fn build_sources_online_agrupa_favoritos_y_recents() {
         let mut state = state_de_prueba();
         state.favorites.insert("remote".to_string(), "https://remote.example/db".to_string());
-        let sources = App::build_sources(&state, SourceTab::Online, None, &HashMap::new());
+        let sources = App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[]);
 
         // Sin sección FAVORITOS: la ★ identifica al favorito, va el primero
         assert!(
@@ -3633,7 +3898,7 @@ mod tests {
     fn build_sources_pon_los_favoritos_de_primeras() {
         // En el tab All: favoritos al inicio (sin sección), luego RECIENTES
         let state = state_de_prueba(); // favorito "one => /a/one.db", recientes /a/one.db + https
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
 
         assert!(sources.first().is_some_and(|s| s.starts_with("★ one => /a/one.db")));
         let recents_idx = sources
@@ -3650,7 +3915,7 @@ mod tests {
     fn build_sources_marca_la_conectada() {
         let state = state_de_prueba();
         let sources =
-            App::build_sources(&state, SourceTab::All, Some("/a/one.db"), &HashMap::new());
+            App::build_sources(&state, SourceTab::All, Some("/a/one.db"), &HashMap::new(), &[]);
         assert!(sources.iter().any(|s| s.starts_with("● ★ one => /a/one.db")));
     }
 
@@ -3663,7 +3928,7 @@ mod tests {
         // colapsar en UNA sola entrada: el `seen` compara rutas canónicas.
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string(), "https://remote.example/db".to_string()];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
 
         let matches = sources
             .iter()
@@ -3682,7 +3947,8 @@ mod tests {
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string()];
         let connected = crate::paths::normalize_path("one.db");
-        let sources = App::build_sources(&state, SourceTab::All, Some(&connected), &HashMap::new());
+        let sources =
+            App::build_sources(&state, SourceTab::All, Some(&connected), &HashMap::new(), &[]);
         assert!(
             sources.iter().any(|s| s.starts_with(&format!("● ▣ {connected}"))),
             "la entrada absoluta debe llevar ●: {sources:?}"
@@ -3694,7 +3960,7 @@ mod tests {
         // El reciente relativo "one.db" debe mostrarse en su forma canónica.
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string()];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
         let shown = sources.iter().find_map(|s| {
             let p = source_path_of(s);
             (!is_source_section(s) && p != "Abrir sakila.db" && p != "Buscar archivo .db")
@@ -3749,7 +4015,7 @@ mod tests {
             "one.db".to_string(),
             "https://remote.example/db".to_string(),
         ];
-        let local = App::build_sources(&state, SourceTab::Local, None, &HashMap::new());
+        let local = App::build_sources(&state, SourceTab::Local, None, &HashMap::new(), &[]);
         assert!(
             local.iter().any(|s| s.starts_with("M mysql://127.0.0.1:3306/lazy")),
             "mysql de localhost debe estar en el tab Local: {local:?}"
@@ -3760,7 +4026,7 @@ mod tests {
             "lo online NO debe filtrarse al tab Local"
         );
 
-        let online = App::build_sources(&state, SourceTab::Online, None, &HashMap::new());
+        let online = App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[]);
         assert!(
             online.iter().any(|s| s.starts_with("⊙ https://remote.example/db")),
             "lo online debe estar en el tab Online: {online:?}"
@@ -3834,7 +4100,7 @@ mod tests {
         let canonical_caida = crate::paths::normalize_path("caida.db");
 
         // Sin caché → sin marcas de salud en absoluto (nada de ✓ por defecto)
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
         assert!(
             sources.iter().any(|s| s.contains(&canonical_ok) && !s.starts_with("✗ ")),
             "la fuente sana no debe llevar marca: {sources:?}"
@@ -3842,14 +4108,14 @@ mod tests {
 
         let mut health = HashMap::new();
         health.insert(canonical_caida.clone(), false);
-        let sources = App::build_sources(&state, SourceTab::All, None, &health);
+        let sources = App::build_sources(&state, SourceTab::All, None, &health, &[]);
         assert!(
             sources.iter().any(|s| s.starts_with(&format!("✗ ▣ {canonical_caida}"))),
             "fuente caída debe llevar ✗: {sources:?}"
         );
         // Conectada y caída combina ● + ✗
         let sources_connected =
-            App::build_sources(&state, SourceTab::All, Some(&canonical_caida), &health);
+            App::build_sources(&state, SourceTab::All, Some(&canonical_caida), &health, &[]);
         assert!(
             sources_connected.iter().any(|s| s.starts_with(&format!("● ✗ ▣ {canonical_caida}"))),
             "conectada + caída = '● ✗': {sources_connected:?}"
@@ -3912,7 +4178,7 @@ mod tests {
             "mysql://localhost/lazy".to_string(),
             "postgres://db.azure.com/prod".to_string(),
         ];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new());
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
         assert!(sources.iter().any(|s| s.starts_with("D ")), "DuckDB debe marcarse D");
         assert!(sources.iter().any(|s| s.starts_with("M ")), "MySQL debe marcarse M");
         assert!(sources.iter().any(|s| s.starts_with("P ")), "Postgres debe marcarse P");
@@ -4224,5 +4490,47 @@ mod tests {
                 dir.join("c.ddb").to_string_lossy().into_owned(),
             ]
         );
+    }
+
+    /// Smoke del flujo completo de servidor: `connect_mysql_server` abre el
+    /// picker con las bases reales, y elegir `lazydb_demo` conecta el catálogo.
+    /// Requiere `MariaDB` local con la env var `LAZYDB_MYSQL_URL` (ver el archivo `AGENTS.md`).
+    #[test]
+    #[ignore = "requiere MariaDB local (LAZYDB_MYSQL_URL)"]
+    fn smoke_flujo_servidor_picker_conecta_bd_real() {
+        let Ok(server_url) = std::env::var("LAZYDB_MYSQL_SERVER_URL") else {
+            return;
+        };
+        let mut app = App::new();
+        app.connect_sqlite(&server_url);
+
+        // Camino A: el primer intento sin credenciales abre el picker (no hay
+        // auth). Camino B: abre el prompt de password → autenticar con root/root.
+        if app.password_prompt.is_some() {
+            let p = app.password_prompt.take().unwrap();
+            app.connect_mysql_server_with_password(PasswordPromptState {
+                server_url: p.server_url,
+                user: "root".into(),
+                buffer: "root".into(),
+            });
+        }
+        let Some(picker) = &app.db_picker else {
+            panic!(
+                "debe abrirse el picker (prompt: {:?}, picker: {:?})",
+                app.password_prompt.is_some(),
+                app.db_picker.is_some()
+            );
+        };
+        assert!(picker.dbs.contains(&"lazydb_demo".to_string()), "bases: {:?}", picker.dbs);
+        // Elegir la BD por índice → connect_sqlite carga el catálogo
+        let idx = picker.dbs.iter().position(|d| d == "lazydb_demo").unwrap();
+        let picker = app.db_picker.take().unwrap();
+        let db = picker.dbs[idx].clone();
+        let mut url = picker.server_url;
+        url.push('/');
+        url.push_str(&db);
+        app.connect_sqlite(&url);
+        assert!(app.tables.contains(&"categories".to_string()), "tablas: {:?}", app.tables);
+        assert!(app.views.contains(&"view_order_summary".to_string()), "vistas: {:?}", app.views);
     }
 }

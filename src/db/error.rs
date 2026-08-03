@@ -47,6 +47,12 @@ impl From<tokio::task::JoinError> for DbError {
     }
 }
 
+impl From<mysql_async::Error> for DbError {
+    fn from(err: mysql_async::Error) -> Self {
+        Self::Sqlite(format!("MySQL: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

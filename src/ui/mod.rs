@@ -66,6 +66,16 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_query_input(frame, area, app);
     }
 
+    // Prompt de contraseña (servidor detectado)
+    if app.password_prompt.is_some() {
+        render_password_prompt(frame, area, app);
+    }
+
+    // Pick de base de datos (servidor detectado: SHOW DATABASES)
+    if app.db_picker.is_some() {
+        render_db_picker(frame, area, app);
+    }
+
     // Popup de error global (modal rojo, encima de todo — Enter/Esc/q cierra)
     if let Some(err) = &app.error {
         let title = format!(" ✗ {}", err.title);
@@ -189,7 +199,83 @@ fn render_actions_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 // ---------------------------------------------------------------------------
-// Help (modal overlay: bindings reales agrupados)
+// Password prompt (modal overlay: servidor detectado pide credenciales)
+// ---------------------------------------------------------------------------
+
+fn render_password_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let Some(state) = &app.password_prompt else { return };
+    let theme = &crate::ui::theme::THEME;
+
+    let width = area.width.saturating_mul(70) / 100;
+    let height = 5;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .title(format!(" Contraseña de {} ", state.user))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.selection));
+    let inner = crate::ui::widgets::modal::inner_area(rect);
+    frame.render_widget(block, rect);
+
+    // Línea del prompt: usuario + password enmascarado (asteriscos)
+    let masked: String = "*".repeat(state.buffer.chars().count());
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(format!("{}@{} ", state.user, state.server_url)),
+            Span::styled(masked, Style::default().fg(theme.text)),
+        ])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    // Hint de teclas en la última fila del inner
+    let hint_y = inner.y + inner.height.saturating_sub(1);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  [enter] conectar   [esc] cancelar",
+            Style::default().fg(theme.dim),
+        )])),
+        Rect::new(inner.x, hint_y, inner.width, 1),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DB picker (modal overlay: SHOW DATABASES de un servidor detectado)
+// ---------------------------------------------------------------------------
+
+fn render_db_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState};
+
+    let Some(state) = &app.db_picker else { return };
+    let theme = &crate::ui::theme::THEME;
+
+    let width = area.width.min(52);
+    let height = area.height.min(12);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, rect);
+
+    let items: Vec<ListItem<'_>> =
+        state.dbs.iter().map(|db| ListItem::new(format!("  {db}"))).collect();
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.idx));
+
+    let block = Block::default()
+        .title(" Elige una base de datos (↑/↓ + Enter, esc cancelar) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().fg(theme.bg).bg(theme.selection))
+        .highlight_symbol(">");
+    frame.render_stateful_widget(list, rect, &mut list_state);
+}
 // ---------------------------------------------------------------------------
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {

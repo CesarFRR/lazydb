@@ -92,6 +92,16 @@ pub fn object_sql(path: &str, object_name: &str) -> Result<String, DbError> {
 #[allow(dead_code)]
 pub fn column_names(path: &str, table_name: &str) -> Result<Vec<Column>, DbError> {
     let conn = open_read_only(path)?;
+    column_names_conn(&conn, table_name)
+}
+
+/// Igual que `column_names` pero sobre la conexión ya abierta.
+/// IMPORTANTE: usar la MISMA conexión que luego ejecuta el SELECT. Con la
+/// extensión `spatial` cargada (gpkg/geojson), abrir una segunda conexión
+/// concurrente al mismo archivo provocaba
+/// `TransactionContext::ActiveTransaction called without active transaction`
+/// al consultar filas (misma lección que file.rs).
+fn column_names_conn(conn: &Connection, table_name: &str) -> Result<Vec<Column>, DbError> {
     let escaped = table_name.replace('\'', "''");
     let sql = format!("PRAGMA table_info('{escaped}')");
     let mut stmt = conn.prepare(&sql)?;
@@ -168,24 +178,29 @@ fn rows_impl(
     let sql = format!("SELECT * FROM \"{escaped}\" LIMIT {limit} OFFSET {offset}");
     let mut stmt = conn.prepare(&sql)?;
 
-    // duckdb-rs: column_count() panica si la query no se ejecutó aún.
-    // El número de columnas se obtiene del catálogo (mismo orden que SELECT *).
-    let col_count = column_names(path, table_name)?.len();
+    // Ejecutamos ANTES de pedir metadatos: con la extensión `spatial` (geojson/
+    // gpkg), consultar el catálogo mientras el SELECT está preparado (aunque
+    // sea en la misma conexión) rompe la transacción con
+    // `ActiveTransaction called without active transaction`. Los nombres y el
+    // count se obtienen de las rows YA ejecutadas (duckdb-rs `Rows`).
+    let mut rows = stmt.query([])?;
+    let col_count = rows.as_ref().expect("stmt").column_count();
+    let col_names = rows.as_ref().expect("stmt").column_names();
 
-    let rows = stmt.query_map([], |row| {
-        let mut values = Vec::new();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        if out.len() >= limit as usize {
+            break;
+        }
+        let mut values = Vec::with_capacity(col_count);
         for i in 0..col_count {
             let cell =
                 if pretty { cell_value_to_pretty(row, i) } else { cell_value_to_string(row, i) };
             values.push(cell);
         }
-        Ok(Row { cells: values })
-    })?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+        out.push(Row { cells: values });
     }
+    let _ = col_names; // el count es lo que importa aquí; los nombres vía catálogo
     Ok(out)
 }
 
@@ -221,24 +236,34 @@ pub fn table_rows_sorted(
 
     let mut stmt = conn.prepare(&sql)?;
 
-    // duckdb-rs: column_names() panica si la query no se ejecutó aún.
-    // Obtenemos los nombres vía el catálogo (mismo orden que SELECT *).
-    let columns = column_names(path, table_name)?;
+    // Ejecutamos ANTES de pedir metadatos: con la extensión `spatial`
+    // (geojson/gpkg), consultar el catálogo mientras el SELECT está preparado
+    // rompe la transacción (`ActiveTransaction called without active
+    // transaction`). Los nombres y el count vienen de las rows ejecutadas
+    // (duckdb-rs `Rows::column_names`).
+    let mut rows = stmt.query([])?;
+    let col_count = rows.as_ref().expect("stmt").column_count();
+    let columns: Vec<Column> = rows
+        .as_ref()
+        .expect("stmt")
+        .column_names()
+        .into_iter()
+        .map(|name| Column { name, dtype: String::new() })
+        .collect();
     if columns.is_empty() {
         return Ok(TableData { columns, rows: Vec::new() });
     }
 
-    let rows = stmt.query_map([], |row| {
-        let mut values = Vec::new();
-        for i in 0..columns.len() {
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        if out.len() >= limit as usize {
+            break;
+        }
+        let mut values = Vec::with_capacity(col_count);
+        for i in 0..col_count {
             values.push(cell_value_to_string(row, i));
         }
-        Ok(Row { cells: values })
-    })?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+        out.push(Row { cells: values });
     }
     Ok(TableData { columns, rows: out })
 }
@@ -652,10 +677,12 @@ fn map_to_pretty(
 
 /// Bytes en hexadecimal compacto.
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut acc, b| {
-        acc.push_str(&format!("{b:02x}"));
-        acc
-    })
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Días desde 1970-01-01 → mes (1-12). Algoritmo `civil_from_days` (Hinnant).
@@ -1171,6 +1198,113 @@ mod tests {
                 Ok(rows) => println!("  QUERY LIBRE: {rows:?}"),
                 Err(err) => println!("  ERROR QUERY LIBRE: {err:?}"),
             }
+        }
+    }
+
+    /// Smoke de MySQL/MariaDB localhost: requiere la URL en el env
+    /// `LAZYDB_MYSQL_URL` (ej. `mysql://lazydb:lazydb123@127.0.0.1:3306/lazydb_demo`).
+    /// Creditos: no hardcodear credenciales en el repo → env var + `#[ignore]`.
+    ///
+    /// ```sql
+    /// CREATE USER IF NOT EXISTS 'lazydb'@'localhost' IDENTIFIED BY 'lazydb123';
+    /// GRANT ALL PRIVILEGES ON lazydb_demo.* TO 'lazydb'@'localhost';
+    /// FLUSH PRIVILEGES;
+    /// ```
+    #[test]
+    #[ignore = "requiere MariaDB local + LAZYDB_MYSQL_URL"]
+    fn smoke_mysql_localhost() {
+        let Some(url) = std::env::var("LAZYDB_MYSQL_URL").ok() else {
+            eprintln!("    ⚠︎ LAZYDB_MYSQL_URL no definida — omitiendo smoke MySQL");
+            return;
+        };
+        println!("=== {url} (host y user ocultos por privacidad) ===");
+        let adapter =
+            crate::db::resolver::resolve_backend(&url).expect("resolver debe reconocer mysql://");
+
+        match adapter.list_objects_by_type("table") {
+            Ok(tables) => println!("  TABLAS: {tables:?}"),
+            Err(err) => {
+                println!("  ERROR REAL: {err:?}");
+                return;
+            }
+        }
+        match adapter.list_objects_by_type("view") {
+            Ok(views) => println!("  VISTAS: {views:?}"),
+            Err(err) => println!("  ERROR VISTAS: {err:?}"),
+        }
+        match adapter.list_advanced_objects() {
+            Ok(adv) => println!("  AVANZADOS (índices+triggers): {adv:?}"),
+            Err(err) => println!("  ERROR AVANZADOS: {err:?}"),
+        }
+        match adapter.table_row_count("categories") {
+            Ok(n) => println!("  COUNT categories: {n}"),
+            Err(err) => println!("  ERROR COUNT: {err:?}"),
+        }
+        match adapter.column_names("categories") {
+            Ok(cols) => println!("  COLUMNAS categories: {cols:?}"),
+            Err(err) => println!("  ERROR COLUMNAS: {err:?}"),
+        }
+        match adapter.table_rows("categories", 3, 0) {
+            Ok(data) => {
+                for row in &data.rows {
+                    println!("    row: {row:?}");
+                }
+            }
+            Err(err) => println!("  ERROR ROWS: {err:?}"),
+        }
+        match adapter.foreign_keys("categories") {
+            Ok(fks) => println!("  FKs categories: {fks:?}"),
+            Err(err) => println!("  ERROR FK: {err:?}"),
+        }
+        // order_items tiene FKs reales (fk_items_orders, fk_items_products)
+        match adapter.foreign_keys("order_items") {
+            Ok(fks) => println!("  FKs order_items: {fks:?}"),
+            Err(err) => println!("  ERROR FKs order_items: {err:?}"),
+        }
+        // FK jump: offset de una row por valor de columna
+        match adapter.row_offset_of("products", "id", "2") {
+            Ok(off) => println!("  OFFSET products id=2: {off:?}"),
+            Err(err) => println!("  ERROR OFFSET: {err:?}"),
+        }
+        match adapter.table_columns("categories") {
+            Ok(info) => {
+                println!("  SCHEMA categories:");
+                for c in &info {
+                    println!("    {c:?}");
+                }
+            }
+            Err(err) => println!("  ERROR SCHEMA: {err:?}"),
+        }
+        match adapter.object_sql("categories") {
+            Ok(ddl) => println!("  DDL categories: {}", ddl.lines().next().unwrap_or("")),
+            Err(err) => println!("  ERROR DDL: {err:?}"),
+        }
+        match adapter.object_sql("categories") {
+            Ok(ddl) => println!("  DDL categories: {}", ddl.lines().next().unwrap_or("")),
+            Err(err) => println!("  ERROR DDL: {err:?}"),
+        }
+        match adapter.query("SELECT id, name FROM categories ORDER BY id", 5) {
+            Ok(rows) => println!("  QUERY LIBRE: {rows:?}"),
+            Err(err) => println!("  ERROR QUERY: {err:?}"),
+        }
+
+        // Conexión a nivel de SERVIDOR (sin BD): listar bases disponibles.
+        // Quitamos la BD de la URL (`.../lazydb_demo` → `.../`) para conectar
+        // solo al host y hacer SHOW DATABASES.
+        let trimmed = url.trim_end_matches('/');
+        let server_url = trimmed
+            .rfind('/')
+            .map_or_else(|| trimmed.to_string(), |idx| trimmed[..=idx].to_string());
+        match crate::db::backends::mysql::connect(&server_url) {
+            Ok((pool, db_name)) => {
+                println!("  SERVER connect db_name='{db_name}'");
+                match crate::db::backends::mysql::list_databases(&pool) {
+                    Ok(dbs) => println!("  BASES: {dbs:?}"),
+                    Err(err) => println!("  ERROR BASES: {err:?}"),
+                }
+                let _ = crate::db::backends::mysql::block_on(pool.disconnect());
+            }
+            Err(err) => println!("  ERROR SERVER CONNECT: {err:?}"),
         }
     }
 }

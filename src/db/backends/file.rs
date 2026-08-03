@@ -120,6 +120,39 @@ fn column_names_conn(conn: &Connection, table: &str) -> Result<Vec<Column>, DbEr
     Ok(out)
 }
 
+/// Columnas del dataset con su tipo real (vía `information_schema`). Distinto
+/// de `column_names_conn` solo en que conservamos el dtype crudo para
+/// detectar columnas GEOMETRY.
+#[allow(dead_code)]
+fn dataset_columns(path: &str) -> Result<Vec<Column>, DbError> {
+    let conn = open_dataset(path)?;
+    column_names_conn(&conn, &dataset_name(path))
+}
+
+/// Proyección `SELECT` sobre el dataset: `ST_AsText("col") AS "col"` para
+/// columnas `GEOMETRY`. La extensión `spatial` de `DuckDB` rompe la transacción
+/// (`ActiveTransaction called without active transaction`) al materializar el
+/// binario WKB de una geometría; convertirlas a texto la evita y además hace
+/// la celda legible en la TUI.
+fn select_projection(columns: &[Column]) -> String {
+    if columns.is_empty() {
+        return "*".to_string();
+    }
+    let mut parts = Vec::with_capacity(columns.len());
+    for col in columns {
+        let name = col.name.replace('"', "\"\"");
+        let is_geom = col.dtype.to_ascii_lowercase().starts_with("geometry")
+            || col.dtype.to_ascii_lowercase().starts_with("geography")
+            || col.dtype.to_ascii_lowercase().starts_with("bblob");
+        if is_geom {
+            parts.push(format!("ST_AsText(\"{name}\") AS \"{name}\""));
+        } else {
+            parts.push(format!("\"{name}\""));
+        }
+    }
+    parts.join(", ")
+}
+
 /// Metadata de columnas (`PRAGMA table_info`, igual que duckdb.rs).
 pub fn table_columns(path: &str) -> Result<Vec<ColumnInfo>, DbError> {
     let conn = open_dataset(path)?;
@@ -154,17 +187,22 @@ pub fn table_data_rows_pretty(path: &str, limit: u32, offset: u32) -> Result<Vec
 fn rows_impl(path: &str, limit: u32, offset: u32, pretty: bool) -> Result<Vec<Row>, DbError> {
     let conn = open_dataset(path)?;
     let table = dataset_name(path).replace('"', "\"\"");
-    let sql = format!("SELECT * FROM \"{table}\" LIMIT {limit} OFFSET {offset}");
+    // Columnas + proyección ANTES de preparar el SELECT (misma conexión):
+    // con `spatial`, el SELECT * con GEOMETRY rompe la transacción.
+    let columns = column_names_conn(&conn, &dataset_name(path))?;
+    let projection = select_projection(&columns);
+    let sql = format!("SELECT {projection} FROM \"{table}\" LIMIT {limit} OFFSET {offset}");
     let mut stmt = conn.prepare(&sql)?;
 
-    let columns = column_names_conn(&conn, &dataset_name(path))?;
-    if columns.is_empty() {
-        return Ok(Vec::new());
-    }
-    let col_count = columns.len();
+    let mut rows = stmt.query([])?;
+    let col_count = rows.as_ref().expect("stmt").column_count();
 
-    let rows = stmt.query_map([], |row| {
-        let mut values = Vec::new();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        if out.len() >= limit as usize {
+            break;
+        }
+        let mut values = Vec::with_capacity(col_count);
         for i in 0..col_count {
             let cell = if pretty {
                 crate::db::backends::duckdb::cell_value_to_pretty(row, i)
@@ -173,12 +211,7 @@ fn rows_impl(path: &str, limit: u32, offset: u32, pretty: bool) -> Result<Vec<Ro
             };
             values.push(cell);
         }
-        Ok(Row { cells: values })
-    })?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+        out.push(Row { cells: values });
     }
     Ok(out)
 }
@@ -192,6 +225,12 @@ pub fn table_rows_sorted(
 ) -> Result<TableData, DbError> {
     let conn = open_dataset(path)?;
     let table = dataset_name(path).replace('"', "\"\"");
+    // Columnas + proyección ANTES de preparar el SELECT (misma conexión):
+    // con `spatial`, el SELECT * con GEOMETRY rompe la transacción.
+    let columns = column_names_conn(&conn, &dataset_name(path))?;
+    let projection = select_projection(&columns);
+    // ORDER BY sobre la columna ORIGINAL (no sobre ST_AsText, que duplicaría
+    // la columna en el output).
     let order_clause = if let Some((col, asc)) = order_col {
         let col_esc = col.replace('"', "\"\"");
         let dir = if asc { "ASC" } else { "DESC" };
@@ -199,25 +238,23 @@ pub fn table_rows_sorted(
     } else {
         String::new()
     };
-    let sql = format!("SELECT * FROM \"{table}\"{order_clause} LIMIT {limit} OFFSET {offset}");
+    let sql =
+        format!("SELECT {projection} FROM \"{table}\"{order_clause} LIMIT {limit} OFFSET {offset}");
     let mut stmt = conn.prepare(&sql)?;
 
-    let columns = column_names_conn(&conn, &dataset_name(path))?;
-    if columns.is_empty() {
-        return Ok(TableData { columns, rows: Vec::new() });
-    }
-
-    let rows = stmt.query_map([], |row| {
-        let mut values = Vec::new();
-        for i in 0..columns.len() {
-            values.push(crate::db::backends::duckdb::cell_value_to_string(row, i));
-        }
-        Ok(Row { cells: values })
-    })?;
+    let mut rows = stmt.query([])?;
+    let col_count = rows.as_ref().expect("stmt").column_count();
 
     let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+    while let Some(row) = rows.next()? {
+        if out.len() >= limit as usize {
+            break;
+        }
+        let mut values = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            values.push(crate::db::backends::duckdb::cell_value_to_string(row, i));
+        }
+        out.push(Row { cells: values });
     }
     Ok(TableData { columns, rows: out })
 }
@@ -280,6 +317,54 @@ pub fn count_free(path: &str, sql: &str) -> Result<u32, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regresión de `ActiveTransaction called without active transaction`:
+    /// leer filas de un dataset espacial (geojson/gpkg) rompía la transacción
+    /// de `DuckDB` al materializar la columna `GEOMETRY`. La proyección con
+    /// `ST_AsText` evita el bug y hace la celda legible (WKT).
+    #[test]
+    #[ignore = "requiere archivos de ejemplo en el repo"]
+    fn filas_de_geojson_no_provocan_active_transaction() {
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/sample-featurecollection.geojson");
+        if !std::path::Path::new(p).exists() {
+            return;
+        }
+        let data = table_rows_sorted(p, 3, 0, None).expect("leer filas del geojson");
+        assert!(!data.rows.is_empty(), "el geojson debe tener filas");
+        // La columna geometry viaja como texto (WKT), no como binario roto.
+        let geom_idx = data.columns.iter().position(|c| c.name.eq_ignore_ascii_case("geom"));
+        if let Some(idx) = geom_idx {
+            for row in &data.rows {
+                if let Some(cell) = row.cells.get(idx) {
+                    assert!(
+                        cell.starts_with("POINT")
+                            || cell.starts_with("POLYGON")
+                            || cell.starts_with("LINESTRING")
+                            || cell.starts_with("MULTI")
+                            || cell.starts_with("GEOMETRY")
+                            || cell.is_empty()
+                            || cell == "NULL",
+                        "celda geométrica debe ser WKT, got: {cell:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn select_projection_envuelve_geometry_con_st_astext() {
+        let cols = vec![
+            Column { name: "id".into(), dtype: "INTEGER".into() },
+            Column { name: "geom".into(), dtype: "GEOMETRY('EPSG:4326')".into() },
+            Column { name: "nombre".into(), dtype: "VARCHAR".into() },
+        ];
+        let sql = select_projection(&cols);
+        assert!(sql.contains("ST_AsText(\"geom\")"), "got: {sql}");
+        assert!(sql.contains("\"id\""), "got: {sql}");
+        assert!(sql.contains("\"nombre\""), "got: {sql}");
+        // Sin columnas → SELECT * (fallback)
+        assert_eq!(select_projection(&[]), "*");
+    }
 
     #[test]
     fn kind_y_nombre_se_deducen_de_la_extension() {

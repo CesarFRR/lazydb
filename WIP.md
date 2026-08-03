@@ -429,6 +429,58 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
   `spatial`). Catálogo (count, columnas) y query libre SÍ funcionan. gpkg no afectado.
   Workaround: usar el modal `:` con SQL sobre el dataset (`SELECT * FROM "lugares"`).
 
+### ✅ Fix ActiveTransaction en archivos espaciales (HECHO, 2026-08-03)
+
+- **Síntoma**: leer filas (Data tab / inspector) de geojson Y gpkg (no solo geojson como se
+  creía) fallaba SIEMPRE con `ActiveTransaction called without active transaction`, incluso
+  `SELECT *` directo por query libre. COUNT(*), `information_schema.columns` y las queries
+  que NO materializaban la columna `geom GEOMETRY('EPSG:4326')` funcionaban (→ la culpa es
+  del tipo GEOMETRY, no de spatial en general).
+- **Causa raíz**: la extensión `spatial` de DuckDB abre su propia transacción interna al
+  materializar el binario WKB de una geometría en la conexión read-write (in-memory) que
+  ya cargó spatial → duckdb-rs aborta con "no active transaction".
+- **Fix** (en `file.rs` y `duckdb.rs`):
+  - `select_projection(&[Column]) -> String`: `ST_AsText("col") AS "col"` para columnas
+    `GEOMETRY`/`GEOGRAPHY` (texto WKT legible), resto entre comillas. Antes se hacía
+    `SELECT *`; ahora la proyección explícita evita materializar WKB.
+  - `rows_impl`/`table_rows_sorted` obtienen las columnas ANTES de preparar el SELECT
+    (vía `column_names_conn`, misma conexión) y construyen la proyección.
+  - En `duckdb.rs` los mismos helpers ejecutan `stmt.query()` ANTES de tocar
+    `rows.as_ref().column_count()`/`column_names()` (lección ya conocida: metadata del
+    Statement solo tras ejecutar).
+- Tests: `select_projection_envuelve_geometry_con_st_astext` (unit) + smoke
+  `filas_de_geojson_no_provocan_active_transaction` (`#[ignore]`, archivos reales) → verdes.
+
+### ✅ Backend MySQL/MariaDB + flujo de servidor (HECHO, 2026-08-03)
+
+- **Crate `mysql` (sync)**: `src/db/backends/mysql.rs` + `mysql_adapter.rs` siguiendo el
+  patrón sqlite.rs (funciones puras → Result). Validado contra MariaDB real (12.3.2 Arch):
+  `connect` (devuelve `(Pool, String)` — la BD es OPCIONAL: si la URL es solo servidor,
+  `db_name` queda `""`), `list_databases` (`SHOW DATABASES` filtrando
+  `information_schema|mysql|performance_schema|sys`), columnas, filas, count, query libre,
+  schema. Smoke `#[ignore]` `smoke_mysql_localhost` (env `LAZYDB_MYSQL_URL`).
+- **`block_on` sin runtime anidado** (bug crítico: "Cannot start a runtime from within a
+  runtime" porque la app corre sobre `#[tokio::main]`): si ya hay runtime activo →
+  `Handle::try_current()` + `tokio::task::block_in_place(|| handle.block_on(f))` (seguro en
+  multi-thread; panica en current-thread, por eso el test de regresión construye su propio
+  runtime multi-thread); si no → `fallback_runtime()` (OnceLock). Test
+  `block_on_es_reutilizable_dentro_de_un_runtime` + verificación fuera de runtime.
+- **Flujo servidor en la UI** (controller.rs):
+  - `connect_sqlite` detecta `mysql://` sin BD (`mysql_url_has_database`) → flujo servidor.
+  - `connect_mysql_server(url)`: prueba PRIMERO `mysql://root@host:port` (root sin password;
+    OJO: user vacío entra como cuenta anónima de MariaDB que solo ve la BD `test`) →
+    `list_databases` → modal `db_picker` (`DbPickerState { server_url, dbs, idx }`).
+    Si falla → modal `password_prompt` (`PasswordPromptState { server_url, user, buffer }`).
+  - `connect_mysql_server_with_password(url, user, pass)`: construye `mysql://user:pass@host`
+    y lista bases (falla → popup de error).
+  - Handlers `handle_db_picker_key` (↑/↓/Enter→`connect_sqlite(url/db)`/Esc) y
+    `handle_password_prompt_key` (Esc/Enter/Backspace/Char), interceptados en `on_key`
+    antes del mapeo; `on_ctrl_c` cierra ambos. Render: `render_db_picker`/`render_password_prompt`
+    en `ui/mod.rs` (password enmascarado `*`, hint de teclas, patrón modal lazy).
+  - Smoke `#[ignore]` `smoke_flujo_servidor_picker_conecta_bd_real` (env
+    `LAZYDB_MYSQL_SERVER_URL`): picker muestra `[lazydb_demo, test]`, elegir `lazydb_demo`
+    carga tablas (`categories`) + vista (`view_order_summary`) → verdes.
+
 
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
