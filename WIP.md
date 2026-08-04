@@ -519,6 +519,29 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
   tstzrange, timestamptz verdes) → verdes.
 - Clippy 0 + fmt OK + 103 tests verdes (7 ignored).
 
+### ✅ Inspector de fila pretty en todos los backends (HECHO, 2026-08-04)
+
+- **Nuevo módulo `src/db/pretty.rs`**: formateo compartido para datos complejos que llegan
+  como TEXTO crudo del servidor (duckdb usa tipos tipados; mysql/postgres/sqlite reciben
+  cadenas). Reglas:
+  - `pretty_json_or_plain`: texto que parece JSON (`{`/`[`) → pretty de `serde_json`;
+    cualquier otra cosa tal cual.
+  - `pretty_cell_or_plain`: JSON primero; si no parsea y empieza por `{` → parser de arrays
+    de postgres (`{a,b}`, `{{1,2},{3,4}}`, strings con comas/escapes `\"` `\\`, `NULL`) →
+    render estilo numpy/pandas de duckdb (primer nivel por línea, anidados compactos).
+  - `prettify_rows`: mapea todas las celdas de las filas (in-place).
+- `table_data_rows_pretty` implementado en `mysql.rs`, `postgres.rs` y `sqlite.rs`
+  (antes heredaban el default compacto del trait) + expuesto en sus adaptadores.
+- `duckdb.rs` reutiliza `pretty::pretty_json_or_plain` (se eliminó la copia privada).
+- **El ahorro de trabajo se mantiene**: el controller (`refresh_row_inspector`) ya llama
+  `table_data_rows_pretty(&object, 1, offset)` → solo UNA fila con offset exacto, solo al
+  abrir/navegar el modal. El pretty solo cambia el render, no la query.
+- 8 tests unitarios del formateo (JSON válido/inválido, arrays planos, matrices 2D/3D,
+  strings escapados, NULL) + smoke `smoke_row_inspector_pretty_postgres` contra
+  `user_profiles` real (uuid, jsonb, text[], point, tstzrange) → `{rust,cachyos,tui}` →
+  `[rust, cachyos, tui]`, jsonb expandido, point/tstzrange intactos.
+- Clippy 0 + fmt OK + 111 tests verdes (8 ignored).
+
 
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
