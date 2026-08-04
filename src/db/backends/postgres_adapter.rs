@@ -88,6 +88,19 @@ impl DbAdapter for PostgresAdapter {
         })
     }
 
+    fn table_data_rows_pretty(
+        &self,
+        table_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Row>, DbError> {
+        self.with_pool(|pool, db| {
+            crate::db::backends::postgres::table_data_rows_pretty(
+                pool, db, table_name, limit, offset,
+            )
+        })
+    }
+
     fn table_rows_sorted(
         &self,
         table_name: &str,

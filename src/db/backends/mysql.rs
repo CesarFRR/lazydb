@@ -337,6 +337,19 @@ pub fn table_data_rows(
     block_on(rows_async(pool, db_name, table_name, limit, offset))
 }
 
+/// Filas con celdas expandidas (multilínea) para el inspector de fila:
+/// columnas `JSON` → pretty de `serde_json`.
+pub fn table_data_rows_pretty(
+    pool: &Pool,
+    db_name: &str,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Row>, DbError> {
+    let rows = table_data_rows(pool, db_name, table_name, limit, offset)?;
+    Ok(crate::db::pretty::prettify_rows(rows))
+}
+
 pub fn table_rows_sorted(
     pool: &Pool,
     db_name: &str,

@@ -52,6 +52,15 @@ impl DbAdapter for SqliteAdapter {
         crate::db::backends::sqlite::table_data_rows(&self.path, table_name, limit, offset)
     }
 
+    fn table_data_rows_pretty(
+        &self,
+        table_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Row>, DbError> {
+        crate::db::backends::sqlite::table_data_rows_pretty(&self.path, table_name, limit, offset)
+    }
+
     fn table_rows_sorted(
         &self,
         table_name: &str,

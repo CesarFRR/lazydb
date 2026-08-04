@@ -480,7 +480,7 @@ fn value_to_pretty(v: &duckdb::types::Value, indent: usize) -> String {
         Value::Double(n) => n.to_string(),
         Value::Decimal(n) => n.to_string(),
         // Text que parece JSON (p.ej. payload_json) → formateado pretty
-        Value::Text(t) => pretty_json_or_plain(t),
+        Value::Text(t) => crate::db::pretty::pretty_json_or_plain(t),
         Value::Blob(b) => format!("0x{}", hex(b)),
         Value::Geometry(b) => format!("WKB[{}B]", b.len()),
         Value::Date32(d) => format!("{y:04}-{:02}-{:02}", month(*d), day(*d), y = year(*d)),
@@ -536,7 +536,7 @@ fn value_compact(v: &duckdb::types::Value) -> String {
         Value::Float(n) => n.to_string(),
         Value::Double(n) => n.to_string(),
         Value::Decimal(n) => n.to_string(),
-        Value::Text(t) => pretty_json_or_plain(t),
+        Value::Text(t) => crate::db::pretty::pretty_json_or_plain(t),
         Value::Blob(b) => format!("0x{}", hex(b)),
         Value::Geometry(b) => format!("WKB[{}B]", b.len()),
         Value::Date32(d) => format!("{y:04}-{:02}-{:02}", month(*d), day(*d), y = year(*d)),
@@ -563,21 +563,6 @@ fn value_compact(v: &duckdb::types::Value) -> String {
         Value::Union(inner) => format!("union({})", value_compact(inner)),
         _ => "<otro>".to_string(),
     }
-}
-
-/// Texto que parece JSON (empieza por `{` o `[`) → pretty de `serde_json`.
-/// Cualquier otro texto se devuelve tal cual.
-fn pretty_json_or_plain(t: &str) -> String {
-    let trimmed = t.trim();
-    let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
-    if looks_json {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-                return pretty;
-            }
-        }
-    }
-    t.to_string()
 }
 
 /// Lista/Array → primer nivel en "filas" (una por línea); los elementos que
@@ -1029,11 +1014,17 @@ mod tests {
     fn render_texto_json_se_formatea_pretty() {
         // Texto que parece JSON → pretty (serde_json)
         let s = r#"{"a":1,"b":[1,2]}"#;
-        assert_eq!(pretty_json_or_plain(s), "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ]\n}");
+        assert_eq!(
+            crate::db::pretty::pretty_json_or_plain(s),
+            "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ]\n}"
+        );
 
         // Texto normal → tal cual
-        assert_eq!(pretty_json_or_plain("Código-1"), "Código-1");
-        assert_eq!(pretty_json_or_plain("no es json {abierto"), "no es json {abierto");
+        assert_eq!(crate::db::pretty::pretty_json_or_plain("Código-1"), "Código-1");
+        assert_eq!(
+            crate::db::pretty::pretty_json_or_plain("no es json {abierto"),
+            "no es json {abierto"
+        );
     }
 
     /// Smoke test contra la DB de prueba real del usuario. Se ejecuta con

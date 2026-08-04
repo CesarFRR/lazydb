@@ -165,9 +165,7 @@ fn rows_from_simple_rows(msgs: Vec<tokio_postgres::SimpleQueryMessage>) -> Vec<R
     msgs.into_iter()
         .filter_map(|msg| match msg {
             tokio_postgres::SimpleQueryMessage::Row(row) => Some(Row {
-                cells: (0..row.len())
-                    .map(|i| row.get(i).unwrap_or("NULL").to_string())
-                    .collect(),
+                cells: (0..row.len()).map(|i| row.get(i).unwrap_or("NULL").to_string()).collect(),
             }),
             _ => None,
         })
@@ -213,12 +211,8 @@ async fn table_rows_sorted_async(
     );
     let rows = client.simple_query(&sql).await?;
     drop(client);
-    Ok(TableData {
-        columns,
-        rows: rows_from_simple_rows(rows),
-    })
+    Ok(TableData { columns, rows: rows_from_simple_rows(rows) })
 }
-
 
 async fn row_count_async(pool: &Pool, db_name: &str, table_name: &str) -> Result<u32, DbError> {
     let client = pool.get().await?;
@@ -439,6 +433,19 @@ pub fn table_data_rows(
     block_on(rows_async(pool, db_name, table_name, limit, offset))
 }
 
+/// Filas con celdas expandidas (multilínea) para el inspector de fila:
+/// `JSONB` y `JSON` → pretty de `serde_json`; arrays (`{a,b}`) → estilo numpy.
+pub fn table_data_rows_pretty(
+    pool: &Pool,
+    db_name: &str,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Row>, DbError> {
+    let rows = table_data_rows(pool, db_name, table_name, limit, offset)?;
+    Ok(crate::db::pretty::prettify_rows(rows))
+}
+
 pub fn table_rows_sorted(
     pool: &Pool,
     db_name: &str,
@@ -496,7 +503,7 @@ pub fn count_free(pool: &Pool, _db_name: &str, sql: &str) -> Result<u32, DbError
 #[cfg(test)]
 mod tests {
 
-        /// Regresión del helper `block_on` compartido: reutiliza el runtime activo
+    /// Regresión del helper `block_on` compartido: reutiliza el runtime activo
     /// (multi-thread, como el de la app) sin abrir uno anidado.
     #[test]
     fn block_on_reutiliza_runtime_en_postgres_path() {
@@ -597,6 +604,46 @@ mod tests {
                 }
             }
             Err(err) => println!("  ERROR SERVER connect: {err:?}"),
+        }
+    }
+
+    /// Smoke del inspector pretty contra `user_profiles` (BD de prueba con
+    /// tipos avanzados: uuid, jsonb, text[], point, tstzrange, enum).
+    /// Requiere la misma env var que `smoke_postgres_localhost`.
+    #[test]
+    #[ignore = "requiere PostgreSQL local + LAZYDB_POSTGRES_URL"]
+    fn smoke_row_inspector_pretty_postgres() {
+        let Some(url) = std::env::var("LAZYDB_POSTGRES_URL").ok() else {
+            eprintln!("    ⚠︎ LAZYDB_POSTGRES_URL no definida — omitiendo smoke pretty");
+            return;
+        };
+        println!("=== PRETTY {url} ===");
+        let adapter = crate::db::resolver::resolve_backend(&url)
+            .expect("resolver debe reconocer postgres://");
+
+        // Compacto vs pretty: el pretty debe expandir JSON y arrays
+        let compact = adapter.table_data_rows("user_profiles", 3, 0);
+        let pretty = adapter.table_data_rows_pretty("user_profiles", 3, 0);
+        match (compact, pretty) {
+            (Ok(compact_rows), Ok(pretty_rows)) => {
+                println!("  COMPACTO: {compact_rows:?}");
+                println!("  PRETTY:   {pretty_rows:?}");
+                assert!(!pretty_rows.is_empty(), "user_profiles debe tener filas");
+                // El pretty debe ser MULTILÍNEA (JSON/arrays expandidos) en
+                // alguna celda → contiene '\n' que el compacto no tiene.
+                let compact_flat: String =
+                    compact_rows.iter().flat_map(|r| r.cells.iter()).cloned().collect();
+                let pretty_flat: String =
+                    pretty_rows.iter().flat_map(|r| r.cells.iter()).cloned().collect();
+                assert_ne!(compact_flat, pretty_flat, "pretty debe diferir del compacto");
+                assert!(
+                    pretty_flat.contains('\n'),
+                    "pretty debe tener celdas multilínea (JSON/array): {pretty_flat}"
+                );
+                println!("  ✔ pretty expande tipos complejos");
+            }
+            (Err(err), _) => println!("  ERROR COMPACTO: {err:?}"),
+            (_, Err(err)) => println!("  ERROR PRETTY: {err:?}"),
         }
     }
 }

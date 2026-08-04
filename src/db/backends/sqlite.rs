@@ -152,6 +152,18 @@ pub fn table_data_rows(
     Ok(out)
 }
 
+/// Filas con celdas expandidas (multilínea) para el inspector de fila:
+/// `TEXT` con JSON → pretty de `serde_json`.
+pub fn table_data_rows_pretty(
+    path: &str,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Row>, DbError> {
+    let rows = table_data_rows(path, table_name, limit, offset)?;
+    Ok(crate::db::pretty::prettify_rows(rows))
+}
+
 /// Filas + columnas, para el preview de datos.
 pub fn table_rows(
     path: &str,
