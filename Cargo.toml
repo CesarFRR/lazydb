@@ -9,10 +9,28 @@ keywords = ["sqlite", "tui", "database", "cli"]
 categories = ["command-line-utilities", "database"]
 rust-version = "1.85"
 
+[features]
+# Interruptores de compilación por backend. Fase A: declarados con TODOS
+# activos por defecto (el build actual no cambia). Fase B: gatear el código
+# con `#[cfg(feature = "...")]` para poder compilar subconjuntos.
+#
+# `files` depende de `duckdb` porque el backend de archivos (parquet/csv/
+# json/geojson/gpkg) se lee con duckdb internamente.
+default = ["sqlite", "duckdb", "files", "mysql", "postgres"]
+sqlite  = ["dep:rusqlite"]
+duckdb  = ["dep:duckdb"]
+files   = ["duckdb"]
+mysql   = ["dep:mysql_async"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+
+# Meta-features de conveniencia: grupos por tipo de conexión
+local   = ["sqlite", "duckdb", "files"]
+remote  = ["mysql", "postgres"]
+
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.29"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 toml = "0.8"
@@ -21,11 +39,11 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 tracing-appender = "0.2.5"
 serde = { version = "1.0.229", features = ["derive"] }
-duckdb = { version = "1.10505.0", features = ["bundled"] }
+duckdb = { version = "1.10505.0", features = ["bundled"], optional = true }
 fallible-streaming-iterator = "0.1.9"
-mysql_async = "0.37.0"
-tokio-postgres = "0.7"
-deadpool-postgres = "0.14"
+mysql_async = { version = "0.37.0", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
