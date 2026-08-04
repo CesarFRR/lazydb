@@ -578,6 +578,47 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 | Embebido KV | `redb` (100% Rust) / `rust-rocksdb` | sync | ✅ | candidato caché local; JSON simple basta por ahora |
 | ❌ Evitar | `sqlx` | async | — | compile-time queries inútiles para SQL dinámico de usuario; overhead de parsing AST; decisión de arquitectura ya tomada (trait sync + spawn_blocking) |
 
+### Análisis de la comunidad — vi-mongo, tabularis, y el post del PM del driver MongoDB (2026-08-04)
+
+Investigación hecha en `Ejemplos-proyectos-de-la-comunidad/` (reindexado en graphify,
+grafo en `graphify-out/graph.json.comunidad.bak`) + Reddit r/rust.
+
+**vi-mongo (Go, tview, 200★)** — TUI para MongoDB, lo más cercano a nuestro objetivo mongo:
+- Llaves verdes `{` / `} {` como separadores de documentos en la tabla (SetReference del
+  `_id` como referencia): render de docs anidados sin JSON crudo en pantalla
+- `ListDocuments` con Limit/Skip + `CountDocuments` en goroutine con callback → misma
+  idea que nuestro "Query async" (trait sync + spawn_blocking + mpsc)
+- `ElementManager` = bus de eventos para navegación entre paneles (equivalente a nuestro
+  manager de panels/focus)
+- Keybindings en YAML recargables en caliente + **estilos/temas en YAML** (dark-blue,
+  dracula, light-forest...) → patrón copiable: temas externos sin recompilar
+- Export a **Extended JSON preservando tipos BSON** (Int64, ObjectId, Date) — importante
+  para nuestra exportación futura: no perder tipos al serializar
+- Edición de docs en `$EDITOR` externo. ⚠️ En lazydb ni siquiera hay copy en el inspector:
+  es una sugerencia futura, no una feature existente
+
+**tabularis (Tauri, Rust + React/TS web)** — cliente SQL de escritorio, NO TUI:
+- Monorepo enorme (164 archivos Rust en src-tauri/src) con plugins (.claude/ skills,
+  plugin-api, manifest checklist): arquitectura de plugins bien documentada
+- `packages/explain` (Explain UI con diagnósticos), AI activities (sessions/events tabs)
+- Frontend React: patrón de contextos (DatabaseContext, SettingsContext, AiSchemaContext)
+- Es SQL-only (sqlite/mysql/postgres/duckdb): no nos sirve para mongo, pero su UI de
+  explain + manejo de conexiones (ConnectionCatalogue) es referencia para Fase 3
+- Reglas de proyecto en `.rules/` (frontend, modals, react, rust, testing): documentan
+  decisiones de UI/UX útiles para la arquitectura de paneles/modales
+
+**Post Reddit r/rust — PM del driver oficial MongoDB pidiendo feedback (2024-2026)**:
+- El driver oficial `mongodb` es maduro y estable (la comunidad lo confirma)
+- Docs pobres: `projection` exige `.with_options(FindOptions...)` en vez de un simple
+  `.projection(...)` — hay que revisar el API real antes de codificar
+- Peticiones populares de la comunidad: queries type-safe (macros `filter!`/`update!`
+  de SevenTV), retry de transacciones
+- Un usuario mencionó bloqueo por licencia → verificar términos del crate
+- **Decisión para lazydb:** usar el crate oficial `mongodb` para el backend, con
+  `bson::Document` crudo (interfaz de bajo nivel, sin serde tipado) — recomendación de
+  un desarrollador en el hilo; evita la fricción de serde con BSON dinámico
+- Disparador de la Fase B de features (Cargo): añadir mongo activará el gateo `#[cfg]`
+
 ### Estrategia lazy (de Gemini, ya aplicada en parte)
 
 - Trait de backend **SÍNCRONO** + `spawn_blocking` en el servicio (patrón lazysql, no gobang)
