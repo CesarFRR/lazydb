@@ -60,10 +60,12 @@ pub async fn count_query_results(db_path: &str, sql: &str) -> Result<u32, DbErro
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "sqlite", feature = "duckdb"))]
     use super::*;
 
     /// Crea una DB `SQLite` temporal con una tabla de `n` filas y devuelve
     /// (path, cleanup). Los tests del dominio nunca necesitan terminal.
+    #[cfg(feature = "sqlite")]
     fn temp_db(name: &str, n: u32) -> (std::path::PathBuf, impl FnOnce()) {
         let dir = std::env::temp_dir().join(format!("lazydb_test_{}_{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("crear dir temp");
@@ -84,6 +86,7 @@ mod tests {
 
     /// Crea una DB `DuckDB` temporal con la misma tabla (para probar que el
     /// query runner despacha por extensión).
+    #[cfg(feature = "duckdb")]
     fn temp_db_duck(name: &str, n: u32) -> (std::path::PathBuf, impl FnOnce()) {
         let dir =
             std::env::temp_dir().join(format!("lazydb_test_ddb_{}_{name}", std::process::id()));
@@ -104,6 +107,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sqlite")]
     fn count_query_results_cuenta_filas_reales() {
         let (path, cleanup) = temp_db("count", 5);
         let result = tokio::runtime::Runtime::new()
@@ -114,6 +118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "duckdb")]
     fn count_query_results_cuenta_en_duckdb() {
         let (path, cleanup) = temp_db_duck("count_ddb", 7);
         let result = tokio::runtime::Runtime::new()
@@ -124,6 +129,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sqlite")]
     fn count_query_results_errores_no_panican() {
         let (path, cleanup) = temp_db("count_err", 1);
         let result = tokio::runtime::Runtime::new().expect("runtime").block_on(
@@ -134,6 +140,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "duckdb")]
     fn execute_query_despacha_por_extension_a_duckdb() {
         let (path, cleanup) = temp_db_duck("query_ddb", 3);
         let result = tokio::runtime::Runtime::new()
@@ -145,6 +152,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sqlite")]
     fn execute_query_devuelve_error_sin_panico() {
         let (path, cleanup) = temp_db("query_err", 1);
         let result = tokio::runtime::Runtime::new().expect("runtime").block_on(execute_query(

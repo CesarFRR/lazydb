@@ -552,14 +552,27 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 - `files` depende de `duckdb`: el backend de archivos (parquet/csv/json/
   geojson/gpkg) lee con duckdb internamente (file.rs usa
   `duckdb::cell_value_to_pretty` etc.).
-- Verificado: `cargo check` default y `--all-features` → idénticos (~5.5s);
-  `--no-default-features --features local/remote` → falla E0432 (esperado:
-  el código aún no está gateado, es la Fase B).
 - CI: `--all-features` deja de ser no-op conceptual (ya expresa intención).
-- **Pendiente Fase B**: `#[cfg(feature = "...")]` en backends + puntos de
-  contacto (resolver, controller, servers, query, UI) para poder compilar
-  subconjuntos. Disparador: añadir MongoDB (crate `mongodb` pesado) o
-  distribuir binarios.
+
+### ✅ Features Cargo por backend — Fase B: gateo del código (HECHO, 2026-08-04, rama `feat/nosql-backend`)
+
+- Cada backend (y su adapter) en `db/backends/mod.rs` con `#[cfg(feature = "...")]`.
+- `db/mod.rs`: `rt` (runtime tokio) solo con `any(mysql, postgres)` — los
+  backends locales son sync puro.
+- `resolver.rs`: imports y ramas de resolución gateadas por feature.
+- `error.rs`: impls `From<...>` de rusqlite/duckdb/mysql_async/tokio-postgres/
+  deadpool gateados; variante `Sqlite` con `cfg_attr(dead_code)` en builds sin
+  ningún backend.
+- `pretty.rs`: parser de arrays PG + `prettify_rows`/`pretty_cell_or_plain`
+  con `any(sqlite, mysql, postgres)`; `pretty_json_or_plain` solo con `duckdb`.
+- `controller.rs`: flujo de servidores mysql/postgres (connect_*_server,
+  password prompt, picker) gateado; `file::kind_for` con `files`.
+- Tests gateados por feature (smokes de MySQL/duckdb/files, helpers de query).
+- Verificado 0 warnings + tests OK en: `[]`, `sqlite`, `duckdb`, `files`,
+  `mysql`, `postgres`, `local`, `remote`, default y `--all-features`.
+  `cargo test` default: 111 ok / 8 ignored; clippy `--all-targets` 0 warnings.
+- Disparador cumplido: añadir MongoDB ahora solo exige declarar la feature
+  `mongodb` + gatear sus módulos.
 
 
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)

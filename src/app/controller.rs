@@ -371,6 +371,8 @@ fn is_source_section(item: &str) -> bool {
 
 /// ¿La URL `mysql://` o `postgres://` incluye una base de datos explícita
 /// (`.../bd`)? Las URLs de `scan_local_servers` llegan sin BD: son servidores.
+/// Solo el flujo de servidores remotos (mysql/postgres) la usa.
+#[cfg(any(feature = "mysql", feature = "postgres"))]
 fn server_url_has_database(url: &str) -> bool {
     let rest = url
         .strip_prefix("mysql://")
@@ -1499,6 +1501,7 @@ impl App {
 
     /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
+    #[cfg(feature = "mysql")]
     fn connect_mysql_server(&mut self, url: &str) {
         self.status = format!("Conectando a {url}...");
         // Conexión a nivel de servidor: primero probamos `root` SIN
@@ -1539,6 +1542,7 @@ impl App {
 
     /// Intenta conectar a la URL con `user:password` recién tipeados. Si la
     /// conexión va, lista las bases y abre el picker.
+    #[cfg(feature = "mysql")]
     fn connect_mysql_server_with_password(&mut self, prompt: PasswordPromptState) {
         let PasswordPromptState { server_url, user, buffer } = prompt;
         // Construye `mysql://user:pass@host:port` a partir de `mysql://host:port`
@@ -1570,6 +1574,7 @@ impl App {
     /// Conexión a nivel de servidor `PostgreSQL`. Prueba primero `postgres`
     /// SIN contraseña (instalaciones locales con trust/auth peer); si falla,
     /// abre el prompt de contraseña con user `postgres` por defecto.
+    #[cfg(feature = "postgres")]
     fn connect_postgres_server(&mut self, url: &str) {
         self.status = format!("Conectando a {url}...");
         // Normalizamos `postgresql://` → `postgres://` (el crate solo entiende
@@ -1611,6 +1616,7 @@ impl App {
 
     /// Intenta conectar a la URL postgres con `user:password` recién
     /// tipeados. Si la conexión va, lista las bases y abre el picker.
+    #[cfg(feature = "postgres")]
     fn connect_postgres_server_with_password(&mut self, prompt: PasswordPromptState) {
         let PasswordPromptState { server_url, user, buffer } = prompt;
         let url = server_url.strip_prefix("postgres://").map_or_else(
@@ -1655,10 +1661,12 @@ impl App {
         // URL mysql:// SIN base → conexión a nivel de SERVIDOR: listar los
         // esquemas (SHOW DATABASES) y dejar que el usuario elija. Las URLs
         // detectadas por `scan_local_servers` llegan sin `/bd`.
+        #[cfg(feature = "mysql")]
         if path.starts_with("mysql://") && !server_url_has_database(&path) {
             self.connect_mysql_server(&path);
             return;
         }
+        #[cfg(feature = "postgres")]
         if (path.starts_with("postgres://") || path.starts_with("postgresql://"))
             && !server_url_has_database(&path)
         {
@@ -2286,10 +2294,32 @@ impl App {
             }
             KeyCode::Enter => {
                 let prompt = std::mem::take(&mut self.password_prompt).expect("estado presente");
+                // URL postgres:// → autenticar en postgres; el resto (mysql://)
+                // cae al bloque mysql. Con un solo backend compilado, la rama
+                // inexistente desaparece y el `else` muestra el mensaje genérico.
+                #[cfg(feature = "postgres")]
                 if prompt.server_url.starts_with("postgres://") {
                     self.connect_postgres_server_with_password(prompt);
                 } else {
+                    #[cfg(feature = "mysql")]
                     self.connect_mysql_server_with_password(prompt);
+                    #[cfg(not(feature = "mysql"))]
+                    {
+                        let _ = prompt;
+                        self.password_prompt = None;
+                        self.status = "Servidor remoto no soportado en este build".to_string();
+                    }
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    #[cfg(feature = "mysql")]
+                    self.connect_mysql_server_with_password(prompt);
+                    #[cfg(not(any(feature = "mysql", feature = "postgres")))]
+                    {
+                        let _ = prompt;
+                        self.password_prompt = None;
+                        self.status = "Servidor remoto no soportado en este build".to_string();
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -3004,7 +3034,16 @@ impl App {
                         || ext.eq_ignore_ascii_case("sqlite3")
                         || ext.eq_ignore_ascii_case("duckdb")
                         || ext.eq_ignore_ascii_case("ddb")
-                        || crate::db::backends::file::kind_for(s).is_some()
+                        || {
+                            #[cfg(feature = "files")]
+                            {
+                                crate::db::backends::file::kind_for(s).is_some()
+                            }
+                            #[cfg(not(feature = "files"))]
+                            {
+                                false
+                            }
+                        }
                 }) =>
             {
                 self.connect_sqlite(s);
@@ -3932,6 +3971,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "mysql", feature = "postgres"))]
     fn server_url_has_database_distingue_servidor_de_bd() {
         // URLs de scan_local_servers: servidor sin base
         assert!(!server_url_has_database("mysql://127.0.0.1:3306"));
@@ -4591,6 +4631,7 @@ mod tests {
     /// picker con las bases reales, y elegir `lazydb_demo` conecta el catálogo.
     /// Requiere `MariaDB` local con la env var `LAZYDB_MYSQL_URL` (ver el archivo `AGENTS.md`).
     #[test]
+    #[cfg(feature = "mysql")]
     #[ignore = "requiere MariaDB local (LAZYDB_MYSQL_URL)"]
     fn smoke_flujo_servidor_picker_conecta_bd_real() {
         let Ok(server_url) = std::env::var("LAZYDB_MYSQL_SERVER_URL") else {

@@ -1135,6 +1135,7 @@ mod tests {
     /// (generados con la CLI duckdb) y red la primera vez para `spatial`.
     /// Se ejecuta con `cargo test -- --ignored --nocapture`.
     #[test]
+    #[cfg(feature = "files")]
     #[ignore = "requiere archivos de prueba en /tmp/opencode + red para spatial"]
     fn smoke_archivos_de_datos() {
         let base = "/tmp/opencode";
@@ -1202,6 +1203,7 @@ mod tests {
     /// FLUSH PRIVILEGES;
     /// ```
     #[test]
+    #[cfg(feature = "mysql")]
     #[ignore = "requiere MariaDB local + LAZYDB_MYSQL_URL"]
     fn smoke_mysql_localhost() {
         let Some(url) = std::env::var("LAZYDB_MYSQL_URL").ok() else {
