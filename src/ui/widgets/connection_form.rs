@@ -138,7 +138,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     y += 1;
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "Tab: siguiente campo · ↑/↓: navegar · Enter: conectar · Esc: salir",
+            "Tab: siguiente · Enter: conectar · Ctrl+U: limpiar campo · Ctrl+L: todo",
             Style::default().fg(crate::ui::theme::THEME.dim),
         ))),
         Rect::new(x, y, INPUT_W + LABEL_W, 1),

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::Rect;
 
 use crate::app::panel::{Panel, PanelKind};
@@ -2479,8 +2479,8 @@ impl App {
             if form.kind_override.is_none() {
                 form.host = spec.host.clone().unwrap_or_default();
                 form.port = spec.port.map_or_else(String::new, |p| p.to_string());
-                form.user.clear();
-                form.pass.clear();
+                form.user = spec.user.clone().unwrap_or_default();
+                form.pass = spec.pass.clone().unwrap_or_default();
                 form.db = spec.db_name.clone().unwrap_or_default();
             }
             form.detected_note = format!("✓ Detectado: {}", spec.display());
@@ -2561,6 +2561,48 @@ impl App {
                 // mueve el foco a Fuentes (la conexión queda pendiente).
                 self.active_panel = PanelKind::Sources;
                 self.status = "Conexión pendiente: el formulario queda en el panel Detalle".to_string();
+            }
+            // Ctrl+U: limpiar el campo activo (estándar readline)
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let active = form.active;
+                let mut rebuild = false;
+                match active {
+                    ConnField::Url => {
+                        form.url.clear();
+                        form.url_last_edit = None;
+                        form.url_debounce_scheduled = false;
+                        form.detected_note.clear();
+                    }
+                    ConnField::Host => {
+                        form.host.clear();
+                        rebuild = true;
+                    }
+                    ConnField::Port => {
+                        form.port.clear();
+                        rebuild = true;
+                    }
+                    ConnField::User => {
+                        form.user.clear();
+                        rebuild = true;
+                    }
+                    ConnField::Pass => {
+                        form.pass.clear();
+                        rebuild = true;
+                    }
+                    ConnField::Db => {
+                        form.db.clear();
+                        rebuild = true;
+                    }
+                    _ => {}
+                }
+                if rebuild {
+                    let _ = form;
+                    self.conn_rebuild_url_from_fields();
+                }
+            }
+            // Ctrl+L: limpiar TODO el formulario (empezar de cero)
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                *form = ConnectionFormState::default();
             }
             KeyCode::Tab | KeyCode::Down => {
                 let next = match form.active {
@@ -5256,8 +5298,61 @@ mod tests {
         assert_eq!(form.kind, crate::db::connection::ConnectionType::Mysql);
         assert_eq!(form.host, "localhost");
         assert_eq!(form.port, "3306");
+        assert_eq!(form.user, "user");
+        assert_eq!(form.pass, "pass");
         assert_eq!(form.db, "lazy");
         assert!(form.detected_note.contains("MySQL"), "nota: {}", form.detected_note);
+    }
+
+    #[test]
+    fn conn_parse_url_uri_clevercloud_rellena_credenciales() {
+        let mut app = App::new();
+        app.connection_form = Some(ConnectionFormState::default());
+        app.connection_form.as_mut().unwrap().url = concat!(
+            "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@",
+            "bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/",
+            "bh4bhaewrpd8qqcreso5"
+        )
+        .to_string();
+        assert!(app.conn_parse_url_into_fields());
+        let form = app.connection_form.as_ref().unwrap();
+        assert_eq!(form.user, "uo8h6cfqdm4u5xv6lfqq");
+        assert_eq!(form.pass, "dsJBQr44561wnu9YizPLTeP1GFh0eO");
+        assert_eq!(form.port, "5432");
+        assert_eq!(form.db, "bh4bhaewrpd8qqcreso5");
+    }
+
+    #[test]
+    fn ctrl_u_limpia_el_campo_activo_y_ctrl_l_limpia_todo() {
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail; // el formulario captura con foco en Detail
+        app.connection_form = Some(ConnectionFormState::default());
+        app.connection_form.as_mut().unwrap().url = "mysql://user:pass@localhost:3306/lazy".to_string();
+        app.connection_form.as_mut().unwrap().host = "localhost".to_string();
+        app.connection_form.as_mut().unwrap().active = ConnField::Url;
+
+        // Ctrl+U limpia el campo URL activo
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.connection_form.as_ref().unwrap().url, "");
+        assert_eq!(
+            app.connection_form.as_ref().unwrap().host,
+            "localhost",
+            "otros campos intactos con Ctrl+U"
+        );
+
+        // Ctrl+L limpia todo el formulario
+        app.connection_form.as_mut().unwrap().host = "localhost".to_string();
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL,
+        ));
+        let form = app.connection_form.as_ref().unwrap();
+        assert!(form.host.is_empty(), "Ctrl+L limpia todo");
+        assert!(form.url.is_empty());
+        assert_eq!(form.active, ConnField::Url, "el foco vuelve a la URL");
     }
 
     #[test]
