@@ -3635,6 +3635,18 @@ impl App {
             return;
         }
 
+        // ── modales superpuestos: el prompt de contraseña y el picker de
+        // bases capturan SIEMPRE primero (se abren sobre el formulario de
+        // conexión cuando conectas a un servidor remoto). ──
+        if self.password_prompt.is_some() {
+            self.handle_password_prompt_key(key);
+            return;
+        }
+        if self.db_picker.is_some() {
+            self.handle_db_picker_key(key);
+            return;
+        }
+
         // ── formulario de nueva conexión (captura TODO solo cuando el foco
         // está en el panel Detail y NO hay db conectada; los chars alimentan
         // el campo activo). Con foco en otro panel, `:` y las teclas globales
@@ -3648,12 +3660,6 @@ impl App {
         // incluidos chars no mapeados a ninguna acción) ──
         if self.query_input.is_some() {
             self.handle_query_input_key(key);
-            return;
-        }
-
-        // ── prompt de contraseña (modal de servidor detectado) ──
-        if self.password_prompt.is_some() {
-            self.handle_password_prompt_key(key);
             return;
         }
 
@@ -5405,6 +5411,27 @@ mod tests {
     }
 
     #[test]
+    fn esc_cierra_el_prompt_de_contrasena_aunque_el_formulario_este_activo() {
+        // El prompt de contraseña (modal superpuesto) captura las teclas
+        // ANTES que el formulario de conexión: Esc debe cerrarlo siempre,
+        // no "mover el foco" (que dejaba el modal colgado).
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail; // el formulario está activo
+        app.connection_form = Some(ConnectionFormState::default());
+        app.password_prompt = Some(PasswordPromptState {
+            server_url: "mysql://127.0.0.1:3306".to_string(),
+            user: "root".to_string(),
+            buffer: "x".to_string(),
+        });
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.password_prompt.is_none(),
+            "Esc debe cerrar el prompt de contraseña (no lo intercepta el formulario)"
+        );
+        assert_eq!(app.active_panel, PanelKind::Detail, "el foco no debe moverse");
+    }
+
+    #[test]
     fn conectar_con_exito_oculta_el_formulario_y_desconectar_lo_reactiva() {
         // Simula el contrato de la regla de oro: el render muestra el
         // formulario cuando `db_path.is_none()`, sea cual sea el panel.
@@ -5512,6 +5539,31 @@ mod tests {
         assert_eq!(
             app.connection_form.as_ref().unwrap().url,
             "mysql://admin:secreto@db.azure.com:3306/prod"
+        );
+    }
+
+    /// Reproducción del bug reportado: pegar la `URI` de `CleverCloud` (con base
+    /// y credenciales) y dar Enter NO debe abrir el prompt de contraseña —
+    /// la URL ya trae `user:pass` y `/db`. Sin red, el resolver falla con
+    /// error de conexión, pero NUNCA debe activar `password_prompt`.
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn uri_clevercloud_con_base_no_abre_prompt_de_contrasena() {
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail;
+        app.connection_form = Some(ConnectionFormState::default());
+        let uri = concat!(
+            "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@",
+            "bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/",
+            "bh4bhaewrpd8qqcreso5"
+        );
+        app.connection_form.as_mut().unwrap().url = uri.to_string();
+        // Enter en el campo URL → parsea + conecta
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.password_prompt.is_none(),
+            "la URI con /db y credenciales NO debe pedir contraseña (status: {})",
+            app.status
         );
     }
 }
