@@ -10,3 +10,12 @@
 
 # Bases de datos de prueba
 *.db
+*.duckdb
+*.gpkg
+*.csv
+*.tsv
+*.parquet
+*.geojson
+
+# Scripts SQL sueltos de prueba
+/script.sql
