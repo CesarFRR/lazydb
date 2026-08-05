@@ -328,6 +328,8 @@ fn db_type_mark(value: &str) -> char {
         'P'
     } else if lower.starts_with("mysql://") {
         'M'
+    } else if lower.starts_with("mongodb://") {
+        'N'
     } else if lower.starts_with("http://")
         || lower.starts_with("https://")
         || lower.starts_with("ssh://")
@@ -350,10 +352,10 @@ fn db_type_mark(value: &str) -> char {
 // ── formato de items del panel Fuentes ─────────────────────────────────
 // Cada item es un string plano con marcas que el render colorea:
 //   sección:   "\u{1}LABEL"          (marcador interno, no visible)
-//   entry:     [● ][✗ ]<★|▣|D|M|P|⊙|C|T|J|G ><texto>
+//   entry:     [● ][✗ ]<★|▣|D|M|P|N|⊙|C|T|J|G ><texto>
 //                     ● = conectada, ✗ = con problemas (sin marca = bien),
 //                     ★ = favorito, ▣ = sqlite, D = duckdb, M = mysql,
-//                     P = postgres, ⊙ = endpoint genérico,
+//                     P = postgres, N = mongodb, ⊙ = endpoint genérico,
 //                     C = csv, T = tsv, J = json(jsonl), G = geojson/gpkg
 // Los favoritos van al inicio de la lista sin sección propia (la ★ basta).
 // Los favoritos usan "name => path"; el resto muestra el path directo.
@@ -390,7 +392,7 @@ fn server_url_has_database(url: &str) -> bool {
 fn strip_source_marks(mut item: &str) -> &str {
     loop {
         let mut stripped = false;
-        for mark in ["● ", "★ ", "✗ ", "▣ ", "D ", "M ", "P ", "⊙ ", "C ", "T ", "J ", "G "]
+        for mark in ["● ", "★ ", "✗ ", "▣ ", "D ", "M ", "P ", "N ", "⊙ ", "C ", "T ", "J ", "G "]
         {
             if let Some(rest) = item.strip_prefix(mark) {
                 item = rest;
@@ -3064,6 +3066,9 @@ impl App {
             s if s.starts_with("postgres://") || s.starts_with("postgresql://") => {
                 self.connect_sqlite(s);
             }
+            s if s.starts_with("mongodb://") => {
+                self.connect_sqlite(s);
+            }
             s if s.contains(" => ") => {
                 let path = s.split_once(" => ").map(|(_, p)| p.to_string()).unwrap_or_default();
                 self.connect_sqlite(&path);
@@ -4176,11 +4181,38 @@ mod tests {
         assert_eq!(db_type_mark("postgres://db.azure.com/prod"), 'P');
         assert_eq!(db_type_mark("postgresql://127.0.0.1/lazy"), 'P');
         assert_eq!(db_type_mark("mysql://localhost/lazy"), 'M');
+        assert_eq!(db_type_mark("mongodb://127.0.0.1:27017"), 'N');
         assert_eq!(db_type_mark("https://api.x/db"), '⊙');
         assert_eq!(db_type_mark("base.duckdb"), 'D');
         assert_eq!(db_type_mark("otra.ddb"), 'D');
         assert_eq!(db_type_mark("sakila.db"), '▣');
         assert_eq!(db_type_mark("sqlite:///tmp/x.db"), '▣');
+    }
+
+    #[test]
+    fn build_sources_servidor_mongo_no_se_normaliza_como_path() {
+        // Regresión del bug: `entry()` normalizaba `mongodb://127.0.0.1:27017`
+        // como path de archivo (is_url no la reconocía) → la URL se rompía.
+        let state = state_de_prueba();
+        let sources = App::build_sources(
+            &state,
+            SourceTab::All,
+            None,
+            &HashMap::new(),
+            &["mongodb://127.0.0.1:27017".to_string()],
+        );
+        let entry = sources
+            .iter()
+            .find(|s| s.contains("mongodb://"))
+            .expect("el servidor mongo debe aparecer en las fuentes");
+        assert!(
+            entry.contains("mongodb://127.0.0.1:27017"),
+            "la URL debe quedar intacta (no un path normalizado): {entry}"
+        );
+        assert!(
+            !entry.contains("lazydb/mongodb"),
+            "no debe mezclarse con el cwd: {entry}"
+        );
     }
 
     #[test]

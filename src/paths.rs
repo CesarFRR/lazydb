@@ -45,7 +45,10 @@ pub fn is_url(input: &str) -> bool {
     let lower = input.to_ascii_lowercase();
     lower.starts_with("mysql://")
         || lower.starts_with("postgres://")
+        || lower.starts_with("postgresql://")
+        || lower.starts_with("mongodb://")
         || lower.starts_with("sqlite://")
+        || lower.starts_with("duckdb://")
         || lower.starts_with("http://")
         || lower.starts_with("https://")
         || lower.starts_with("ssh://")
@@ -85,6 +88,9 @@ mod tests {
         for url in [
             "mysql://127.0.0.1:3306/lazy",
             "postgres://user@db.azure.com:5432/prod",
+            "mongodb://127.0.0.1:27017",
+            "mongodb://user:pass@127.0.0.1:27017/lazydb_probe",
+            "duckdb:///tmp/x.duckdb",
             "https://api.example.com/db",
             "ssh://host/db",
             "sqlite:///tmp/x.db",
