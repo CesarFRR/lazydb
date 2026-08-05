@@ -84,6 +84,53 @@ fn observed_keys(docs: &[Document]) -> Vec<String> {
     keys
 }
 
+/// Nombre de tipo BSON compacto (estilo vi-mongo).
+const fn bson_type_label(v: &Bson) -> &'static str {
+    match v {
+        Bson::Double(_) => "double",
+        Bson::String(_) => "string",
+        Bson::Array(_) => "array",
+        Bson::Document(_) => "object",
+        Bson::Boolean(_) => "bool",
+        Bson::Int32(_) => "int32",
+        Bson::Int64(_) => "int64",
+        Bson::Null | Bson::Undefined => "null",
+        Bson::ObjectId(_) => "objectId",
+        Bson::DateTime(_) => "date",
+        Bson::Timestamp(_) => "timestamp",
+        Bson::Binary(_) => "binData",
+        Bson::Decimal128(_) => "decimal",
+        Bson::RegularExpression(_) => "regex",
+        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => "javascript",
+        Bson::Symbol(_) => "symbol",
+        Bson::DbPointer(_) => "dbPointer",
+        Bson::MaxKey | Bson::MinKey => "minMaxKey",
+    }
+}
+
+/// Claves observadas con su tipo inferido. Si una clave tiene varios tipos
+/// entre los docs de la muestra → tipo `Mixed` (estilo vi-mongo).
+fn observed_key_types(docs: &[Document]) -> Vec<(String, String)> {
+    // (clave) → (tipo, ¿es mixto?)
+    let mut types: Vec<(String, String, bool)> = Vec::new();
+    for doc in docs {
+        for (key, value) in doc {
+            let t = bson_type_label(value).to_string();
+            if let Some(entry) = types.iter_mut().find(|(k, _, _)| k == key) {
+                if entry.1 != t {
+                    entry.2 = true; // Mixed
+                }
+            } else {
+                types.push((key.clone(), t, false));
+            }
+        }
+    }
+    types
+        .into_iter()
+        .map(|(k, t, mixed)| (k, if mixed { "mixed".to_string() } else { t }))
+        .collect()
+}
+
 // ─── Render de valores BSON a texto ────────────────────────────────────
 
 /// Render de un valor BSON a String, compacto por defecto (Data tab).
@@ -226,19 +273,22 @@ async fn docs_page_async(
         }
     }
 
-    let keys = observed_keys(&docs);
+    let key_types = observed_key_types(&docs);
     let rows: Vec<Row> = docs
         .iter()
         .map(|doc| {
-            let cells = keys
+            let cells = key_types
                 .iter()
-                .map(|k| doc.get(k).map_or_else(String::new, bson_to_string))
+                .map(|(k, _)| doc.get(k).map_or_else(String::new, bson_to_string))
                 .collect();
             Row { cells }
         })
         .collect();
     Ok(TableData {
-        columns: keys.into_iter().map(|name| Column { name, dtype: "bson".into() }).collect(),
+        columns: key_types
+            .into_iter()
+            .map(|(name, dtype)| Column { name, dtype })
+            .collect(),
         rows,
     })
 }
@@ -357,9 +407,9 @@ pub fn observed_columns(
         }
         Ok::<Vec<Document>, DbError>(docs)
     })?;
-    Ok(observed_keys(&docs)
+    Ok(observed_key_types(&docs)
         .into_iter()
-        .map(|name| Column { name, dtype: "bson".into() })
+        .map(|(name, dtype)| Column { name, dtype })
         .collect())
 }
 
@@ -393,6 +443,43 @@ pub const fn foreign_keys(
     Vec::new()
 }
 
+/// Convierte un `Bson` a `serde_json::Value` para el modo JSON del modal.
+/// Los tipos nativos de mongo se representan como strings anotados
+/// (`ObjectId`, `Date` ISO, `binData` base64) para que el JSON sea leíble y
+/// no se pierda información de tipo.
+fn bson_to_json_value(v: &Bson) -> serde_json::Value {
+    match v {
+        Bson::Double(f) => serde_json::Value::Number(serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0))),
+        Bson::String(s) => serde_json::Value::String(s.clone()),
+        Bson::Boolean(b) => serde_json::Value::Bool(*b),
+        Bson::Int32(i) => serde_json::Value::Number((*i).into()),
+        Bson::Int64(i) => serde_json::Value::Number((*i).into()),
+        Bson::Null | Bson::Undefined => serde_json::Value::Null,
+        Bson::ObjectId(oid) => serde_json::Value::String(format!("ObjectId(\"{oid}\")")),
+        Bson::DateTime(dt) => serde_json::Value::String(format!("ISODate(\"{dt}\")")),
+        Bson::Timestamp(ts) => serde_json::Value::String(format!("Timestamp({ts})")),
+        Bson::Binary(bin) => serde_json::Value::String(format!("BinData(0, {})", bin.bytes.len())),
+        Bson::Decimal128(d) => serde_json::Value::String(format!("NumberDecimal(\"{d}\")")),
+        Bson::Array(items) => {
+            serde_json::Value::Array(items.iter().map(bson_to_json_value).collect())
+        }
+        Bson::Document(doc) => {
+            let map: serde_json::Map<String, serde_json::Value> = doc
+                .iter()
+                .map(|(k, v)| (k.clone(), bson_to_json_value(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+        other => serde_json::Value::String(other.to_string()),
+    }
+}
+
+/// JSON pretty del documento (modo JSON del modal de detalles).
+pub fn doc_to_json_pretty(doc: &Document) -> String {
+    let value = bson_to_json_value(&Bson::Document(doc.clone()));
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Pares `(clave, valor)` del documento en `offset`, para el modal de
 /// detalles. SOLO los campos presentes (`NoSQL`: cada doc puede tener campos
 /// distintos; los ausentes no existen y no deben mostrarse).
@@ -402,7 +489,7 @@ pub fn row_inspector_pairs(
     db_name: &str,
     collection: &str,
     offset: u32,
-) -> Result<Vec<(String, String)>, DbError> {
+) -> Result<(Vec<(String, String)>, String), DbError> {
     let coll = db(client, db_name).collection::<Document>(collection);
     block_on(async {
         let mut cursor = coll
@@ -416,12 +503,13 @@ pub fn row_inspector_pairs(
             .await
             .map_err(|e| DbError::Open(format!("{collection}.find cursor: {e}")))?
         else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), String::new()));
         };
-        Ok(doc
+        let pairs = doc
             .iter()
             .map(|(k, v)| (k.clone(), render_value_pretty(v, 0)))
-            .collect())
+            .collect();
+        Ok((pairs, doc_to_json_pretty(&doc)))
     })
 }
 
@@ -642,15 +730,17 @@ mod tests {
         let offset_cesar = row_offset_of(&client, &db, &coll_name, "name", "cesar")
             .expect("offset cesar");
         if let Some(idx) = offset_cesar {
-            let pairs =
+            let (pairs, json) =
                 row_inspector_pairs(&client, &db, &coll_name, idx).expect("pares de fila");
             println!("PARES del doc cesar (offset {idx}): {pairs:?}");
+            assert!(json.contains("cesar"), "el JSON debe incluir el doc: {json}");
+            assert!(json.trim_start().starts_with('{'), "JSON pretty: {json}");
             let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
             assert!(keys.contains(&"_id"), "todo doc tiene _id: {keys:?}");
             assert!(keys.contains(&"name"), "cesar tiene name: {keys:?}");
             assert!(keys.contains(&"meta"), "cesar tiene meta: {keys:?}");
             // Un doc sin `age` no lo lista: verificamos con el doc ana (offset+1)
-            let pairs_ana =
+            let (pairs_ana, _json_ana) =
                 row_inspector_pairs(&client, &db, &coll_name, idx + 1).expect("pares ana");
             let keys_ana: Vec<&str> = pairs_ana.iter().map(|(k, _)| k.as_str()).collect();
             assert!(

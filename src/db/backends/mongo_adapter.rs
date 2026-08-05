@@ -38,6 +38,10 @@ impl MongoAdapter {
 }
 
 impl DbAdapter for MongoAdapter {
+    fn is_nosql(&self) -> bool {
+        true
+    }
+
     fn list_objects_by_type(&self, object_type: &str) -> Result<Vec<String>, DbError> {
         self.with_client(|client, db| match object_type {
             "table" | "collection" => {
@@ -142,6 +146,15 @@ impl DbAdapter for MongoAdapter {
     ) -> Option<Vec<(String, String)>> {
         self.with_client(|client, db| {
             crate::db::backends::mongo::row_inspector_pairs(client, db, object_name, offset)
+                .map(|(pairs, _json)| pairs)
+        })
+        .ok()
+    }
+
+    fn row_inspector_json(&self, object_name: &str, offset: u32) -> Option<String> {
+        self.with_client(|client, db| {
+            crate::db::backends::mongo::row_inspector_pairs(client, db, object_name, offset)
+                .map(|(_pairs, json)| json)
         })
         .ok()
     }

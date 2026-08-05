@@ -67,6 +67,8 @@ pub enum AppAction {
     Yank,
     /// Exportar tabla actual a CSV
     ExportCsv,
+    /// Alternar pares ↔ JSON en el modal de detalles (solo `NoSQL`)
+    ToggleInspectorJson,
     /// Iniciar filtro de búsqueda /
     StartFilter,
     /// Scroll horizontal de columnas (shift+h)
@@ -121,7 +123,7 @@ impl AppAction {
             ObjectSectionViews, OpenQueryInput, PrevPage, QuitOrBack, Refresh, ReloadRuntimeConfig,
             RunCountQuery, SidebarFocusNext, SidebarFocusPrev, SourceTabFavorites, SourceTabNext,
             SourceTabPrev, SourceTabRecents, StartFilter, ToggleActionsMenu, ToggleCurrentPanel,
-            ToggleFavoriteSource, ToggleHelp, Yank,
+            ToggleFavoriteSource, ToggleHelp, ToggleInspectorJson, Yank,
         };
         match self {
             MoveUp | MoveDown | PrevPage | NextPage | QuitOrBack | Refresh => KeyGroup::Navigation,
@@ -141,7 +143,8 @@ impl AppAction {
             | DetailTabMeta => KeyGroup::Tabs,
             RunCountQuery | ClearQueryState | ReloadRuntimeConfig | OpenQueryInput
             | HScrollLeft | HScrollRight => KeyGroup::Data,
-            Enter | ToggleActionsMenu | Yank | ExportCsv | StartFilter | ToggleHelp => {
+            Enter | ToggleActionsMenu | Yank | ExportCsv | StartFilter | ToggleHelp
+            | ToggleInspectorJson => {
                 KeyGroup::Actions
             }
         }
@@ -158,7 +161,7 @@ impl AppAction {
             ObjectSectionViews, OpenQueryInput, PrevPage, QuitOrBack, Refresh, ReloadRuntimeConfig,
             RunCountQuery, SidebarFocusNext, SidebarFocusPrev, SourceTabFavorites, SourceTabNext,
             SourceTabPrev, SourceTabRecents, StartFilter, ToggleActionsMenu, ToggleCurrentPanel,
-            ToggleFavoriteSource, ToggleHelp, Yank,
+            ToggleFavoriteSource, ToggleHelp, ToggleInspectorJson, Yank,
         };
         match self {
             RunCountQuery => "Contar filas (query async)",
@@ -205,6 +208,7 @@ impl AppAction {
             Yank => "Copiar (yank)",
             ExportCsv => "Exportar CSV",
             StartFilter => "Filtrar /",
+            ToggleInspectorJson => "Pares ↔ JSON (NoSQL)",
             HScrollLeft => "Scroll izq. (columnas)",
             HScrollRight => "Scroll der. (columnas)",
             ToggleHelp => "Ayuda de teclas",
@@ -370,6 +374,8 @@ impl Default for Keymap {
         bindings.insert("e".to_string(), AppAction::ExportCsv);
         bindings.insert("/".to_string(), AppAction::StartFilter);
         bindings.insert("?".to_string(), AppAction::ToggleHelp);
+        // Modal de detalles NoSQL: alternar pares ↔ JSON del documento
+        bindings.insert("shift+j".to_string(), AppAction::ToggleInspectorJson);
 
         // ── scroll horizontal de columnas (Data tab) ──
         bindings.insert("shift+h".to_string(), AppAction::HScrollLeft);

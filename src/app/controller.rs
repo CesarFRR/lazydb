@@ -692,6 +692,9 @@ pub struct App {
     pub refresh_count: u32,
     pub db_path: Option<String>,
     pub db_size_bytes: Option<u64>,
+    /// ¿El backend conectado es `NoSQL` (mongo)? La UI cambia terminología
+    /// (`row` → `doc`) y muestra el toggle JSON del modal.
+    pub is_nosql: bool,
     pub status: String,
     pub current_page: u32,
     pub rows_per_page: u32,
@@ -734,6 +737,10 @@ pub struct App {
     /// Inspector de fila (modal de detalle de registro)
     pub show_row_inspector: bool,
     pub row_inspector_pairs: Vec<(String, String)>,
+    /// Modo de visualización del modal `NoSQL`: `false` = pares clave→valor,
+    /// `true` = JSON formateado del documento.
+    pub inspector_json_mode: bool,
+    pub inspector_json_text: String,
     pub inspector_scroll: crate::ui::widgets::modal::ModalScroll,
     /// Ayuda de teclas (modal `?`): se autogenera desde los bindings reales
     pub show_help: bool,
@@ -847,6 +854,7 @@ impl App {
             refresh_count: 0,
             db_path: None,
             db_size_bytes: None,
+            is_nosql: false,
             status: "Sin conexion SQLite".to_string(),
             current_page: 0,
             rows_per_page: ui_config.rows_per_page,
@@ -860,6 +868,8 @@ impl App {
             actions_menu_idx: 0,
             show_row_inspector: false,
             row_inspector_pairs: Vec::new(),
+            inspector_json_mode: false,
+            inspector_json_text: String::new(),
             inspector_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             show_help: false,
             help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
@@ -1321,13 +1331,15 @@ impl App {
                 for &tab in &available {
                     let label = tab.label();
                     let text = if tab == DetailTab::Data {
-                        // Número de fila actual / total
+                        // Número de fila actual / total. En NoSQL (mongo)
+                        // cada fila es un documento → `doc X/Y`.
                         if self.total_rows > 0 {
                             let current_row = self.preview_loaded_offset
                                 + self.selected_idx(PanelKind::Detail).saturating_sub(1) as u32
                                 + 1;
                             let total = self.total_rows;
-                            format!("{label} - row {current_row}/{total}")
+                            let unit = if self.is_nosql { "doc" } else { "row" };
+                            format!("{label} - {unit} {current_row}/{total}")
                         } else {
                             label.to_string()
                         }
@@ -1746,6 +1758,10 @@ impl App {
             );
 
             self.db_path = Some(path.clone());
+            // ¿NoSQL? (mongo): cambia la terminología de la UI (row→doc) y
+            // habilita el toggle JSON del modal de detalles.
+            self.is_nosql = db::resolver::resolve_backend(&path)
+                .is_some_and(|a| a.is_nosql());
             // `db_size_bytes` solo aplica a bds de archivo (mysql:// no es path)
             self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
             self.tables = tables;
@@ -2710,8 +2726,11 @@ impl App {
         // NoSQL (mongo): el backend entrega directo los pares clave→valor SOLO
         // de los campos presentes en este documento. Cada fila puede tener
         // campos distintos; los ausentes no se muestran ni se desalinean.
+        // También entregamos el JSON formateado (modo JSON del modal).
         if let Some(pairs) = adapter.row_inspector_pairs(&object, offset) {
             self.row_inspector_pairs = pairs;
+            self.inspector_json_text =
+                adapter.row_inspector_json(&object, offset).unwrap_or_default();
             self.inspector_scroll.reset();
             return;
         }
@@ -2753,6 +2772,11 @@ impl App {
     #[allow(clippy::missing_const_for_fn)]
     fn close_row_inspector(&mut self) {
         self.show_row_inspector = false;
+    }
+
+    /// Etiqueta del modo de visualización del modal `NoSQL` (para el título).
+    pub const fn inspector_mode_label(&self) -> &'static str {
+        if self.inspector_json_mode { "json" } else { "pares" }
     }
 
     /// Copia el ítem seleccionado al portapapeles del sistema.
@@ -3251,6 +3275,12 @@ impl App {
                 self.move_selection(1);
                 self.refresh_row_inspector();
             }
+            // NoSQL: alternar pares ↔ JSON del documento (solo tiene sentido
+            // si el backend entregó JSON; SQL ignora el toggle).
+            keys::AppAction::ToggleInspectorJson if !self.inspector_json_text.is_empty() => {
+                self.inspector_json_mode = !self.inspector_json_mode;
+                self.inspector_scroll.reset();
+            }
             _ => {}
         }
     }
@@ -3309,6 +3339,9 @@ impl App {
                 self.actions_menu_idx = 0;
                 self.status = "Menu de acciones abierto".to_string();
             }
+            // Fuera del modal no aplica: el toggle se maneja en
+            // `handle_row_inspector_key` (solo dentro del modal NoSQL).
+            keys::AppAction::ToggleInspectorJson => {}
             keys::AppAction::ToggleHelp => {
                 self.show_help = !self.show_help;
                 if self.show_help {

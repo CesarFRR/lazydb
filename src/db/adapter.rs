@@ -48,6 +48,13 @@ pub trait DbAdapter: Send + Sync {
     ) -> Result<Option<u32>, DbError>;
 
     // ── inspector de fila (NoSQL) ──
+    /// ¿Este backend es `NoSQL` (documentos/clave-valor) en vez de SQL?
+    /// La UI usa esto para cambiar la terminología (`row` → `doc`), mostrar
+    /// el toggle JSON del modal, etc. SQL devuelve `false` por defecto.
+    fn is_nosql(&self) -> bool {
+        false
+    }
+
     /// Pares `(clave, valor)` de la fila en `offset` para el modal de
     /// detalles. SOLO incluye los campos PRESENTES en el documento/entidad:
     /// en `NoSQL` (mongo) cada fila puede tener campos distintos y los
@@ -60,6 +67,12 @@ pub trait DbAdapter: Send + Sync {
         _object_name: &str,
         _offset: u32,
     ) -> Option<Vec<(String, String)>> {
+        None
+    }
+
+    /// JSON pretty del documento en `offset` (modo JSON del modal de
+    /// detalles). `NoSQL` (mongo) lo implementa; SQL devuelve `None`.
+    fn row_inspector_json(&self, _object_name: &str, _offset: u32) -> Option<String> {
         None
     }
 
