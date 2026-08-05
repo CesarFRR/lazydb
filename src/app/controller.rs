@@ -1826,8 +1826,10 @@ impl App {
         // URL mysql:// SIN base → conexión a nivel de SERVIDOR: listar los
         // esquemas (SHOW DATABASES) y dejar que el usuario elija. Las URLs
         // detectadas por `scan_local_servers` llegan sin `/bd`.
+        tracing::debug!(path = %path, "connect_sqlite: url normalizada");
         #[cfg(feature = "mysql")]
         if path.starts_with("mysql://") && !server_url_has_database(&path) {
+            tracing::debug!(path = %path, "mysql sin base → flujo de servidor");
             self.connect_mysql_server(&path);
             return;
         }
@@ -1835,6 +1837,7 @@ impl App {
         if (path.starts_with("postgres://") || path.starts_with("postgresql://"))
             && !server_url_has_database(&path)
         {
+            tracing::debug!(path = %path, "postgres sin base → flujo de servidor");
             self.connect_postgres_server(&path);
             return;
         }
@@ -2573,6 +2576,7 @@ impl App {
             self.status = "Escribe una URL o ruta para conectar".to_string();
             return;
         }
+        tracing::debug!(url = %url, rebuild, "conn_submit: url a conectar");
         // Conexión real (sync por ahora; el spinner se limpia después)
         self.connection_form.as_mut().unwrap().connecting = true;
         self.connect_sqlite(&url);
