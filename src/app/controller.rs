@@ -2512,6 +2512,9 @@ impl App {
     /// Devuelve `true` si el parseo fue exitoso (la URL define el tipo).
     fn conn_parse_url_into_fields(&mut self) -> bool {
         let Some(form) = self.connection_form.as_mut() else { return false };
+        // Purga de la URL: quitar saltos de línea y espacios externos antes
+        // de analizar (las URLs de CleverCloud pueden llegar partidas).
+        form.url = form.url.trim().replace(['\n', '\r'], "");
         let spec = crate::db::connection::analyze_connection(&form.url);
         let complete = spec.kind != crate::db::connection::ConnectionType::Unknown;
 
@@ -2572,6 +2575,8 @@ impl App {
             .as_ref()
             .map(|f| f.url.clone())
             .unwrap_or_default();
+        // Purga final antes de conectar (defensa en profundidad contra \n)
+        let url = url.trim().replace(['\n', '\r'], "");
         if url.trim().is_empty() {
             self.status = "Escribe una URL o ruta para conectar".to_string();
             return;
@@ -3619,6 +3624,68 @@ impl App {
             self.status = String::new();
         } else {
             self.should_quit = true;
+        }
+    }
+
+    /// Pegado del portapapeles (bracketed paste). Se enruta al estado activo
+    /// que acepte texto; los `\n` se sanitizan (las URLs de `CleverCloud` se
+    /// parten en 2 líneas y el `\n` no debe disparar Enter).
+    pub fn on_paste(&mut self, text: &str) {
+        let clean = text.replace(['\n', '\r'], "");
+        if clean.is_empty() {
+            return;
+        }
+
+        // Formulario de conexión: pegar en el campo URL (o el campo activo)
+        if self.connection_form.is_some() && self.db_path.is_none() {
+            if let Some(form) = self.connection_form.as_mut() {
+                let target = match form.active {
+                    ConnField::Url => &mut form.url,
+                    ConnField::Host => &mut form.host,
+                    ConnField::Port => &mut form.port,
+                    ConnField::User => &mut form.user,
+                    ConnField::Pass => &mut form.pass,
+                    ConnField::Db => &mut form.db,
+                    _ => return,
+                };
+                target.push_str(&clean);
+                if form.active == ConnField::Url {
+                    form.url_last_edit = Some(std::time::Instant::now());
+                    form.url_debounce_scheduled = true;
+                }
+            }
+            // Reconstruir la URL si se pegó en un campo individual
+            if let Some(form) = self.connection_form.as_ref() {
+                if matches!(
+                    form.active,
+                    ConnField::Host | ConnField::Port | ConnField::User | ConnField::Pass
+                        | ConnField::Db
+                ) {
+                    self.conn_rebuild_url_from_fields();
+                }
+            }
+            return;
+        }
+
+        // Input de query (`:`)
+        if self.query_input.is_some() {
+            if let Some(state) = self.query_input.as_mut() {
+                state.buffer.push_str(&clean);
+            }
+            return;
+        }
+
+        // Prompt de contraseña
+        if self.password_prompt.is_some() {
+            if let Some(state) = self.password_prompt.as_mut() {
+                state.buffer.push_str(&clean);
+            }
+            return;
+        }
+
+        // Modo filtro
+        if self.input_mode == InputMode::Filtering {
+            self.filter_query.push_str(&clean);
         }
     }
 
@@ -5567,6 +5634,40 @@ mod tests {
         assert!(
             app.password_prompt.is_none(),
             "la URI con /db y credenciales NO debe pedir contraseña (status: {})",
+            app.status
+        );
+    }
+
+    /// Regresión: una URL pegada PARTIDA por un `\n` (`CleverCloud` la parte en
+    /// dos líneas) debe purgarse antes de analizar/conectar: sin saltos de
+    /// línea y con la base registrada. Nunca debe ir al flujo de servidor.
+    #[test]
+    fn on_paste_sanitiza_nueva_linea_y_conn_parse_purga_la_url() {
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail;
+        app.connection_form = Some(ConnectionFormState::default());
+
+        // Simula el pegado de la URL partida (con \n entre el puerto y la db)
+        let pegada = concat!(
+            "postgresql://uo8h6cfqdm4u5xv6lfqq:secret@host:5432/\n",
+            "bh4bhaewrpd8qqcreso5"
+        );
+        app.on_paste(pegada);
+        let url_limpia = app.connection_form.as_ref().unwrap().url.clone();
+        assert!(
+            !url_limpia.contains('\n'),
+            "el paste debe quitar el \\n: {url_limpia:?}"
+        );
+        assert!(
+            url_limpia.ends_with("bh4bhaewrpd8qqcreso5"),
+            "la base debe quedar al final: {url_limpia:?}"
+        );
+
+        // Enter → parsea (con purga) y no debe ir al flujo de servidor
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.password_prompt.is_none(),
+            "URL purgada no debe pedir contraseña (status: {})",
             app.status
         );
     }
