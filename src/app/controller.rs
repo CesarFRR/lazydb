@@ -2779,6 +2779,15 @@ impl App {
         if self.inspector_json_mode { "json" } else { "pares" }
     }
 
+    /// Alterna pares ↔ JSON del documento en el modal `NoSQL`. No hace nada
+    /// si el backend no entregó JSON (SQL o doc sin datos).
+    pub fn toggle_inspector_json_mode(&mut self) {
+        if !self.inspector_json_text.is_empty() {
+            self.inspector_json_mode = !self.inspector_json_mode;
+            self.inspector_scroll.reset();
+        }
+    }
+
     /// Copia el ítem seleccionado al portapapeles del sistema.
     fn yank_selected(&mut self) {
         let items = self.items_for(self.active_panel);
@@ -3937,7 +3946,11 @@ impl App {
             let inside =
                 x >= mx && x < mx.saturating_add(mw) && y >= my && y < my.saturating_add(mh);
             if inside {
-                // Click dentro del modal: sin acción
+                // Botón del modo NoSQL (`[J: json]` / `[J: pares]`): vive en el
+                // título (fila superior del borde del modal), lado derecho.
+                if self.is_nosql && y == my {
+                    self.toggle_inspector_json_mode();
+                }
                 return;
             }
             self.close_row_inspector();

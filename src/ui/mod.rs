@@ -40,7 +40,13 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     // Inspector de fila (modal tabla con word-wrap)
     if app.show_row_inspector {
-        let title = format!("▸ {} ({})", app.selected_object(), app.inspector_mode_label());
+        // NoSQL: botón de modo en el título (`[J: json]` / `[J: pares]`).
+        // El mismo texto es la zona clicable (ver `on_mouse_click`).
+        let title = if app.is_nosql {
+            format!("▸ {}   [J: {}]", app.selected_object(), app.inspector_mode_label())
+        } else {
+            format!("▸ {}", app.selected_object())
+        };
         if app.inspector_json_mode {
             // NoSQL en modo JSON: el documento completo formateado.
             let lines: Vec<ratatui::text::Line<'_>> =
