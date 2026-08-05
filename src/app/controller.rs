@@ -777,7 +777,13 @@ pub struct App {
     pub is_loading: bool,
     pub refresh_count: u32,
     pub db_path: Option<String>,
-    pub db_size_bytes: Option<u64>,
+    /// Adapter de la conexión ACTIVA (compartido): se crea UNA vez al
+    /// conectar y se reusa para todas las operaciones. Evita recrear el
+    /// pool (handshake TCP+auth) en cada navegación, lo que fallaba con
+    /// conexiones lentas (`CleverCloud`) por límite de conexiones.
+    /// `Rc` permite clonar la referencia sin prestar `self` (los métodos
+    /// que usan el adapter también asignan campos de `self`).
+    pub active_adapter: Option<std::rc::Rc<dyn crate::db::adapter::DbAdapter>>,    pub db_size_bytes: Option<u64>,
     /// ¿El backend conectado es `NoSQL` (mongo)? La UI cambia terminología
     /// (`row` → `doc`) y muestra el toggle JSON del modal.
     pub is_nosql: bool,
@@ -942,6 +948,7 @@ impl App {
             is_loading: false,
             refresh_count: 0,
             db_path: None,
+            active_adapter: None,
             db_size_bytes: None,
             is_nosql: false,
             status: "Sin conexion".to_string(),
@@ -1859,6 +1866,10 @@ impl App {
             tracing::error!(path = %path, "fuente no soportada por el resolver");
             return;
         };
+        // Compartir el adapter: la conexión/pool se crea UNA vez y se reusa
+        // para todas las operaciones (evita límite de conexiones + handshakes).
+        self.active_adapter = Some(std::rc::Rc::from(adapter));
+        let adapter = self.active_adapter.as_ref().unwrap().as_ref();
         let tables = adapter.list_objects_by_type("table");
         let views = adapter.list_objects_by_type("view");
         let advanced = adapter.list_advanced_objects();
@@ -1878,8 +1889,7 @@ impl App {
             self.db_path = Some(path.clone());
             // ¿NoSQL? (mongo): cambia la terminología de la UI (row→doc) y
             // habilita el toggle JSON del modal de detalles.
-            self.is_nosql = db::resolver::resolve_backend(&path)
-                .is_some_and(|a| a.is_nosql());
+            self.is_nosql = self.adapter_rc().is_some_and(|a| a.is_nosql());
             // `db_size_bytes` solo aplica a bds de archivo (mysql:// no es path)
             self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
             self.tables = tables;
@@ -1954,9 +1964,6 @@ impl App {
         self.panel_mut(PanelKind::Detail).scroll_offset.set(0);
         // Reset scroll horizontal: el nuevo objeto puede tener otras columnas
         self.panel_mut(PanelKind::Detail).h_scroll.set(0);
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
 
         self.is_loading = true;
         self.status = format!("Cargando {}...", self.detail_tab.label().trim());
@@ -1974,7 +1981,7 @@ impl App {
 
         // Backend resuelto por extensión: todas las lecturas del preview
         // (filas, schema, DDL, count) pasan por el adapter.
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_rc() else {
             self.is_loading = false;
             return;
         };
@@ -2160,9 +2167,6 @@ impl App {
             return; // ya estamos al final del dataset
         }
 
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             return;
@@ -2179,7 +2183,7 @@ impl App {
         self.status = format!("Cargando más filas (offset {next_offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_rc() else {
             self.is_loading = false;
             return;
         };
@@ -2209,9 +2213,6 @@ impl App {
             return; // ya estamos al inicio del dataset
         }
 
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             return;
@@ -2227,7 +2228,7 @@ impl App {
         self.status = format!("Cargando filas anteriores (offset {offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_rc() else {
             self.is_loading = false;
             return;
         };
@@ -3038,10 +3039,17 @@ impl App {
         }
     }
 
+    /// Adapter de la conexión activa (compartido). `None` si no hay db.
+    /// Referencia clonada al adapter activo (no presta `self`).
+    fn adapter_rc(&self) -> Option<std::rc::Rc<dyn crate::db::adapter::DbAdapter>> {
+        self.active_adapter.as_ref().map(std::rc::Rc::clone)
+    }
+
     /// Cierra la conexión actual y vuelve el foco a Fuentes.
     fn disconnect_db(&mut self) {
         self.db_path = None;
         self.db_size_bytes = None;
+        self.active_adapter = None;
         self.tables.clear();
         self.views.clear();
         self.advanced.clear();
@@ -3144,14 +3152,11 @@ impl App {
     /// actualmente seleccionada en el Detail. Se puede llamar en caliente
     /// (mientras el modal está abierto) para seguir la navegación ↑/↓.
     fn refresh_row_inspector(&mut self) {
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             return;
         }
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_rc() else {
             return;
         };
 
@@ -3432,7 +3437,6 @@ impl App {
     ///
     /// Devuelve `true` si saltó (la fila tenía una FK resuelta).
     fn fk_jump(&mut self) -> bool {
-        let Some(path) = self.db_path.as_deref() else { return false };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             return false;
@@ -3441,7 +3445,7 @@ impl App {
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1);
         let Some(row) = data.rows.get(row_idx) else { return false };
 
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_rc() else {
             return false;
         };
         let Ok(fks) = adapter.foreign_keys(&object) else {
@@ -3488,18 +3492,16 @@ impl App {
 
         // Cambiar al objeto referenciado (recargando tablas si no estaba)
         if !self.tables.contains(&fk.table) {
-            if let Some(path) = self.db_path.as_deref() {
-                if let Some(adapter) = db::resolver::resolve_backend(path) {
-                    if let Ok(tables) = adapter.list_objects_by_type("table") {
-                        self.tables = tables;
-                        self.sources = Self::build_sources(
-                            &self.state,
-                            self.source_tab,
-                            Some(path),
-                            &self.health,
-                            &self.detected_servers,
-                        );
-                    }
+            if let Some(adapter) = self.adapter_rc() {
+                if let Ok(tables) = adapter.list_objects_by_type("table") {
+                    self.tables = tables;
+                    self.sources = Self::build_sources(
+                        &self.state,
+                        self.source_tab,
+                        self.db_path.as_deref(),
+                        &self.health,
+                        &self.detected_servers,
+                    );
                 }
             }
         }
@@ -5443,6 +5445,10 @@ mod tests {
             app.db_path.is_some(),
             "Enter en URL válida debe conectar (status: {})",
             app.status
+        );
+        assert!(
+            app.active_adapter.is_some(),
+            "el adapter debe compartirse en active_adapter tras conectar"
         );
         assert!(
             app.tables.iter().any(|c| c == "test_probe"),
