@@ -374,6 +374,27 @@ fn is_source_section(item: &str) -> bool {
     item.starts_with(SOURCE_SECTION_MARK)
 }
 
+/// Quita las credenciales (`user:pass@`) de una URL y devuelve el user.
+/// Útil para el prompt de contraseña: no mostrar la password de nuevo y
+/// sugerir el user que la URL ya traía. Acepta `mysql://`, `postgres://` y
+/// `postgresql://` (el parámetro `scheme` cubre la variante canónica).
+#[cfg(any(feature = "mysql", feature = "postgres"))]
+fn strip_url_credentials(url: &str) -> (String, Option<String>) {
+    // Encuentra `scheme://` o `scheme+algo://` (p.ej. postgresql://)
+    let Some(at) = url.find("://") else {
+        return (url.to_string(), None);
+    };
+    let (scheme_part, rest) = url.split_at(at + 3);
+    let Some(at_mark) = rest.rfind('@') else {
+        return (url.to_string(), None);
+    };
+    let creds = &rest[..at_mark];
+    let host = &rest[at_mark + 1..];
+    let user =
+        creds.split_once(':').map_or(Some(creds), |(u, _)| Some(u)).map(ToString::to_string);
+    (format!("{scheme_part}{host}"), user)
+}
+
 /// ¿La URL `mysql://`, `postgres://` o `mongodb://` incluye una base de datos
 /// explícita (`.../bd`)? Las URLs de `scan_local_servers` llegan sin BD: son
 /// servidores. Solo el flujo de servidores remotos (mysql/postgres/mongo) la usa.
@@ -1598,11 +1619,17 @@ impl App {
     #[cfg(feature = "mysql")]
     fn connect_mysql_server(&mut self, url: &str) {
         self.status = format!("Conectando a {url}...");
-        // Conexión a nivel de servidor: primero probamos `root` SIN
-        // contraseña (el caso típico de instalaciones locales sin auth).
-        // Importante: NO usar la URL tal cual (user vacío → la cuenta
-        // anónima de MariaDB solo ve la BD `test`), sino root explícito.
-        let url_root = {
+        // Si la URL YA trae credenciales (`user:pass@`), se conservan: es una
+        // conexión a servidor autenticada desde el inicio.
+        let has_creds = url
+            .strip_prefix("mysql://")
+            .is_some_and(|rest| rest.contains('@') && !rest.starts_with('@'));
+        // Sin credenciales: probar `root` SIN contraseña (instalaciones
+        // locales típicas). NO usar la URL tal cual (user vacío → la cuenta
+        // anónima de MariaDB solo ve la BD `test`).
+        let url_root = if has_creds {
+            url.to_string()
+        } else {
             let host = url.strip_prefix("mysql://").unwrap_or(url);
             format!("mysql://root@{host}")
         };
@@ -1621,13 +1648,14 @@ impl App {
                 self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
-                // Sin acceso (auth o red): pedir contraseña. El usuario
-                // asumido es `root` en localhost.
+                // Sin acceso (auth o red): pedir contraseña. URL limpia (sin
+                // credenciales) y el user de la URL si lo traía.
                 tracing::warn!(url = %url, error = ?err, "servidor sin acceso, pidiendo contraseña");
                 self.status = String::new();
+                let (clean_url, user) = strip_url_credentials(url);
                 self.password_prompt = Some(PasswordPromptState {
-                    server_url: url.to_string(),
-                    user: "root".to_string(),
+                    server_url: clean_url,
+                    user: user.unwrap_or_else(|| "root".to_string()),
                     buffer: String::new(),
                 });
             }
@@ -1672,15 +1700,23 @@ impl App {
     fn connect_postgres_server(&mut self, url: &str) {
         self.status = format!("Conectando a {url}...");
         // Normalizamos `postgresql://` → `postgres://` (el crate solo entiende
-        // el segundo). OJO: NO probar con user vacío (el peer auth de Postgres
-        // usa el user del SO); probar el superuser local `postgres`.
+        // el segundo). Si la URL YA trae credenciales (`user:pass@`), se
+        // conservan: es una conexión a servidor autenticada desde el inicio.
         let scheme_normalized = if url.starts_with("postgresql://") {
             url.replacen("postgresql://", "postgres://", 1)
         } else {
             url.to_string()
         };
+        let has_creds = scheme_normalized
+            .strip_prefix("postgres://")
+            .is_some_and(|rest| rest.contains('@') && !rest.starts_with('@'));
         let host = scheme_normalized.strip_prefix("postgres://").unwrap_or(&scheme_normalized);
-        let url_postgres = format!("postgres://postgres@{host}");
+        // Sin credenciales: probar el superuser local `postgres` (peer auth).
+        let url_postgres = if has_creds {
+            scheme_normalized.clone()
+        } else {
+            format!("postgres://postgres@{host}")
+        };
         let result = crate::db::rt::block_on(async {
             let (pool, db_name) = crate::db::backends::postgres::connect(&url_postgres)?;
             let dbs = crate::db::backends::postgres::list_databases(&pool)?;
@@ -1699,9 +1735,12 @@ impl App {
             Err(err) => {
                 tracing::warn!(url = %url, error = ?err, "servidor postgres sin acceso, pidiendo contraseña");
                 self.status = String::new();
+                // Prompt con URL SIN credenciales (no repetir la password en
+                // pantalla) y el user de la URL si lo traía.
+                let (clean_url, user) = strip_url_credentials(&scheme_normalized);
                 self.password_prompt = Some(PasswordPromptState {
-                    server_url: scheme_normalized,
-                    user: "postgres".to_string(),
+                    server_url: clean_url,
+                    user: user.unwrap_or_else(|| "postgres".to_string()),
                     buffer: String::new(),
                 });
             }
@@ -4511,6 +4550,24 @@ mod tests {
 
     #[test]
     #[cfg(any(feature = "mysql", feature = "postgres"))]
+    fn strip_url_credentials_quita_user_pass_y_devuelve_el_user() {
+        let (clean, user) =
+            strip_url_credentials("postgresql://uo8h6cfqdm4u5xv6lfqq:secret@host:5432/db");
+        assert_eq!(clean, "postgresql://host:5432/db");
+        assert_eq!(user.as_deref(), Some("uo8h6cfqdm4u5xv6lfqq"));
+
+        // Sin credenciales: intacta y user None
+        let (clean, user) = strip_url_credentials("postgres://localhost:5432");
+        assert_eq!(clean, "postgres://localhost:5432");
+        assert_eq!(user, None);
+
+        let (clean, user) = strip_url_credentials("mysql://root:root@127.0.0.1:3306");
+        assert_eq!(clean, "mysql://127.0.0.1:3306");
+        assert_eq!(user.as_deref(), Some("root"));
+    }
+
+    #[test]
+    #[cfg(any(feature = "mysql", feature = "postgres"))]
     fn server_url_has_database_distingue_servidor_de_bd() {
         // URLs de scan_local_servers: servidor sin base
         assert!(!server_url_has_database("mysql://127.0.0.1:3306"));
@@ -4525,6 +4582,10 @@ mod tests {
         assert!(!server_url_has_database("postgres://postgres:secret@127.0.0.1:5432"));
         assert!(server_url_has_database("postgres://127.0.0.1:5432/sakila"));
         assert!(server_url_has_database("postgresql://user:pw@localhost:5432/mydb"));
+        // URI real de CleverCloud (producción): con base → NO es servidor
+        assert!(server_url_has_database(
+            "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/bh4bhaewrpd8qqcreso5"
+        ));
         // No-servidor no entra en el flujo
         assert!(!server_url_has_database("/tmp/x.db"));
     }
