@@ -126,8 +126,9 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
     let items = app.items_for(kind);
     let focused = app.active_panel == kind;
 
-    // Formulario de nueva conexión: panel Detail sin db abierta
-    if kind == PanelKind::Detail && app.connection_form.is_some() {
+    // Formulario de nueva conexión: REGLA DE ORO — sin db abierta, el Detail
+    // SIEMPRE muestra el formulario, sin importar el panel enfocado ni Esc.
+    if kind == PanelKind::Detail && app.db_path.is_none() {
         widgets::connection_form::render(frame, area, app);
         return;
     }

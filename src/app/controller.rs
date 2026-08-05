@@ -2537,8 +2537,16 @@ impl App {
         // Conexión real (sync por ahora; el spinner se limpia después)
         self.connection_form.as_mut().unwrap().connecting = true;
         self.connect_sqlite(&url);
-        self.connection_form = None;
-        self.status = "Conectando…".to_string();
+        // REGLA DE ORO: el formulario persiste en el estado; el render lo
+        // oculta mientras haya db (`db_path.is_some()`). Al desconectar,
+        // reaparece automáticamente.
+        if let Some(form) = self.connection_form.as_mut() {
+            form.connecting = false;
+            form.url_debounce_scheduled = false;
+        }
+        if self.db_path.is_none() {
+            self.status = format!("No se pudo conectar a {url}");
+        }
     }
 
     /// Maneja las teclas del formulario de conexión.
@@ -2549,8 +2557,10 @@ impl App {
         let Some(form) = self.connection_form.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
-                self.connection_form = None;
-                self.status = "Conexión cancelada".to_string();
+                // REGLA DE ORO: el formulario nunca se cierra sin db. Esc solo
+                // mueve el foco a Fuentes (la conexión queda pendiente).
+                self.active_panel = PanelKind::Sources;
+                self.status = "Conexión pendiente: el formulario queda en el panel Detalle".to_string();
             }
             KeyCode::Tab | KeyCode::Down => {
                 let next = match form.active {
@@ -3543,10 +3553,7 @@ impl App {
         // está en el panel Detail y NO hay db conectada; los chars alimentan
         // el campo activo). Con foco en otro panel, `:` y las teclas globales
         // siguen funcionando normal. ──
-        if self.connection_form.is_some()
-            && self.db_path.is_none()
-            && self.active_panel == PanelKind::Detail
-        {
+        if self.db_path.is_none() && self.active_panel == PanelKind::Detail {
             self.handle_connection_form_key(key);
             return;
         }
@@ -5209,6 +5216,33 @@ mod tests {
         };
         assert_eq!(form.active, ConnField::Url, "foco inicial en la URL");
         assert!(app.preview_rows.is_empty(), "sin items de lista");
+    }
+
+    #[test]
+    fn regla_de_oro_el_formulario_nunca_se_cierra_sin_db() {
+        // Esc con el foco en Detail no cierra el formulario: solo mueve el
+        // foco a Fuentes. El estado `connection_form` persiste.
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.connection_form.is_some(),
+            "Esc no debe cerrar el formulario sin db abierta"
+        );
+        assert_eq!(app.active_panel, PanelKind::Sources, "Esc mueve el foco a Fuentes");
+
+        // Navegar a otros paneles no elimina el formulario tampoco
+        app.active_panel = PanelKind::Tables;
+        assert!(app.connection_form.is_some(), "el formulario persiste en cualquier panel");
+    }
+
+    #[test]
+    fn conectar_con_exito_oculta_el_formulario_y_desconectar_lo_reactiva() {
+        // Simula el contrato de la regla de oro: el render muestra el
+        // formulario cuando `db_path.is_none()`, sea cual sea el panel.
+        let app = App::new();
+        assert!(app.db_path.is_none());
+        assert!(app.connection_form.is_some(), "sin db → formulario presente");
     }
 
     #[test]
