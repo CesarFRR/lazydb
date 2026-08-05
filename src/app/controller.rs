@@ -369,15 +369,16 @@ fn is_source_section(item: &str) -> bool {
     item.starts_with(SOURCE_SECTION_MARK)
 }
 
-/// ¿La URL `mysql://` o `postgres://` incluye una base de datos explícita
-/// (`.../bd`)? Las URLs de `scan_local_servers` llegan sin BD: son servidores.
-/// Solo el flujo de servidores remotos (mysql/postgres) la usa.
-#[cfg(any(feature = "mysql", feature = "postgres"))]
+/// ¿La URL `mysql://`, `postgres://` o `mongodb://` incluye una base de datos
+/// explícita (`.../bd`)? Las URLs de `scan_local_servers` llegan sin BD: son
+/// servidores. Solo el flujo de servidores remotos (mysql/postgres/mongo) la usa.
+#[cfg(any(feature = "mysql", feature = "postgres", feature = "mongodb"))]
 fn server_url_has_database(url: &str) -> bool {
     let rest = url
         .strip_prefix("mysql://")
         .or_else(|| url.strip_prefix("postgres://"))
         .or_else(|| url.strip_prefix("postgresql://"))
+        .or_else(|| url.strip_prefix("mongodb://"))
         .unwrap_or_default();
     // `host`, `host:puerto`, `user:pass@host:puerto` → sin `/` = sin BD.
     // Con `/bd` → hay base.
@@ -1644,6 +1645,33 @@ impl App {
         }
     }
 
+    /// Conexión a nivel de servidor `MongoDB`: lista las bases (listDatabases)
+    /// y abre el picker para elegir. Mongo local suele correr sin auth; si hay
+    /// credenciales en la URL, el connect las usa.
+    #[cfg(feature = "mongodb")]
+    fn connect_mongo_server(&mut self, url: &str) {
+        self.status = format!("Conectando a {url}...");
+        let result = crate::db::rt::block_on(async {
+            let (client, db_name) = crate::db::backends::mongo::connect(url)?;
+            let dbs = crate::db::backends::mongo::list_databases(&client)?;
+            Ok::<(String, Vec<String>), crate::db::DbError>((db_name, dbs))
+        });
+        match result {
+            Ok((db_name, dbs)) if dbs.is_empty() => {
+                self.status =
+                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+            }
+            Ok((_db_name, dbs)) => {
+                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
+            }
+            Err(err) => {
+                tracing::warn!(url = %url, error = ?err, "mongo sin acceso");
+                self.show_error("No se pudo conectar a MongoDB", &err.to_string());
+            }
+        }
+    }
+
     /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
     fn connect_sqlite(&mut self, path: &str) {
@@ -1654,6 +1682,11 @@ impl App {
         } else if path.starts_with("postgresql://") {
             // El crate solo entiende `postgres://`; unificar el alias aquí.
             path.replacen("postgresql://", "postgres://", 1)
+        } else if path.contains("://") {
+            // Cualquier otra URL con scheme (mongodb://, postgres://, duckdb://
+            // remoto, etc.) se preserva tal cual: solo los paths de archivo
+            // pasan por la normalización.
+            path.to_string()
         } else {
             crate::paths::normalize_path(path)
         };
@@ -1671,6 +1704,14 @@ impl App {
             && !server_url_has_database(&path)
         {
             self.connect_postgres_server(&path);
+            return;
+        }
+        // URL mongodb:// SIN base → listar bases (listDatabases) y picker.
+        // Mongo local suele correr sin auth; si pide credenciales el
+        // connect falla y el resolver mostrará el error.
+        #[cfg(feature = "mongodb")]
+        if path.starts_with("mongodb://") && !server_url_has_database(&path) {
+            self.connect_mongo_server(&path);
             return;
         }
         self.is_loading = true;
@@ -4668,5 +4709,42 @@ mod tests {
         app.connect_sqlite(&url);
         assert!(app.tables.contains(&"categories".to_string()), "tablas: {:?}", app.tables);
         assert!(app.views.contains(&"view_order_summary".to_string()), "vistas: {:?}", app.views);
+    }
+
+    /// Smoke del flujo mongo: abrir `mongodb://host:puerto` (sin base) desde
+    /// servidores locales abre el picker con las bases reales, y elegir una
+    /// conecta el catálogo (colecciones). Requiere `MongoDB` local
+    /// (`LAZYDB_MONGO_URI`).
+    #[test]
+    #[cfg(feature = "mongodb")]
+    #[ignore = "requiere MongoDB local (LAZYDB_MONGO_URI)"]
+    fn smoke_flujo_servidor_mongo_picker_conecta_colecciones() {
+        let Ok(server_url) = std::env::var("LAZYDB_MONGO_SERVER_URL") else {
+            return;
+        };
+        let mut app = App::new();
+        // Mismo path que la UI al presionar Enter sobre el servidor detectado
+        app.connect_sqlite(&server_url);
+        let Some(picker) = &app.db_picker else {
+            panic!("debe abrirse el picker (status: {})", app.status);
+        };
+        assert!(
+            picker.dbs.iter().any(|d| d == "lazydb_probe"),
+            "bases: {:?}",
+            picker.dbs
+        );
+        // Elegir la base por índice → connect_sqlite conecta el catálogo
+        let idx = picker.dbs.iter().position(|d| d == "lazydb_probe").unwrap();
+        let picker = app.db_picker.take().unwrap();
+        let db = picker.dbs[idx].clone();
+        let mut url = picker.server_url;
+        url.push('/');
+        url.push_str(&db);
+        app.connect_sqlite(&url);
+        assert!(
+            app.tables.iter().any(|c| c == "test_probe"),
+            "colecciones: {:?}",
+            app.tables
+        );
     }
 }

@@ -16,16 +16,20 @@ rust-version = "1.85"
 #
 # `files` depende de `duckdb` porque el backend de archivos (parquet/csv/
 # json/geojson/gpkg) se lee con duckdb internamente.
-default = ["sqlite", "duckdb", "files", "mysql", "postgres"]
+default = ["sqlite", "duckdb", "files", "mysql", "postgres", "mongodb"]
 sqlite  = ["dep:rusqlite"]
 duckdb  = ["dep:duckdb"]
 files   = ["duckdb"]
 mysql   = ["dep:mysql_async"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+# NoSQL: MongoDB (crate oficial `mongodb`). Sin serde tipado: `bson::Document`
+# crudo + helpers manuales (interfaz de bajo nivel, ver WIP.md).
+mongodb = ["dep:mongodb"]
 
 # Meta-features de conveniencia: grupos por tipo de conexión
 local   = ["sqlite", "duckdb", "files"]
 remote  = ["mysql", "postgres"]
+nosql   = ["mongodb"]
 
 [dependencies]
 ratatui = "0.29"
@@ -44,6 +48,10 @@ fallible-streaming-iterator = "0.1.9"
 mysql_async = { version = "0.37.0", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
+# `compat-3-3-0` (API estable) + `bson-2` (API clásica de bson, la que usa
+# el driver por defecto) + `rustls-tls` (TLS sin openssl).
+mongodb = { version = "3.8", default-features = false, features = ["compat-3-3-0", "bson-2", "rustls-tls"], optional = true }
+futures-util = "0.3"
 
 [lints.rust]
 unsafe_code = "forbid"

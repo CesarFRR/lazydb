@@ -1,7 +1,7 @@
 // Backends concretos, gateados por feature (Fase B):
 // `sqlite` → sqlite.rs/adapter, `duckdb` → duckdb.rs/adapter,
 // `files` → file.rs/adapter (depende de duckdb), `mysql` → mysql.rs/adapter,
-// `postgres` → postgres.rs/adapter.
+// `postgres` → postgres.rs/adapter, `mongodb` → mongo.rs/adapter.
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 #[cfg(feature = "sqlite")]
@@ -26,3 +26,8 @@ pub mod mysql_adapter;
 pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_adapter;
+
+#[cfg(feature = "mongodb")]
+pub mod mongo;
+#[cfg(feature = "mongodb")]
+pub mod mongo_adapter;

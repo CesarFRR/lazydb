@@ -76,6 +76,13 @@ impl From<deadpool_postgres::PoolError> for DbError {
     }
 }
 
+#[cfg(feature = "mongodb")]
+impl From<mongodb::error::Error> for DbError {
+    fn from(err: mongodb::error::Error) -> Self {
+        Self::Sqlite(format!("MongoDB: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
