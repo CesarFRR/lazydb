@@ -389,6 +389,38 @@ pub const fn foreign_keys(
     Vec::new()
 }
 
+/// Pares `(clave, valor)` del documento en `offset`, para el modal de
+/// detalles. SOLO los campos presentes (`NoSQL`: cada doc puede tener campos
+/// distintos; los ausentes no existen y no deben mostrarse).
+/// El valor se renderiza con `render_value_pretty` (multilínea si anida).
+pub fn row_inspector_pairs(
+    client: &Client,
+    db_name: &str,
+    collection: &str,
+    offset: u32,
+) -> Result<Vec<(String, String)>, DbError> {
+    let coll = db(client, db_name).collection::<Document>(collection);
+    block_on(async {
+        let mut cursor = coll
+            .find(Document::new())
+            .skip(u64::from(offset))
+            .limit(1)
+            .await
+            .map_err(|e| DbError::Open(format!("{collection}.find: {e}")))?;
+        let Some(doc) = cursor
+            .try_next()
+            .await
+            .map_err(|e| DbError::Open(format!("{collection}.find cursor: {e}")))?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(doc
+            .iter()
+            .map(|(k, v)| (k.clone(), render_value_pretty(v, 0)))
+            .collect())
+    })
+}
+
 /// Offset del documento cuyo campo `col` serializa a `value` (para FK Jump /
 /// saltar a una fila). Recorre secuencialmente: no hay índice de texto.
 pub fn row_offset_of(
@@ -595,5 +627,28 @@ mod tests {
         let cols_schema = observed_columns(&client, &db, &coll_name).expect("columnas");
         println!("COLUMNAS observadas: {cols_schema:?}");
         assert!(cols_schema.iter().any(|c| c.name == "_id"));
+
+        // Inspector de fila: pares SOLO de campos presentes en cada doc.
+        // Los docs tienen campos distintos → los pares deben reflejarlo
+        // (un doc sin `age` no debe traer un par `age` vacío).
+        let offset_cesar = row_offset_of(&client, &db, &coll_name, "name", "cesar")
+            .expect("offset cesar");
+        if let Some(idx) = offset_cesar {
+            let pairs =
+                row_inspector_pairs(&client, &db, &coll_name, idx).expect("pares de fila");
+            println!("PARES del doc cesar (offset {idx}): {pairs:?}");
+            let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+            assert!(keys.contains(&"_id"), "todo doc tiene _id: {keys:?}");
+            assert!(keys.contains(&"name"), "cesar tiene name: {keys:?}");
+            assert!(keys.contains(&"meta"), "cesar tiene meta: {keys:?}");
+            // Un doc sin `age` no lo lista: verificamos con el doc ana (offset+1)
+            let pairs_ana =
+                row_inspector_pairs(&client, &db, &coll_name, idx + 1).expect("pares ana");
+            let keys_ana: Vec<&str> = pairs_ana.iter().map(|(k, _)| k.as_str()).collect();
+            assert!(
+                !keys_ana.contains(&"meta"),
+                "ana no tiene meta; no debe listarse: {keys_ana:?}"
+            );
+        }
     }
 }

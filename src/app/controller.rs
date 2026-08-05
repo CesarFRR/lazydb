@@ -2702,13 +2702,24 @@ impl App {
         let Some(adapter) = db::resolver::resolve_backend(path) else {
             return;
         };
-        let Ok(columns) = adapter.column_names(&object) else {
-            return;
-        };
 
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1); // skip header
         #[allow(clippy::cast_possible_truncation)]
         let offset = self.preview_loaded_offset + row_idx as u32;
+
+        // NoSQL (mongo): el backend entrega directo los pares clave→valor SOLO
+        // de los campos presentes en este documento. Cada fila puede tener
+        // campos distintos; los ausentes no se muestran ni se desalinean.
+        if let Some(pairs) = adapter.row_inspector_pairs(&object, offset) {
+            self.row_inspector_pairs = pairs;
+            self.inspector_scroll.reset();
+            return;
+        }
+
+        // SQL (esquema fijo): flujo clásico por índice.
+        let Ok(columns) = adapter.column_names(&object) else {
+            return;
+        };
         // Celdas expandidas (multilínea): los tipos compuestos de DuckDB
         // (list/struct/map/union/array) se muestran completos en el modal.
         let Ok(rows) = adapter.table_data_rows_pretty(&object, 1, offset) else {

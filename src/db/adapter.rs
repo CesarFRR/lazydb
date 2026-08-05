@@ -47,6 +47,22 @@ pub trait DbAdapter: Send + Sync {
         value: &str,
     ) -> Result<Option<u32>, DbError>;
 
+    // ── inspector de fila (NoSQL) ──
+    /// Pares `(clave, valor)` de la fila en `offset` para el modal de
+    /// detalles. SOLO incluye los campos PRESENTES en el documento/entidad:
+    /// en `NoSQL` (mongo) cada fila puede tener campos distintos y los
+    /// ausentes no deben aparecer (ni como fila vacía ni desalineados).
+    ///
+    /// SQL (esquema fijo) devuelve `None` → el inspector usa el flujo clásico
+    /// `column_names` + `table_data_rows_pretty` alineados por índice.
+    fn row_inspector_pairs(
+        &self,
+        _object_name: &str,
+        _offset: u32,
+    ) -> Option<Vec<(String, String)>> {
+        None
+    }
+
     // ── query libre del usuario (modal `:`) ──
     /// Ejecuta un SQL arbitrario read-only y devuelve las filas formateadas
     /// (`celda | celda`), con tope `limit` (culling: nunca materializar todo).

@@ -141,6 +141,17 @@ impl DbAdapter for MongoAdapter {
         })
     }
 
+    fn row_inspector_pairs(
+        &self,
+        object_name: &str,
+        offset: u32,
+    ) -> Option<Vec<(String, String)>> {
+        self.with_client(|client, db| {
+            crate::db::backends::mongo::row_inspector_pairs(client, db, object_name, offset)
+        })
+        .ok()
+    }
+
     fn query(&self, sql: &str, limit: u32) -> Result<Vec<String>, DbError> {
         self.with_client(|client, db| {
             crate::db::backends::mongo::query_free(client, db, sql, limit)
