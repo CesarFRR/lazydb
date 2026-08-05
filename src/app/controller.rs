@@ -233,6 +233,7 @@ fn source_kind(value: &str) -> SourceKind {
     if lower.starts_with("mysql://")
         || lower.starts_with("postgres://")
         || lower.starts_with("postgresql://")
+        || lower.starts_with("mongodb://")
     {
         let host = url_host(&lower);
         let is_local =
@@ -264,6 +265,8 @@ fn source_host_port(url: &str) -> Option<(String, u16)> {
         3306
     } else if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
         5432
+    } else if lower.starts_with("mongodb://") {
+        27017
     } else if lower.starts_with("http://") {
         80
     } else if lower.starts_with("https://") {
@@ -4159,6 +4162,8 @@ mod tests {
         assert_eq!(source_kind("mysql://127.0.0.1:3306/lazy"), SourceKind::Localhost);
         assert_eq!(source_kind("postgres://[::1]:5432/prod"), SourceKind::Localhost);
         assert_eq!(source_kind("postgres://db.azure.com:5432/prod"), SourceKind::Online);
+        assert_eq!(source_kind("mongodb://127.0.0.1:27017"), SourceKind::Localhost);
+        assert_eq!(source_kind("mongodb://mongo.atlas.cloud:27017/db"), SourceKind::Online);
         assert_eq!(source_kind("https://api.example.com/db"), SourceKind::Online);
         assert_eq!(source_kind("ssh://host/db"), SourceKind::Online);
         // sqlite:// y rutas de archivo SIEMPRE son File (antes se confundían)
@@ -4173,6 +4178,7 @@ mod tests {
         assert_eq!(url_host("mysql://localhost/db"), Some("localhost"));
         assert_eq!(url_host("postgres://[::1]:5432/x"), Some("[::1]"));
         assert_eq!(url_host("postgres://db.azure.com:5432/prod"), Some("db.azure.com"));
+        assert_eq!(url_host("mongodb://127.0.0.1:27017"), Some("127.0.0.1"));
         assert_eq!(url_host("sqlite:///tmp/x.db"), Some(""));
     }
 
@@ -4257,6 +4263,8 @@ mod tests {
         );
         // Sin puerto → default del esquema
         assert_eq!(source_host_port("mysql://localhost/lazy"), Some(("localhost".into(), 3306)));
+        assert_eq!(source_host_port("mongodb://localhost/mydb"), Some(("localhost".into(), 27017)));
+        assert_eq!(source_host_port("mongodb://127.0.0.1:27017"), Some(("127.0.0.1".into(), 27017)));
         assert_eq!(
             source_host_port("https://api.example.com/x"),
             Some(("api.example.com".into(), 443))
@@ -4293,6 +4301,9 @@ mod tests {
         let port = listener.local_addr().expect("puerto local").port();
         let url = format!("mysql://127.0.0.1:{port}/lazy");
         assert!(probe_source(&url), "servicio escuchando debe dar ✓: {url}");
+        // MongoDB usa el mismo probe TCP (puerto explícito en la URL)
+        let url_mongo = format!("mongodb://127.0.0.1:{port}/lazy");
+        assert!(probe_source(&url_mongo), "servicio mongo escuchando debe dar ✓: {url_mongo}");
         drop(listener);
 
         // Puerto cerrado: debe dar ✗ (refused es inmediato)

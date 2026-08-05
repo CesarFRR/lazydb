@@ -118,14 +118,33 @@ fn render_doc_compact(doc: &Document) -> String {
     format!("{{ {} }}", inner.join(", "))
 }
 
+/// ¿Contiene el valor algún compuesto (document/array) ANIDADO?
+/// `false` → puede mostrarse en una sola línea.
+fn has_nested(v: &Bson) -> bool {
+    match v {
+        Bson::Document(doc) => {
+            doc.values().any(|x| matches!(x, Bson::Document(_) | Bson::Array(_)) || has_nested(x))
+        }
+        Bson::Array(items) => {
+            items.iter().any(|x| matches!(x, Bson::Document(_) | Bson::Array(_)) || has_nested(x))
+        }
+        _ => false,
+    }
+}
+
 /// Render de un documento BSON con indentación (inspector de fila).
+///
+/// Inteligente: si el doc NO contiene compuestos anidados (o está vacío),
+/// se renderiza en una sola línea (`{ a: 1, b: x }`). Si hay anidados, cada
+/// clave va en su línea; los valores simples se mantienen en línea y solo
+/// los compuestos con hijos propios se expanden.
 pub fn render_doc_pretty(doc: &Document, indent: usize) -> String {
+    let nested = doc.values().any(|v| matches!(v, Bson::Document(_) | Bson::Array(_)) || has_nested(v));
+    if doc.is_empty() || !nested {
+        return render_doc_compact(doc);
+    }
     let pad = "  ".repeat(indent);
     let mut out = String::from("{");
-    if doc.is_empty() {
-        out.push('}');
-        return out;
-    }
     for (k, v) in doc {
         out.push('\n');
         out.push_str(&pad);
@@ -144,10 +163,17 @@ fn render_value_pretty(v: &Bson, indent: usize) -> String {
     match v {
         Bson::Document(doc) => render_doc_pretty(doc, indent),
         Bson::Array(items) => {
-            let pad = "  ".repeat(indent);
-            if items.is_empty() {
-                return "[]".to_string();
+            // Array simple → una línea `[a, b]`. Solo se expande si algún
+            // elemento es a su vez un array (2D) o tiene compuestos anidados
+            // con profundidad real: `[[1,2],[3,4]]` expande;
+            // `[{a:1},{b:2}]` (docs simples) no.
+            let deep_nested = items
+                .iter()
+                .any(|x| matches!(x, Bson::Array(_)) || has_nested(x));
+            if items.is_empty() || !deep_nested {
+                return bson_to_string(v);
             }
+            let pad = "  ".repeat(indent);
             let mut out = String::from("[");
             for item in items {
                 out.push('\n');
@@ -469,13 +495,39 @@ mod tests {
 
     #[test]
     fn render_doc_pretty_indenta_anidados() {
+        // Los DOCS anidados expanden por nivel; los arrays simples dentro
+        // quedan en una línea (`b: [1, 2]`).
         let doc = doc! {"a": 1, "nested": doc! {"b": [1, 2]}};
         let out = render_doc_pretty(&doc, 0);
         assert!(out.contains("\n  a: 1"), "doc: {out}");
         assert!(
-            out.contains("\n  nested: {\n    b: [\n      1\n      2\n    ]\n  }"),
+            out.contains("\n  nested: {\n    b: [1, 2]\n  }"),
             "doc: {out}"
         );
+    }
+
+    #[test]
+    fn render_doc_pretty_simple_queda_en_una_linea() {
+        // `{ok: true}` (un solo par, sin anidados) → una línea, sin saltos
+        let doc = doc! {"ok": true};
+        assert_eq!(render_doc_pretty(&doc, 0), "{ ok: true }");
+        // Varios pares simples también: sin compuestos → una línea
+        let doc = doc! {"a": 1, "b": "x"};
+        assert_eq!(render_doc_pretty(&doc, 0), "{ a: 1, b: x }");
+    }
+
+    #[test]
+    fn render_value_pretty_array_simple_queda_en_una_linea() {
+        // tags: ["a", "b"] (array 1D simple) → una línea, sin saltos
+        let v = bson!(["a", "b"]);
+        assert_eq!(render_value_pretty(&v, 0), "[a, b]");
+        // Array de escalares y docs simples → sin anidados → una línea
+        let v = bson!([1, 2, 3]);
+        assert_eq!(render_value_pretty(&v, 0), "[1, 2, 3]");
+        // Array 2D (arrays dentro) → multilínea
+        let v = bson!([[1, 2], [3, 4]]);
+        let out = render_value_pretty(&v, 0);
+        assert!(out.contains('\n'), "array 2d debe expandirse: {out}");
     }
 
     #[test]
