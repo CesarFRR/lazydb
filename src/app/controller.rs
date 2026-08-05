@@ -783,7 +783,7 @@ pub struct App {
     /// conexiones lentas (`CleverCloud`) por límite de conexiones.
     /// `Rc` permite clonar la referencia sin prestar `self` (los métodos
     /// que usan el adapter también asignan campos de `self`).
-    pub active_adapter: Option<std::rc::Rc<dyn crate::db::adapter::DbAdapter>>,    pub db_size_bytes: Option<u64>,
+    pub active_adapter: Option<std::sync::Arc<dyn crate::db::adapter::DbAdapter>>,    pub db_size_bytes: Option<u64>,
     /// ¿El backend conectado es `NoSQL` (mongo)? La UI cambia terminología
     /// (`row` → `doc`) y muestra el toggle JSON del modal.
     pub is_nosql: bool,
@@ -1868,7 +1868,7 @@ impl App {
         };
         // Compartir el adapter: la conexión/pool se crea UNA vez y se reusa
         // para todas las operaciones (evita límite de conexiones + handshakes).
-        self.active_adapter = Some(std::rc::Rc::from(adapter));
+        self.active_adapter = Some(std::sync::Arc::from(adapter));
         let adapter = self.active_adapter.as_ref().unwrap().as_ref();
         let tables = adapter.list_objects_by_type("table");
         let views = adapter.list_objects_by_type("view");
@@ -1889,7 +1889,7 @@ impl App {
             self.db_path = Some(path.clone());
             // ¿NoSQL? (mongo): cambia la terminología de la UI (row→doc) y
             // habilita el toggle JSON del modal de detalles.
-            self.is_nosql = self.adapter_rc().is_some_and(|a| a.is_nosql());
+            self.is_nosql = self.adapter_arc().is_some_and(|a| a.is_nosql());
             // `db_size_bytes` solo aplica a bds de archivo (mysql:// no es path)
             self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
             self.tables = tables;
@@ -1981,7 +1981,7 @@ impl App {
 
         // Backend resuelto por extensión: todas las lecturas del preview
         // (filas, schema, DDL, count) pasan por el adapter.
-        let Some(adapter) = self.adapter_rc() else {
+        let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
         };
@@ -2183,7 +2183,7 @@ impl App {
         self.status = format!("Cargando más filas (offset {next_offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-        let Some(adapter) = self.adapter_rc() else {
+        let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
         };
@@ -2228,7 +2228,7 @@ impl App {
         self.status = format!("Cargando filas anteriores (offset {offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-        let Some(adapter) = self.adapter_rc() else {
+        let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
         };
@@ -2314,8 +2314,10 @@ impl App {
         self.query_state = query::QueryState::Running;
         self.status = "Contando filas...".to_string();
 
+        // Provider: reusar la conexión activa (evita re-handshake en remoto)
+        let adapter = self.adapter_arc();
         tokio::spawn(async move {
-            let res = query::count_query_results(&path, &sql).await;
+            let res = query::count_query_results(adapter, &path, &sql).await;
             let _ = tx.send(query::QueryMsg::Count(generation, sql, res));
         });
     }
@@ -2914,8 +2916,10 @@ impl App {
         self.status = "Ejecutando query...".to_string();
         self.is_loading = true;
 
+        // Provider: reusar la conexión activa (evita re-handshake en remoto)
+        let adapter = self.adapter_arc();
         tokio::spawn(async move {
-            let res = query::execute_query(&path, &sql, query::QUERY_RESULT_LIMIT).await;
+            let res = query::execute_query(adapter, &path, &sql, query::QUERY_RESULT_LIMIT).await;
             let _ = tx.send(query::QueryMsg::Free(generation, sql, res));
         });
     }
@@ -3041,8 +3045,8 @@ impl App {
 
     /// Adapter de la conexión activa (compartido). `None` si no hay db.
     /// Referencia clonada al adapter activo (no presta `self`).
-    fn adapter_rc(&self) -> Option<std::rc::Rc<dyn crate::db::adapter::DbAdapter>> {
-        self.active_adapter.as_ref().map(std::rc::Rc::clone)
+    fn adapter_arc(&self) -> Option<std::sync::Arc<dyn crate::db::adapter::DbAdapter>> {
+        self.active_adapter.as_ref().map(std::sync::Arc::clone)
     }
 
     /// Cierra la conexión actual y vuelve el foco a Fuentes.
@@ -3156,7 +3160,7 @@ impl App {
         if object.is_empty() || object == "-" {
             return;
         }
-        let Some(adapter) = self.adapter_rc() else {
+        let Some(adapter) = self.adapter_arc() else {
             return;
         };
 
@@ -3445,7 +3449,7 @@ impl App {
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1);
         let Some(row) = data.rows.get(row_idx) else { return false };
 
-        let Some(adapter) = self.adapter_rc() else {
+        let Some(adapter) = self.adapter_arc() else {
             return false;
         };
         let Ok(fks) = adapter.foreign_keys(&object) else {
@@ -3492,7 +3496,7 @@ impl App {
 
         // Cambiar al objeto referenciado (recargando tablas si no estaba)
         if !self.tables.contains(&fk.table) {
-            if let Some(adapter) = self.adapter_rc() {
+            if let Some(adapter) = self.adapter_arc() {
                 if let Ok(tables) = adapter.list_objects_by_type("table") {
                     self.tables = tables;
                     self.sources = Self::build_sources(
