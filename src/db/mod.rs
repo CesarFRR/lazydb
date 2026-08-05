@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod backends;
+pub mod connection;
 pub mod error;
 pub mod model;
 pub mod pretty;

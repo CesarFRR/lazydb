@@ -659,6 +659,71 @@ pub struct PasswordPromptState {
     pub buffer: String,
 }
 
+/// Índice de campo del formulario de nueva conexión.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnField {
+    Url,
+    Kind,
+    Host,
+    Port,
+    User,
+    Pass,
+    Db,
+    Connect,
+}
+
+/// Formulario "Nueva conexión" del panel Detail (sin db abierta).
+///
+/// Sincronización bidireccional:
+/// - Editar un campo (host/puerto/user/pass/db) → la URL se reconcatena
+///   al instante (operación trivial; el tipo no se retoca).
+/// - Escribir en la URL → debounce 1s; si parsea COMPLETO, rellena los
+///   campos. Si está incompleta, no toca nada (espera).
+/// - Enter en la URL → reparsea y rellena los campos de inmediato.
+pub struct ConnectionFormState {
+    /// Campo con el foco
+    pub active: ConnField,
+    /// URL/ruta canónica (fuente de verdad para conectar)
+    pub url: String,
+    /// Tipo detectado por el analizador (Auto si desconocido)
+    pub kind: crate::db::connection::ConnectionType,
+    /// Tipo forzado manualmente por el usuario (None = seguir el auto)
+    pub kind_override: Option<crate::db::connection::ConnectionType>,
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub pass: String,
+    pub db: String,
+    /// Tick del último keystroke en la URL (para el debounce de reparseo)
+    pub url_last_edit: Option<std::time::Instant>,
+    /// `true` si el reparseo por debounce ya está programado este frame
+    pub url_debounce_scheduled: bool,
+    /// Mensaje del campo URL (resultado del último análisis)
+    pub detected_note: String,
+    /// `true` mientras se conecta (spinner)
+    pub connecting: bool,
+}
+
+impl Default for ConnectionFormState {
+    fn default() -> Self {
+        Self {
+            active: ConnField::Url,
+            url: String::new(),
+            kind: crate::db::connection::ConnectionType::Unknown,
+            kind_override: None,
+            host: String::new(),
+            port: String::new(),
+            user: String::new(),
+            pass: String::new(),
+            db: String::new(),
+            url_last_edit: None,
+            url_debounce_scheduled: false,
+            detected_note: String::new(),
+            connecting: false,
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     // ── sistema de paneles ──
@@ -756,6 +821,9 @@ pub struct App {
     pub db_picker: Option<DbPickerState>,
     /// Prompt de contraseña de un servidor detectado (modal de entrada).
     pub password_prompt: Option<PasswordPromptState>,
+    /// Formulario de nueva conexión (panel Detail sin db abierta). `None` =
+    /// el usuario ya está conectado o no se ha abierto el formulario.
+    pub connection_form: Option<ConnectionFormState>,
     /// El preview muestra el resultado de una query libre del usuario (no el
     /// objeto seleccionado). Los scrolls infinitos y refreshes lo respetan.
     pub query_mode: bool,
@@ -877,6 +945,7 @@ impl App {
             query_input: None,
             db_picker: None,
             password_prompt: None,
+            connection_form: Some(ConnectionFormState::default()),
             query_mode: false,
             last_click_time: 0,
             last_click_kind: None,
@@ -889,10 +958,9 @@ impl App {
             sort_asc: true,
             drag: None,
         };
-        // El panel Detail arranca con las opciones de conexión (sin db abierta)
-        // en lugar del viejo placeholder "Sin conexion SQLite".
-        app.preview_rows = app.build_connection_placeholder();
-        app.status = "Conecta una base: Enter sobre un item o `⋆ Nueva conexión`".to_string();
+        // El panel Detail arranca con el formulario de nueva conexión
+        // (sin db abierta): auto-detecta el tipo desde la URL/ruta.
+        app.status = "Nueva conexión: escribe la URL o ruta y Enter conecta".to_string();
         app
     }
 
@@ -907,6 +975,9 @@ impl App {
 
         self.layout = layout::compute(width, height, active_sidebar, self.active_panel);
         self.frame += 1;
+
+        // Debounce del formulario de conexión (reparseo de la URL 1s)
+        self.tick_connection_form();
 
         // Aplicar resultados de probes de salud y de queries terminadas, y
         // disparar los probes que correspondan según el layout del frame
@@ -2356,6 +2427,241 @@ impl App {
         }
     }
 
+    // ── formulario de nueva conexión ─────────────────────────────────
+
+    /// Reconstruye la URL canónica desde los campos individuales
+    /// (host/puerto/user/pass/db). Se llama al editar un campo.
+    fn conn_rebuild_url_from_fields(&mut self) {
+        let Some(form) = self.connection_form.as_mut() else { return };
+        let kind = form.kind_override.unwrap_or(form.kind);
+        let scheme = match kind {
+            crate::db::connection::ConnectionType::Mysql => "mysql",
+            crate::db::connection::ConnectionType::Postgres => "postgres",
+            crate::db::connection::ConnectionType::Mongo => "mongodb",
+            crate::db::connection::ConnectionType::Sqlite => "sqlite",
+            crate::db::connection::ConnectionType::Duckdb => "duckdb",
+            crate::db::connection::ConnectionType::File
+            | crate::db::connection::ConnectionType::Unknown => {
+                return; // archivos y desconocido: la URL es libre (ruta)
+            }
+        };
+        let mut url = format!("{scheme}://");
+        if !form.user.is_empty() || !form.pass.is_empty() {
+            url.push_str(&form.user);
+            if !form.pass.is_empty() {
+                url.push(':');
+                url.push_str(&form.pass);
+            }
+            url.push('@');
+        }
+        url.push_str(&form.host);
+        if !form.port.is_empty() {
+            url.push(':');
+            url.push_str(&form.port);
+        }
+        if !form.db.is_empty() {
+            url.push('/');
+            url.push_str(&form.db);
+        }
+        form.url = url;
+    }
+
+    /// Reparsea la URL actual y rellena los campos (si está completa).
+    /// Devuelve `true` si el parseo fue exitoso (la URL define el tipo).
+    fn conn_parse_url_into_fields(&mut self) -> bool {
+        let Some(form) = self.connection_form.as_mut() else { return false };
+        let spec = crate::db::connection::analyze_connection(&form.url);
+        let complete = spec.kind != crate::db::connection::ConnectionType::Unknown;
+
+        if complete {
+            form.kind = spec.kind;
+            // Solo sobreescribir campos si el usuario no los forzó
+            if form.kind_override.is_none() {
+                form.host = spec.host.clone().unwrap_or_default();
+                form.port = spec.port.map_or_else(String::new, |p| p.to_string());
+                form.user.clear();
+                form.pass.clear();
+                form.db = spec.db_name.clone().unwrap_or_default();
+            }
+            form.detected_note = format!("✓ Detectado: {}", spec.display());
+        } else if form.url.is_empty() {
+            form.detected_note.clear();
+        } else {
+            form.detected_note = "⏳ escribe la URL o ruta…".to_string();
+        }
+        complete
+    }
+
+    /// Procesa el debounce de la URL (1s desde la última tecla): si está
+    /// completa, rellena los campos. Se llama una vez por frame.
+    pub fn tick_connection_form(&mut self) {
+        let debounce_due = {
+            let Some(form) = self.connection_form.as_ref() else { return };
+            if !form.url_debounce_scheduled {
+                return;
+            }
+            form.url_last_edit
+                .is_some_and(|last| last.elapsed() >= std::time::Duration::from_secs(1))
+        };
+        if debounce_due {
+            if let Some(form) = self.connection_form.as_mut() {
+                form.url_debounce_scheduled = false;
+                form.url_last_edit = None;
+            }
+            self.conn_parse_url_into_fields();
+        }
+    }
+
+    /// Conecta con lo que haya en el formulario (URL canónica).
+    fn conn_submit(&mut self) {
+        // Si el foco está en un campo individual, reconstruir primero
+        let rebuild = self.connection_form.as_ref().is_some_and(|form| {
+            matches!(
+                form.active,
+                ConnField::Host | ConnField::Port | ConnField::User | ConnField::Pass
+                    | ConnField::Db
+            )
+        });
+        if rebuild {
+            self.conn_rebuild_url_from_fields();
+        }
+        let url = self
+            .connection_form
+            .as_ref()
+            .map(|f| f.url.clone())
+            .unwrap_or_default();
+        if url.trim().is_empty() {
+            self.status = "Escribe una URL o ruta para conectar".to_string();
+            return;
+        }
+        // Conexión real (sync por ahora; el spinner se limpia después)
+        self.connection_form.as_mut().unwrap().connecting = true;
+        self.connect_sqlite(&url);
+        self.connection_form = None;
+        self.status = "Conectando…".to_string();
+    }
+
+    /// Maneja las teclas del formulario de conexión.
+    // `drop(form)` termina el borrow de `self.connection_form` (NLL) antes de
+    // llamar a `self.conn_*`; es un no-op para clippy pero necesario aquí.
+    #[allow(clippy::too_many_lines)]
+    fn handle_connection_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = self.connection_form.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => {
+                self.connection_form = None;
+                self.status = "Conexión cancelada".to_string();
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                let next = match form.active {
+                    ConnField::Url => ConnField::Kind,
+                    ConnField::Kind => ConnField::Host,
+                    ConnField::Host => ConnField::Port,
+                    ConnField::Port => ConnField::User,
+                    ConnField::User => ConnField::Pass,
+                    ConnField::Pass => ConnField::Db,
+                    ConnField::Db => ConnField::Connect,
+                    ConnField::Connect => ConnField::Url,
+                };
+                form.active = next;
+            }
+            KeyCode::Up => {
+                let prev = match form.active {
+                    ConnField::Url => ConnField::Connect,
+                    ConnField::Kind => ConnField::Url,
+                    ConnField::Host => ConnField::Kind,
+                    ConnField::Port => ConnField::Host,
+                    ConnField::User => ConnField::Port,
+                    ConnField::Pass => ConnField::User,
+                    ConnField::Db => ConnField::Pass,
+                    ConnField::Connect => ConnField::Db,
+                };
+                form.active = prev;
+            }
+            KeyCode::Enter => {
+                let on_url = form.active == ConnField::Url;
+                let _ = form; // termina el borrow antes de llamar &mut self
+                if on_url {
+                    self.conn_parse_url_into_fields();
+                } else {
+                    self.conn_submit();
+                }
+            }
+            KeyCode::Backspace => {
+                let active = form.active;
+                let mut rebuild = false;
+                match active {
+                    ConnField::Url => {
+                        form.url.pop();
+                        form.url_last_edit = Some(std::time::Instant::now());
+                        form.url_debounce_scheduled = true;
+                    }
+                    // Host/Port/User/Pass/Db: pop + reconstruir la URL
+                    other @ (ConnField::Host
+                    | ConnField::Port
+                    | ConnField::User
+                    | ConnField::Pass
+                    | ConnField::Db) => {
+                        let field = match other {
+                            ConnField::Host => &mut form.host,
+                            ConnField::Port => &mut form.port,
+                            ConnField::User => &mut form.user,
+                            ConnField::Pass => &mut form.pass,
+                            _ => &mut form.db,
+                        };
+                        field.pop();
+                        rebuild = true;
+                    }
+                    _ => {}
+                }
+                if rebuild {
+                    let _ = form;
+                    self.conn_rebuild_url_from_fields();
+                }
+            }
+            KeyCode::Char(c) => {
+                let active = form.active;
+                let mut rebuild = false;
+                match active {
+                    ConnField::Url => {
+                        form.url.push(c);
+                        form.url_last_edit = Some(std::time::Instant::now());
+                        form.url_debounce_scheduled = true;
+                    }
+                    // Kind y Connect no aceptan chars (Kind: h/l cambia el tipo)
+                    ConnField::Kind | ConnField::Connect => {}
+                    other @ (ConnField::Host
+                    | ConnField::Port
+                    | ConnField::User
+                    | ConnField::Pass
+                    | ConnField::Db) => {
+                        let field = match other {
+                            ConnField::Host => &mut form.host,
+                            ConnField::Port => &mut form.port,
+                            ConnField::User => &mut form.user,
+                            ConnField::Pass => &mut form.pass,
+                            _ => &mut form.db,
+                        };
+                        if other == ConnField::Port {
+                            if c.is_ascii_digit() {
+                                field.push(c);
+                                rebuild = true;
+                            }
+                        } else {
+                            field.push(c);
+                            rebuild = true;
+                        }
+                    }
+                }
+                if rebuild {
+                    let _ = form;
+                    self.conn_rebuild_url_from_fields();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Teclas del prompt de contraseña (servidor detectado): Esc cancela,
     /// Enter autentica, el resto alimenta el buffer enmascarado.
     fn handle_password_prompt_key(&mut self, key: KeyEvent) {
@@ -2627,24 +2933,6 @@ impl App {
         }
     }
 
-    /// Lista de conexiones mostrada en el Detail cuando NO hay db abierta:
-    /// "Nueva conexión" (URL manual) + servidores detectados (localhost) +
-    /// recientes. Al presionar Enter sobre un item, `connect_sqlite` lo abre.
-    fn build_connection_placeholder(&self) -> Vec<String> {
-        let mut items = vec!["⋆ Nueva conexión (escribe la URL)".to_string()];
-        // Servidores detectados (mysql/postgres/mongo en puertos típicos)
-        for server in &self.detected_servers {
-            items.push(format!("  {server}"));
-        }
-        // Recientes (paths y URLs guardadas)
-        for recent in &self.state.recents {
-            if recent != "Nueva conexión" {
-                items.push(format!("  {recent}"));
-            }
-        }
-        items
-    }
-
     /// Cierra la conexión actual y vuelve el foco a Fuentes.
     fn disconnect_db(&mut self) {
         self.db_path = None;
@@ -2652,8 +2940,9 @@ impl App {
         self.tables.clear();
         self.views.clear();
         self.advanced.clear();
-        self.preview_rows = self.build_connection_placeholder();
+        self.preview_rows.clear();
         self.preview_data = None;
+        self.connection_form = Some(ConnectionFormState::default());
         self.total_rows = 0;
         self.preview_loaded_offset = 0;
         self.current_page = 0;
@@ -3005,25 +3294,6 @@ impl App {
 
     // ── menú de acciones ──────────────────────────────────────────────
     fn jump_to_detail(&mut self) {
-        // Sin db abierta: el Detail muestra las opciones de conexión. Enter
-        // conecta el item seleccionado (URL manual / servidor / reciente).
-        if self.db_path.is_none() && self.active_panel == PanelKind::Detail {
-            let items = self.build_connection_placeholder();
-            let idx = self.selected_idx(PanelKind::Detail);
-            if let Some(item) = items.get(idx) {
-                let text = item.trim().trim_start_matches('⋆').trim();
-                if text.starts_with("Nueva conexión") || text.is_empty() {
-                    // URL manual → reusar el input del modal `:`
-                    self.query_input = Some(QueryInputState::default());
-                    self.status =
-                        "URL de conexión: sqlite:// | duckdb:// | mysql:// | postgres:// | mongodb://".to_string();
-                } else {
-                    self.connect_sqlite(text);
-                }
-            }
-            return;
-        }
-
         if self.active_panel == PanelKind::Detail {
             // Enter sobre una fila de datos: FK Jump si la fila referencia
             // otra tabla; si no, el inspector de fila (comportamiento previo).
@@ -3266,6 +3536,18 @@ impl App {
             if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
                 self.error = None;
             }
+            return;
+        }
+
+        // ── formulario de nueva conexión (captura TODO solo cuando el foco
+        // está en el panel Detail y NO hay db conectada; los chars alimentan
+        // el campo activo). Con foco en otro panel, `:` y las teclas globales
+        // siguen funcionando normal. ──
+        if self.connection_form.is_some()
+            && self.db_path.is_none()
+            && self.active_panel == PanelKind::Detail
+        {
+            self.handle_connection_form_key(key);
             return;
         }
 
@@ -4918,26 +5200,63 @@ mod tests {
     }
 
     #[test]
-    fn sin_db_el_detail_muestra_opciones_de_conexion() {
-        // Al arrancar (sin db): el Detail debe ofrecer conexión, no el viejo
-        // placeholder "Sin conexion SQLite".
+    fn sin_db_el_detail_muestra_el_formulario_de_conexion() {
+        // Al arrancar (sin db): el Detail debe ofrecer el formulario de
+        // conexión con el foco en la URL (nada del placeholder viejo).
         let app = App::new();
-        assert!(
-            !app.preview_rows.iter().any(|r| r.contains("Sin conexion SQLite")),
-            "no debe quedar el placeholder viejo: {:?}",
-            app.preview_rows
-        );
-        assert!(
-            app.preview_rows.iter().any(|r| r.contains("Nueva conexión")),
-            "debe ofrecer nueva conexión: {:?}",
-            app.preview_rows
-        );
-        // Los servidores detectados aparecen como opciones conectables
-        for server in &app.detected_servers {
-            assert!(
-                app.preview_rows.iter().any(|r| r.trim() == server),
-                "servidor detectado debe estar en el placeholder: {server}"
-            );
+        let Some(form) = app.connection_form.as_ref() else {
+            panic!("debe existir el formulario de conexión al arrancar");
+        };
+        assert_eq!(form.active, ConnField::Url, "foco inicial en la URL");
+        assert!(app.preview_rows.is_empty(), "sin items de lista");
+    }
+
+    #[test]
+    fn conn_parse_url_rellena_los_campos() {
+        let mut app = App::new();
+        app.connection_form = Some(ConnectionFormState::default());
+        app.connection_form.as_mut().unwrap().url =
+            "mysql://user:pass@localhost:3306/lazy".to_string();
+        assert!(app.conn_parse_url_into_fields());
+        let form = app.connection_form.as_ref().unwrap();
+        assert_eq!(form.kind, crate::db::connection::ConnectionType::Mysql);
+        assert_eq!(form.host, "localhost");
+        assert_eq!(form.port, "3306");
+        assert_eq!(form.db, "lazy");
+        assert!(form.detected_note.contains("MySQL"), "nota: {}", form.detected_note);
+    }
+
+    #[test]
+    fn conn_parse_url_incompleta_no_toca_campos() {
+        let mut app = App::new();
+        app.connection_form = Some(ConnectionFormState::default());
+        {
+            let form = app.connection_form.as_mut().unwrap();
+            form.url = "mysql:/".to_string(); // incompleta: sin `//host`
+            form.host = "ya-editado".to_string();
         }
+        assert!(!app.conn_parse_url_into_fields());
+        let form = app.connection_form.as_ref().unwrap();
+        assert_eq!(form.host, "ya-editado", "no debe sobreescribir campos manuales");
+    }
+
+    #[test]
+    fn conn_rebuild_url_desde_campos() {
+        let mut app = App::new();
+        app.connection_form = Some(ConnectionFormState::default());
+        {
+            let form = app.connection_form.as_mut().unwrap();
+            form.kind = crate::db::connection::ConnectionType::Mysql;
+            form.host = "db.azure.com".to_string();
+            form.port = "3306".to_string();
+            form.user = "admin".to_string();
+            form.pass = "secreto".to_string();
+            form.db = "prod".to_string();
+        }
+        app.conn_rebuild_url_from_fields();
+        assert_eq!(
+            app.connection_form.as_ref().unwrap().url,
+            "mysql://admin:secreto@db.azure.com:3306/prod"
+        );
     }
 }

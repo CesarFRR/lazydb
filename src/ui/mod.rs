@@ -43,7 +43,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         // NoSQL: botón de modo en el título (`[J: json]` / `[J: pares]`).
         // El mismo texto es la zona clicable (ver `on_mouse_click`).
         let title = if app.is_nosql {
-            format!("▸ {}   [J: {}]", app.selected_object(), app.inspector_mode_label())
+            format!("▸ {}   [Shift+J: {}]", app.selected_object(), app.inspector_mode_label())
         } else {
             format!("▸ {}", app.selected_object())
         };
@@ -125,6 +125,12 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
     let title = app.title_for(kind);
     let items = app.items_for(kind);
     let focused = app.active_panel == kind;
+
+    // Formulario de nueva conexión: panel Detail sin db abierta
+    if kind == PanelKind::Detail && app.connection_form.is_some() {
+        widgets::connection_form::render(frame, area, app);
+        return;
+    }
 
     // Tabla de datos con columnas reales para Detail + Data tab
     let new_scroll = if kind == PanelKind::Detail && app.detail_tab == DetailTab::Data {
