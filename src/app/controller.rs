@@ -818,7 +818,7 @@ impl App {
             Panel::new(PanelKind::Detail),
         ];
 
-        Self {
+        let mut app = Self {
             panels,
             active_panel: PanelKind::Sources,
             last_sidebar_focus: PanelKind::Sources,
@@ -846,7 +846,7 @@ impl App {
             tables: vec![],
             views: vec![],
             advanced: vec![],
-            preview_rows: vec!["Sin conexion SQLite".to_string()],
+            preview_rows: Vec::new(), // se rellena abajo (necesita self listo)
             preview_data: None,
             detail_tab: DetailTab::Data,
             should_quit: false,
@@ -855,7 +855,7 @@ impl App {
             db_path: None,
             db_size_bytes: None,
             is_nosql: false,
-            status: "Sin conexion SQLite".to_string(),
+            status: "Sin conexion".to_string(),
             current_page: 0,
             rows_per_page: ui_config.rows_per_page,
             total_rows: 0,
@@ -888,7 +888,12 @@ impl App {
             sort_column: None,
             sort_asc: true,
             drag: None,
-        }
+        };
+        // El panel Detail arranca con las opciones de conexión (sin db abierta)
+        // en lugar del viejo placeholder "Sin conexion SQLite".
+        app.preview_rows = app.build_connection_placeholder();
+        app.status = "Conecta una base: Enter sobre un item o `⋆ Nueva conexión`".to_string();
+        app
     }
 
     // ── layout ────────────────────────────────────────────────────────
@@ -2304,7 +2309,13 @@ impl App {
                 if sql.is_empty() {
                     return;
                 }
-                self.execute_user_query(&sql);
+                // Sin db abierta el input es de CONEXIÓN (URL manual); con
+                // db es el SQL del modal `:`.
+                if self.db_path.is_none() {
+                    self.connect_sqlite(&sql);
+                } else {
+                    self.execute_user_query(&sql);
+                }
             }
             KeyCode::Backspace => {
                 if state.cursor > 0 {
@@ -2616,6 +2627,24 @@ impl App {
         }
     }
 
+    /// Lista de conexiones mostrada en el Detail cuando NO hay db abierta:
+    /// "Nueva conexión" (URL manual) + servidores detectados (localhost) +
+    /// recientes. Al presionar Enter sobre un item, `connect_sqlite` lo abre.
+    fn build_connection_placeholder(&self) -> Vec<String> {
+        let mut items = vec!["⋆ Nueva conexión (escribe la URL)".to_string()];
+        // Servidores detectados (mysql/postgres/mongo en puertos típicos)
+        for server in &self.detected_servers {
+            items.push(format!("  {server}"));
+        }
+        // Recientes (paths y URLs guardadas)
+        for recent in &self.state.recents {
+            if recent != "Nueva conexión" {
+                items.push(format!("  {recent}"));
+            }
+        }
+        items
+    }
+
     /// Cierra la conexión actual y vuelve el foco a Fuentes.
     fn disconnect_db(&mut self) {
         self.db_path = None;
@@ -2623,7 +2652,7 @@ impl App {
         self.tables.clear();
         self.views.clear();
         self.advanced.clear();
-        self.preview_rows = vec!["Sin conexion SQLite".to_string()];
+        self.preview_rows = self.build_connection_placeholder();
         self.preview_data = None;
         self.total_rows = 0;
         self.preview_loaded_offset = 0;
@@ -2976,6 +3005,25 @@ impl App {
 
     // ── menú de acciones ──────────────────────────────────────────────
     fn jump_to_detail(&mut self) {
+        // Sin db abierta: el Detail muestra las opciones de conexión. Enter
+        // conecta el item seleccionado (URL manual / servidor / reciente).
+        if self.db_path.is_none() && self.active_panel == PanelKind::Detail {
+            let items = self.build_connection_placeholder();
+            let idx = self.selected_idx(PanelKind::Detail);
+            if let Some(item) = items.get(idx) {
+                let text = item.trim().trim_start_matches('⋆').trim();
+                if text.starts_with("Nueva conexión") || text.is_empty() {
+                    // URL manual → reusar el input del modal `:`
+                    self.query_input = Some(QueryInputState::default());
+                    self.status =
+                        "URL de conexión: sqlite:// | duckdb:// | mysql:// | postgres:// | mongodb://".to_string();
+                } else {
+                    self.connect_sqlite(text);
+                }
+            }
+            return;
+        }
+
         if self.active_panel == PanelKind::Detail {
             // Enter sobre una fila de datos: FK Jump si la fila referencia
             // otra tabla; si no, el inspector de fila (comportamiento previo).
@@ -4867,5 +4915,29 @@ mod tests {
             "colecciones: {:?}",
             app.tables
         );
+    }
+
+    #[test]
+    fn sin_db_el_detail_muestra_opciones_de_conexion() {
+        // Al arrancar (sin db): el Detail debe ofrecer conexión, no el viejo
+        // placeholder "Sin conexion SQLite".
+        let app = App::new();
+        assert!(
+            !app.preview_rows.iter().any(|r| r.contains("Sin conexion SQLite")),
+            "no debe quedar el placeholder viejo: {:?}",
+            app.preview_rows
+        );
+        assert!(
+            app.preview_rows.iter().any(|r| r.contains("Nueva conexión")),
+            "debe ofrecer nueva conexión: {:?}",
+            app.preview_rows
+        );
+        // Los servidores detectados aparecen como opciones conectables
+        for server in &app.detected_servers {
+            assert!(
+                app.preview_rows.iter().any(|r| r.trim() == server),
+                "servidor detectado debe estar en el placeholder: {server}"
+            );
+        }
     }
 }
