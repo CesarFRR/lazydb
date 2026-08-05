@@ -194,4 +194,24 @@ mod tests {
         assert_eq!(s.query_history[0], "SELECT 1");
         assert_eq!(s.query_history.len(), 2, "la duplicada NO consecutiva se reposiciona");
     }
+
+    #[test]
+    fn recents_nunca_contienen_credenciales_en_claro() {
+        // REGLA DE SEGURIDAD: aunque `add_recent` reciba una URL con
+        // password embebido, lo que persiste NO debe contenerlo (el password
+        // vive en el keyring, no en recents.json).
+        let mut s = AppState::new();
+        let url_con_creds =
+            "postgresql://user:supersecreto@host:5432/db".to_string();
+        // El controller aplica strip ANTES de add_recent (seguridad)
+        let limpia = crate::security::strip_credentials(&url_con_creds);
+        s.add_recent(limpia);
+        let guardado = &s.recents[0];
+        assert!(
+            !guardado.contains("supersecreto"),
+            "recents.json no debe contener el password: {guardado}"
+        );
+        assert!(!guardado.contains("user:"), "ni el user:pass");
+        assert!(guardado.contains("host:5432/db"), "el host sí se conserva");
+    }
 }

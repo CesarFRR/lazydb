@@ -411,6 +411,22 @@ fn server_url_has_database(url: &str) -> bool {
     rest.contains('/') && !rest.ends_with('/')
 }
 
+/// ¿Es una URL remota (`mysql://`, `postgres://`, `postgresql://`, `mongodb://`)?
+fn is_remote_url(url: &str) -> bool {
+    url.starts_with("mysql://")
+        || url.starts_with("postgres://")
+        || url.starts_with("postgresql://")
+        || url.starts_with("mongodb://")
+}
+
+/// Inserta `user:pass@` tras el scheme de la URL (para reconectar con las
+/// credenciales del keyring). Devuelve la URL con credenciales.
+fn inject_credentials(url: &str, scheme: &str, user: &str, pass: &str) -> String {
+    let prefix = format!("{scheme}://");
+    url.strip_prefix(&prefix)
+        .map_or_else(|| url.to_string(), |rest| format!("{prefix}{user}:{pass}@{rest}"))
+}
+
 /// Quita las marcas decorativas (● ★ ▣ ⊙, combinables: "● ★ x") de un item de
 /// Fuentes y devuelve el dato real (path o "name => path" para favoritos).
 fn strip_source_marks(mut item: &str) -> &str {
@@ -1813,10 +1829,9 @@ impl App {
 
     /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
-    fn connect_sqlite(&mut self, path: &str) {
-        // Choke point de normalización: solo para rutas de archivo. Las URLs
+    fn connect_sqlite(&mut self, path: &str) {        // Choke point de normalización: solo para rutas de archivo. Las URLs
         // (`mysql://`, `duckdb://` remotos) no se tocan.
-        let path = if path.starts_with('/') || path.starts_with("mysql://") {
+        let mut path = if path.starts_with('/') || path.starts_with("mysql://") {
             path.to_string()
         } else if path.starts_with("postgresql://") {
             // El crate solo entiende `postgres://`; unificar el alias aquí.
@@ -1829,6 +1844,31 @@ impl App {
         } else {
             crate::paths::normalize_path(path)
         };
+
+        // Seguridad: si la URL trae credenciales, se guardan en el keyring
+        // del SO (nunca en disco). La conexión usa la URL tal cual.
+        if crate::security::has_credentials(&path) {
+            if let Err(err) = crate::security::save_credentials(&path) {
+                tracing::warn!(error = ?err, "no se pudieron guardar credenciales en el keyring");
+            }
+        } else if is_remote_url(&path) {
+            // Reabrir un reciente (URL sin credenciales): recuperarlas del
+            // keyring y reconstruir la URL para conectar.
+            match crate::security::get_credentials(&path) {
+                Ok(Some((user, pass))) if !pass.is_empty() => {
+                    let scheme = if path.starts_with("mongodb://") {
+                        "mongodb"
+                    } else if path.starts_with("mysql://") {
+                        "mysql"
+                    } else {
+                        "postgres"
+                    };
+                    path = inject_credentials(&path, scheme, &user, &pass);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = ?err, "keyring: sin credenciales para {path}"),
+            }
+        }
 
         // URL mysql:// SIN base → conexión a nivel de SERVIDOR: listar los
         // esquemas (SHOW DATABASES) y dejar que el usuario elija. Las URLs
@@ -1875,7 +1915,9 @@ impl App {
         let advanced = adapter.list_advanced_objects();
 
         if let (Ok(tables), Ok(views), Ok(advanced)) = (tables, views, advanced) {
-            let path_str = path.clone();
+            // Seguridad: el reciente se guarda SIN credenciales (el password
+            // vive en el keyring del SO, nunca en recents.json en claro).
+            let path_str = crate::security::strip_credentials(&path);
             self.state.add_recent(path_str);
             let _ = self.state.save();
             self.sources = Self::build_sources(

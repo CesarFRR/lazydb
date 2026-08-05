@@ -4,6 +4,7 @@ mod db;
 mod keys;
 mod paths;
 mod query;
+mod security;
 mod storage;
 mod ui;
 
