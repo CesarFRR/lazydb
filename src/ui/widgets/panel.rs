@@ -123,11 +123,44 @@ pub fn render_data_table(
     // ── Fuente de columnas: celdas tipadas (render 2D) o fallback strings ──
     // `typed` marca si las filas vienen de Row.cells (sin split('|')): un
     // valor "a | b" dentro de una celda NO debe partirse.
-    let (typed, headers, rows_hint): (bool, Vec<&str>, usize) = match data {
+    //
+    // `headers` = nombre limpio (para el sort/indicador); el texto visible
+    // añade el tipo (`nombre tipo`) para SQL reales y mongo (BSON/mixed).
+    // `names`/`display` son Vec<String> que viven durante todo el render
+    // (los `Vec<&str>` prestan de ellas).
+    // `headers` = nombre limpio (para el sort/indicador); el texto visible
+    // añade el tipo (`nombre tipo`) para SQL reales y mongo (BSON/mixed).
+    // Los `Vec<String>` viven en `names`/`display`; los `Vec<&str>` prestan.
+    let mut names: Vec<String> = Vec::new();
+    let mut display: Vec<String> = Vec::new();
+    #[allow(unused_assignments)]
+    let (typed, rows_hint): (bool, usize) = match data {
         Some(data) if data.columns.len() > 1 && !data.rows.is_empty() => {
-            (true, data.columns.iter().map(|c| c.name.as_str()).collect(), data.rows.len())
+            names = data.columns.iter().map(|c| c.name.clone()).collect();
+            display = data
+                .columns
+                .iter()
+                .map(|c| {
+                    if c.dtype.is_empty() {
+                        c.name.clone()
+                    } else {
+                        format!("{} {}", c.name, c.dtype)
+                    }
+                })
+                .collect();
+            (true, data.rows.len())
         }
-        _ => (false, items[0].split(" | ").collect(), items.len().saturating_sub(1)),
+        _ => (false, items.len().saturating_sub(1)),
+    };
+    let headers: Vec<&str> = if typed {
+        names.iter().map(String::as_str).collect()
+    } else {
+        items[0].split(" | ").collect()
+    };
+    let headers_display: Vec<&str> = if typed {
+        display.iter().map(String::as_str).collect()
+    } else {
+        headers.clone()
     };
 
     let col_count = headers.len().max(1);
@@ -240,12 +273,13 @@ pub fn render_data_table(
     let header_cells: Vec<Cell<'_>> = (vis_start..vis_end)
         .map(|i| {
             let w = cell_widths[i - vis_start];
-            let h_trimmed = headers[i].trim();
+            let h_trimmed = headers[i].trim(); // nombre limpio → sort
+            let h_display = headers_display[i].trim(); // con tipo → texto
             let has_indicator = sort_column == Some(h_trimmed);
             let is_last = i == vis_end.saturating_sub(1);
             let text = if is_last {
                 let iw = w.saturating_sub(1);
-                let val = truncate_middle(h_trimmed, iw);
+                let val = truncate_middle(h_display, iw);
                 // Última columna visible: sin separador │, el indicador va pegado al nombre
                 if has_indicator {
                     let ch = if sort_asc { '▴' } else { '▾' };
@@ -261,7 +295,7 @@ pub fn render_data_table(
                 }
             } else {
                 let iw = w.saturating_sub(3);
-                let val = truncate_middle(h_trimmed, iw);
+                let val = truncate_middle(h_display, iw);
                 // El ▴/▾ reemplaza el último espacio del padding antes de " │"
                 let padded = format!("{val:<iw$}");
                 if has_indicator {

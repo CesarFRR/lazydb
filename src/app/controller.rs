@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::Rect;
 
 use crate::app::panel::{Panel, PanelKind};
@@ -233,6 +233,7 @@ fn source_kind(value: &str) -> SourceKind {
     if lower.starts_with("mysql://")
         || lower.starts_with("postgres://")
         || lower.starts_with("postgresql://")
+        || lower.starts_with("mongodb://")
     {
         let host = url_host(&lower);
         let is_local =
@@ -264,6 +265,8 @@ fn source_host_port(url: &str) -> Option<(String, u16)> {
         3306
     } else if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
         5432
+    } else if lower.starts_with("mongodb://") {
+        27017
     } else if lower.starts_with("http://") {
         80
     } else if lower.starts_with("https://") {
@@ -328,6 +331,8 @@ fn db_type_mark(value: &str) -> char {
         'P'
     } else if lower.starts_with("mysql://") {
         'M'
+    } else if lower.starts_with("mongodb://") {
+        'N'
     } else if lower.starts_with("http://")
         || lower.starts_with("https://")
         || lower.starts_with("ssh://")
@@ -350,10 +355,10 @@ fn db_type_mark(value: &str) -> char {
 // ── formato de items del panel Fuentes ─────────────────────────────────
 // Cada item es un string plano con marcas que el render colorea:
 //   sección:   "\u{1}LABEL"          (marcador interno, no visible)
-//   entry:     [● ][✗ ]<★|▣|D|M|P|⊙|C|T|J|G ><texto>
+//   entry:     [● ][✗ ]<★|▣|D|M|P|N|⊙|C|T|J|G ><texto>
 //                     ● = conectada, ✗ = con problemas (sin marca = bien),
 //                     ★ = favorito, ▣ = sqlite, D = duckdb, M = mysql,
-//                     P = postgres, ⊙ = endpoint genérico,
+//                     P = postgres, N = mongodb, ⊙ = endpoint genérico,
 //                     C = csv, T = tsv, J = json(jsonl), G = geojson/gpkg
 // Los favoritos van al inicio de la lista sin sección propia (la ★ basta).
 // Los favoritos usan "name => path"; el resto muestra el path directo.
@@ -369,13 +374,37 @@ fn is_source_section(item: &str) -> bool {
     item.starts_with(SOURCE_SECTION_MARK)
 }
 
-/// ¿La URL `mysql://` o `postgres://` incluye una base de datos explícita
-/// (`.../bd`)? Las URLs de `scan_local_servers` llegan sin BD: son servidores.
+/// Quita las credenciales (`user:pass@`) de una URL y devuelve el user.
+/// Útil para el prompt de contraseña: no mostrar la password de nuevo y
+/// sugerir el user que la URL ya traía. Acepta `mysql://`, `postgres://` y
+/// `postgresql://` (el parámetro `scheme` cubre la variante canónica).
+#[cfg(any(feature = "mysql", feature = "postgres"))]
+fn strip_url_credentials(url: &str) -> (String, Option<String>) {
+    // Encuentra `scheme://` o `scheme+algo://` (p.ej. postgresql://)
+    let Some(at) = url.find("://") else {
+        return (url.to_string(), None);
+    };
+    let (scheme_part, rest) = url.split_at(at + 3);
+    let Some(at_mark) = rest.rfind('@') else {
+        return (url.to_string(), None);
+    };
+    let creds = &rest[..at_mark];
+    let host = &rest[at_mark + 1..];
+    let user =
+        creds.split_once(':').map_or(Some(creds), |(u, _)| Some(u)).map(ToString::to_string);
+    (format!("{scheme_part}{host}"), user)
+}
+
+/// ¿La URL `mysql://`, `postgres://` o `mongodb://` incluye una base de datos
+/// explícita (`.../bd`)? Las URLs de `scan_local_servers` llegan sin BD: son
+/// servidores. Solo el flujo de servidores remotos (mysql/postgres/mongo) la usa.
+#[cfg(any(feature = "mysql", feature = "postgres", feature = "mongodb"))]
 fn server_url_has_database(url: &str) -> bool {
     let rest = url
         .strip_prefix("mysql://")
         .or_else(|| url.strip_prefix("postgres://"))
         .or_else(|| url.strip_prefix("postgresql://"))
+        .or_else(|| url.strip_prefix("mongodb://"))
         .unwrap_or_default();
     // `host`, `host:puerto`, `user:pass@host:puerto` → sin `/` = sin BD.
     // Con `/bd` → hay base.
@@ -387,7 +416,7 @@ fn server_url_has_database(url: &str) -> bool {
 fn strip_source_marks(mut item: &str) -> &str {
     loop {
         let mut stripped = false;
-        for mark in ["● ", "★ ", "✗ ", "▣ ", "D ", "M ", "P ", "⊙ ", "C ", "T ", "J ", "G "]
+        for mark in ["● ", "★ ", "✗ ", "▣ ", "D ", "M ", "P ", "N ", "⊙ ", "C ", "T ", "J ", "G "]
         {
             if let Some(rest) = item.strip_prefix(mark) {
                 item = rest;
@@ -651,6 +680,71 @@ pub struct PasswordPromptState {
     pub buffer: String,
 }
 
+/// Índice de campo del formulario de nueva conexión.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnField {
+    Url,
+    Kind,
+    Host,
+    Port,
+    User,
+    Pass,
+    Db,
+    Connect,
+}
+
+/// Formulario "Nueva conexión" del panel Detail (sin db abierta).
+///
+/// Sincronización bidireccional:
+/// - Editar un campo (host/puerto/user/pass/db) → la URL se reconcatena
+///   al instante (operación trivial; el tipo no se retoca).
+/// - Escribir en la URL → debounce 1s; si parsea COMPLETO, rellena los
+///   campos. Si está incompleta, no toca nada (espera).
+/// - Enter en la URL → reparsea y rellena los campos de inmediato.
+pub struct ConnectionFormState {
+    /// Campo con el foco
+    pub active: ConnField,
+    /// URL/ruta canónica (fuente de verdad para conectar)
+    pub url: String,
+    /// Tipo detectado por el analizador (Auto si desconocido)
+    pub kind: crate::db::connection::ConnectionType,
+    /// Tipo forzado manualmente por el usuario (None = seguir el auto)
+    pub kind_override: Option<crate::db::connection::ConnectionType>,
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub pass: String,
+    pub db: String,
+    /// Tick del último keystroke en la URL (para el debounce de reparseo)
+    pub url_last_edit: Option<std::time::Instant>,
+    /// `true` si el reparseo por debounce ya está programado este frame
+    pub url_debounce_scheduled: bool,
+    /// Mensaje del campo URL (resultado del último análisis)
+    pub detected_note: String,
+    /// `true` mientras se conecta (spinner)
+    pub connecting: bool,
+}
+
+impl Default for ConnectionFormState {
+    fn default() -> Self {
+        Self {
+            active: ConnField::Url,
+            url: String::new(),
+            kind: crate::db::connection::ConnectionType::Unknown,
+            kind_override: None,
+            host: String::new(),
+            port: String::new(),
+            user: String::new(),
+            pass: String::new(),
+            db: String::new(),
+            url_last_edit: None,
+            url_debounce_scheduled: false,
+            detected_note: String::new(),
+            connecting: false,
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     // ── sistema de paneles ──
@@ -683,7 +777,16 @@ pub struct App {
     pub is_loading: bool,
     pub refresh_count: u32,
     pub db_path: Option<String>,
-    pub db_size_bytes: Option<u64>,
+    /// Adapter de la conexión ACTIVA (compartido): se crea UNA vez al
+    /// conectar y se reusa para todas las operaciones. Evita recrear el
+    /// pool (handshake TCP+auth) en cada navegación, lo que fallaba con
+    /// conexiones lentas (`CleverCloud`) por límite de conexiones.
+    /// `Rc` permite clonar la referencia sin prestar `self` (los métodos
+    /// que usan el adapter también asignan campos de `self`).
+    pub active_adapter: Option<std::sync::Arc<dyn crate::db::adapter::DbAdapter>>,    pub db_size_bytes: Option<u64>,
+    /// ¿El backend conectado es `NoSQL` (mongo)? La UI cambia terminología
+    /// (`row` → `doc`) y muestra el toggle JSON del modal.
+    pub is_nosql: bool,
     pub status: String,
     pub current_page: u32,
     pub rows_per_page: u32,
@@ -726,6 +829,10 @@ pub struct App {
     /// Inspector de fila (modal de detalle de registro)
     pub show_row_inspector: bool,
     pub row_inspector_pairs: Vec<(String, String)>,
+    /// Modo de visualización del modal `NoSQL`: `false` = pares clave→valor,
+    /// `true` = JSON formateado del documento.
+    pub inspector_json_mode: bool,
+    pub inspector_json_text: String,
     pub inspector_scroll: crate::ui::widgets::modal::ModalScroll,
     /// Ayuda de teclas (modal `?`): se autogenera desde los bindings reales
     pub show_help: bool,
@@ -741,6 +848,9 @@ pub struct App {
     pub db_picker: Option<DbPickerState>,
     /// Prompt de contraseña de un servidor detectado (modal de entrada).
     pub password_prompt: Option<PasswordPromptState>,
+    /// Formulario de nueva conexión (panel Detail sin db abierta). `None` =
+    /// el usuario ya está conectado o no se ha abierto el formulario.
+    pub connection_form: Option<ConnectionFormState>,
     /// El preview muestra el resultado de una query libre del usuario (no el
     /// objeto seleccionado). Los scrolls infinitos y refreshes lo respetan.
     pub query_mode: bool,
@@ -803,7 +913,7 @@ impl App {
             Panel::new(PanelKind::Detail),
         ];
 
-        Self {
+        let mut app = Self {
             panels,
             active_panel: PanelKind::Sources,
             last_sidebar_focus: PanelKind::Sources,
@@ -831,15 +941,17 @@ impl App {
             tables: vec![],
             views: vec![],
             advanced: vec![],
-            preview_rows: vec!["Sin conexion SQLite".to_string()],
+            preview_rows: Vec::new(), // se rellena abajo (necesita self listo)
             preview_data: None,
             detail_tab: DetailTab::Data,
             should_quit: false,
             is_loading: false,
             refresh_count: 0,
             db_path: None,
+            active_adapter: None,
             db_size_bytes: None,
-            status: "Sin conexion SQLite".to_string(),
+            is_nosql: false,
+            status: "Sin conexion".to_string(),
             current_page: 0,
             rows_per_page: ui_config.rows_per_page,
             total_rows: 0,
@@ -852,6 +964,8 @@ impl App {
             actions_menu_idx: 0,
             show_row_inspector: false,
             row_inspector_pairs: Vec::new(),
+            inspector_json_mode: false,
+            inspector_json_text: String::new(),
             inspector_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             show_help: false,
             help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
@@ -859,6 +973,7 @@ impl App {
             query_input: None,
             db_picker: None,
             password_prompt: None,
+            connection_form: Some(ConnectionFormState::default()),
             query_mode: false,
             last_click_time: 0,
             last_click_kind: None,
@@ -870,7 +985,11 @@ impl App {
             sort_column: None,
             sort_asc: true,
             drag: None,
-        }
+        };
+        // El panel Detail arranca con el formulario de nueva conexión
+        // (sin db abierta): auto-detecta el tipo desde la URL/ruta.
+        app.status = "Nueva conexión: escribe la URL o ruta y Enter conecta".to_string();
+        app
     }
 
     // ── layout ────────────────────────────────────────────────────────
@@ -884,6 +1003,9 @@ impl App {
 
         self.layout = layout::compute(width, height, active_sidebar, self.active_panel);
         self.frame += 1;
+
+        // Debounce del formulario de conexión (reparseo de la URL 1s)
+        self.tick_connection_form();
 
         // Aplicar resultados de probes de salud y de queries terminadas, y
         // disparar los probes que correspondan según el layout del frame
@@ -1313,13 +1435,15 @@ impl App {
                 for &tab in &available {
                     let label = tab.label();
                     let text = if tab == DetailTab::Data {
-                        // Número de fila actual / total
+                        // Número de fila actual / total. En NoSQL (mongo)
+                        // cada fila es un documento → `doc X/Y`.
                         if self.total_rows > 0 {
                             let current_row = self.preview_loaded_offset
                                 + self.selected_idx(PanelKind::Detail).saturating_sub(1) as u32
                                 + 1;
                             let total = self.total_rows;
-                            format!("{label} - row {current_row}/{total}")
+                            let unit = if self.is_nosql { "doc" } else { "row" };
+                            format!("{label} - {unit} {current_row}/{total}")
                         } else {
                             label.to_string()
                         }
@@ -1499,13 +1623,20 @@ impl App {
 
     /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
+    #[cfg(feature = "mysql")]
     fn connect_mysql_server(&mut self, url: &str) {
         self.status = format!("Conectando a {url}...");
-        // Conexión a nivel de servidor: primero probamos `root` SIN
-        // contraseña (el caso típico de instalaciones locales sin auth).
-        // Importante: NO usar la URL tal cual (user vacío → la cuenta
-        // anónima de MariaDB solo ve la BD `test`), sino root explícito.
-        let url_root = {
+        // Si la URL YA trae credenciales (`user:pass@`), se conservan: es una
+        // conexión a servidor autenticada desde el inicio.
+        let has_creds = url
+            .strip_prefix("mysql://")
+            .is_some_and(|rest| rest.contains('@') && !rest.starts_with('@'));
+        // Sin credenciales: probar `root` SIN contraseña (instalaciones
+        // locales típicas). NO usar la URL tal cual (user vacío → la cuenta
+        // anónima de MariaDB solo ve la BD `test`).
+        let url_root = if has_creds {
+            url.to_string()
+        } else {
             let host = url.strip_prefix("mysql://").unwrap_or(url);
             format!("mysql://root@{host}")
         };
@@ -1524,13 +1655,14 @@ impl App {
                 self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
-                // Sin acceso (auth o red): pedir contraseña. El usuario
-                // asumido es `root` en localhost.
+                // Sin acceso (auth o red): pedir contraseña. URL limpia (sin
+                // credenciales) y el user de la URL si lo traía.
                 tracing::warn!(url = %url, error = ?err, "servidor sin acceso, pidiendo contraseña");
                 self.status = String::new();
+                let (clean_url, user) = strip_url_credentials(url);
                 self.password_prompt = Some(PasswordPromptState {
-                    server_url: url.to_string(),
-                    user: "root".to_string(),
+                    server_url: clean_url,
+                    user: user.unwrap_or_else(|| "root".to_string()),
                     buffer: String::new(),
                 });
             }
@@ -1539,6 +1671,7 @@ impl App {
 
     /// Intenta conectar a la URL con `user:password` recién tipeados. Si la
     /// conexión va, lista las bases y abre el picker.
+    #[cfg(feature = "mysql")]
     fn connect_mysql_server_with_password(&mut self, prompt: PasswordPromptState) {
         let PasswordPromptState { server_url, user, buffer } = prompt;
         // Construye `mysql://user:pass@host:port` a partir de `mysql://host:port`
@@ -1570,18 +1703,27 @@ impl App {
     /// Conexión a nivel de servidor `PostgreSQL`. Prueba primero `postgres`
     /// SIN contraseña (instalaciones locales con trust/auth peer); si falla,
     /// abre el prompt de contraseña con user `postgres` por defecto.
+    #[cfg(feature = "postgres")]
     fn connect_postgres_server(&mut self, url: &str) {
         self.status = format!("Conectando a {url}...");
         // Normalizamos `postgresql://` → `postgres://` (el crate solo entiende
-        // el segundo). OJO: NO probar con user vacío (el peer auth de Postgres
-        // usa el user del SO); probar el superuser local `postgres`.
+        // el segundo). Si la URL YA trae credenciales (`user:pass@`), se
+        // conservan: es una conexión a servidor autenticada desde el inicio.
         let scheme_normalized = if url.starts_with("postgresql://") {
             url.replacen("postgresql://", "postgres://", 1)
         } else {
             url.to_string()
         };
+        let has_creds = scheme_normalized
+            .strip_prefix("postgres://")
+            .is_some_and(|rest| rest.contains('@') && !rest.starts_with('@'));
         let host = scheme_normalized.strip_prefix("postgres://").unwrap_or(&scheme_normalized);
-        let url_postgres = format!("postgres://postgres@{host}");
+        // Sin credenciales: probar el superuser local `postgres` (peer auth).
+        let url_postgres = if has_creds {
+            scheme_normalized.clone()
+        } else {
+            format!("postgres://postgres@{host}")
+        };
         let result = crate::db::rt::block_on(async {
             let (pool, db_name) = crate::db::backends::postgres::connect(&url_postgres)?;
             let dbs = crate::db::backends::postgres::list_databases(&pool)?;
@@ -1600,9 +1742,12 @@ impl App {
             Err(err) => {
                 tracing::warn!(url = %url, error = ?err, "servidor postgres sin acceso, pidiendo contraseña");
                 self.status = String::new();
+                // Prompt con URL SIN credenciales (no repetir la password en
+                // pantalla) y el user de la URL si lo traía.
+                let (clean_url, user) = strip_url_credentials(&scheme_normalized);
                 self.password_prompt = Some(PasswordPromptState {
-                    server_url: scheme_normalized,
-                    user: "postgres".to_string(),
+                    server_url: clean_url,
+                    user: user.unwrap_or_else(|| "postgres".to_string()),
                     buffer: String::new(),
                 });
             }
@@ -1611,6 +1756,7 @@ impl App {
 
     /// Intenta conectar a la URL postgres con `user:password` recién
     /// tipeados. Si la conexión va, lista las bases y abre el picker.
+    #[cfg(feature = "postgres")]
     fn connect_postgres_server_with_password(&mut self, prompt: PasswordPromptState) {
         let PasswordPromptState { server_url, user, buffer } = prompt;
         let url = server_url.strip_prefix("postgres://").map_or_else(
@@ -1638,6 +1784,33 @@ impl App {
         }
     }
 
+    /// Conexión a nivel de servidor `MongoDB`: lista las bases (listDatabases)
+    /// y abre el picker para elegir. Mongo local suele correr sin auth; si hay
+    /// credenciales en la URL, el connect las usa.
+    #[cfg(feature = "mongodb")]
+    fn connect_mongo_server(&mut self, url: &str) {
+        self.status = format!("Conectando a {url}...");
+        let result = crate::db::rt::block_on(async {
+            let (client, db_name) = crate::db::backends::mongo::connect(url)?;
+            let dbs = crate::db::backends::mongo::list_databases(&client)?;
+            Ok::<(String, Vec<String>), crate::db::DbError>((db_name, dbs))
+        });
+        match result {
+            Ok((db_name, dbs)) if dbs.is_empty() => {
+                self.status =
+                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+            }
+            Ok((_db_name, dbs)) => {
+                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
+            }
+            Err(err) => {
+                tracing::warn!(url = %url, error = ?err, "mongo sin acceso");
+                self.show_error("No se pudo conectar a MongoDB", &err.to_string());
+            }
+        }
+    }
+
     /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
     fn connect_sqlite(&mut self, path: &str) {
@@ -1648,6 +1821,11 @@ impl App {
         } else if path.starts_with("postgresql://") {
             // El crate solo entiende `postgres://`; unificar el alias aquí.
             path.replacen("postgresql://", "postgres://", 1)
+        } else if path.contains("://") {
+            // Cualquier otra URL con scheme (mongodb://, postgres://, duckdb://
+            // remoto, etc.) se preserva tal cual: solo los paths de archivo
+            // pasan por la normalización.
+            path.to_string()
         } else {
             crate::paths::normalize_path(path)
         };
@@ -1655,14 +1833,27 @@ impl App {
         // URL mysql:// SIN base → conexión a nivel de SERVIDOR: listar los
         // esquemas (SHOW DATABASES) y dejar que el usuario elija. Las URLs
         // detectadas por `scan_local_servers` llegan sin `/bd`.
+        tracing::debug!(path = %path, "connect_sqlite: url normalizada");
+        #[cfg(feature = "mysql")]
         if path.starts_with("mysql://") && !server_url_has_database(&path) {
+            tracing::debug!(path = %path, "mysql sin base → flujo de servidor");
             self.connect_mysql_server(&path);
             return;
         }
+        #[cfg(feature = "postgres")]
         if (path.starts_with("postgres://") || path.starts_with("postgresql://"))
             && !server_url_has_database(&path)
         {
+            tracing::debug!(path = %path, "postgres sin base → flujo de servidor");
             self.connect_postgres_server(&path);
+            return;
+        }
+        // URL mongodb:// SIN base → listar bases (listDatabases) y picker.
+        // Mongo local suele correr sin auth; si pide credenciales el
+        // connect falla y el resolver mostrará el error.
+        #[cfg(feature = "mongodb")]
+        if path.starts_with("mongodb://") && !server_url_has_database(&path) {
+            self.connect_mongo_server(&path);
             return;
         }
         self.is_loading = true;
@@ -1675,6 +1866,10 @@ impl App {
             tracing::error!(path = %path, "fuente no soportada por el resolver");
             return;
         };
+        // Compartir el adapter: la conexión/pool se crea UNA vez y se reusa
+        // para todas las operaciones (evita límite de conexiones + handshakes).
+        self.active_adapter = Some(std::sync::Arc::from(adapter));
+        let adapter = self.active_adapter.as_ref().unwrap().as_ref();
         let tables = adapter.list_objects_by_type("table");
         let views = adapter.list_objects_by_type("view");
         let advanced = adapter.list_advanced_objects();
@@ -1692,6 +1887,9 @@ impl App {
             );
 
             self.db_path = Some(path.clone());
+            // ¿NoSQL? (mongo): cambia la terminología de la UI (row→doc) y
+            // habilita el toggle JSON del modal de detalles.
+            self.is_nosql = self.adapter_arc().is_some_and(|a| a.is_nosql());
             // `db_size_bytes` solo aplica a bds de archivo (mysql:// no es path)
             self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
             self.tables = tables;
@@ -1766,9 +1964,6 @@ impl App {
         self.panel_mut(PanelKind::Detail).scroll_offset.set(0);
         // Reset scroll horizontal: el nuevo objeto puede tener otras columnas
         self.panel_mut(PanelKind::Detail).h_scroll.set(0);
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
 
         self.is_loading = true;
         self.status = format!("Cargando {}...", self.detail_tab.label().trim());
@@ -1786,7 +1981,7 @@ impl App {
 
         // Backend resuelto por extensión: todas las lecturas del preview
         // (filas, schema, DDL, count) pasan por el adapter.
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
         };
@@ -1972,9 +2167,6 @@ impl App {
             return; // ya estamos al final del dataset
         }
 
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             return;
@@ -1991,7 +2183,7 @@ impl App {
         self.status = format!("Cargando más filas (offset {next_offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
         };
@@ -2021,9 +2213,6 @@ impl App {
             return; // ya estamos al inicio del dataset
         }
 
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             return;
@@ -2039,7 +2228,7 @@ impl App {
         self.status = format!("Cargando filas anteriores (offset {offset})...");
 
         let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
         };
@@ -2125,8 +2314,10 @@ impl App {
         self.query_state = query::QueryState::Running;
         self.status = "Contando filas...".to_string();
 
+        // Provider: reusar la conexión activa (evita re-handshake en remoto)
+        let adapter = self.adapter_arc();
         tokio::spawn(async move {
-            let res = query::count_query_results(&path, &sql).await;
+            let res = query::count_query_results(adapter, &path, &sql).await;
             let _ = tx.send(query::QueryMsg::Count(generation, sql, res));
         });
     }
@@ -2234,7 +2425,13 @@ impl App {
                 if sql.is_empty() {
                     return;
                 }
-                self.execute_user_query(&sql);
+                // Sin db abierta el input es de CONEXIÓN (URL manual); con
+                // db es el SQL del modal `:`.
+                if self.db_path.is_none() {
+                    self.connect_sqlite(&sql);
+                } else {
+                    self.execute_user_query(&sql);
+                }
             }
             KeyCode::Backspace => {
                 if state.cursor > 0 {
@@ -2275,6 +2472,304 @@ impl App {
         }
     }
 
+    // ── formulario de nueva conexión ─────────────────────────────────
+
+    /// Reconstruye la URL canónica desde los campos individuales
+    /// (host/puerto/user/pass/db). Se llama al editar un campo.
+    fn conn_rebuild_url_from_fields(&mut self) {
+        let Some(form) = self.connection_form.as_mut() else { return };
+        let kind = form.kind_override.unwrap_or(form.kind);
+        let scheme = match kind {
+            crate::db::connection::ConnectionType::Mysql => "mysql",
+            crate::db::connection::ConnectionType::Postgres => "postgres",
+            crate::db::connection::ConnectionType::Mongo => "mongodb",
+            crate::db::connection::ConnectionType::Sqlite => "sqlite",
+            crate::db::connection::ConnectionType::Duckdb => "duckdb",
+            crate::db::connection::ConnectionType::File
+            | crate::db::connection::ConnectionType::Unknown => {
+                return; // archivos y desconocido: la URL es libre (ruta)
+            }
+        };
+        let mut url = format!("{scheme}://");
+        if !form.user.is_empty() || !form.pass.is_empty() {
+            url.push_str(&form.user);
+            if !form.pass.is_empty() {
+                url.push(':');
+                url.push_str(&form.pass);
+            }
+            url.push('@');
+        }
+        url.push_str(&form.host);
+        if !form.port.is_empty() {
+            url.push(':');
+            url.push_str(&form.port);
+        }
+        if !form.db.is_empty() {
+            url.push('/');
+            url.push_str(&form.db);
+        }
+        form.url = url;
+    }
+
+    /// Reparsea la URL actual y rellena los campos (si está completa).
+    /// Devuelve `true` si el parseo fue exitoso (la URL define el tipo).
+    fn conn_parse_url_into_fields(&mut self) -> bool {
+        let Some(form) = self.connection_form.as_mut() else { return false };
+        // Purga de la URL: quitar saltos de línea y espacios externos antes
+        // de analizar (las URLs de CleverCloud pueden llegar partidas).
+        form.url = form.url.trim().replace(['\n', '\r'], "");
+        let spec = crate::db::connection::analyze_connection(&form.url);
+        let complete = spec.kind != crate::db::connection::ConnectionType::Unknown;
+
+        if complete {
+            form.kind = spec.kind;
+            // Solo sobreescribir campos si el usuario no los forzó
+            if form.kind_override.is_none() {
+                form.host = spec.host.clone().unwrap_or_default();
+                form.port = spec.port.map_or_else(String::new, |p| p.to_string());
+                form.user = spec.user.clone().unwrap_or_default();
+                form.pass = spec.pass.clone().unwrap_or_default();
+                form.db = spec.db_name.clone().unwrap_or_default();
+            }
+            form.detected_note = format!("✓ Detectado: {}", spec.display());
+        } else if form.url.is_empty() {
+            form.detected_note.clear();
+        } else {
+            form.detected_note = "⏳ escribe la URL o ruta…".to_string();
+        }
+        complete
+    }
+
+    /// Procesa el debounce de la URL (1s desde la última tecla): si está
+    /// completa, rellena los campos. Se llama una vez por frame.
+    pub fn tick_connection_form(&mut self) {
+        let debounce_due = {
+            let Some(form) = self.connection_form.as_ref() else { return };
+            if !form.url_debounce_scheduled {
+                return;
+            }
+            form.url_last_edit
+                .is_some_and(|last| last.elapsed() >= std::time::Duration::from_secs(1))
+        };
+        if debounce_due {
+            if let Some(form) = self.connection_form.as_mut() {
+                form.url_debounce_scheduled = false;
+                form.url_last_edit = None;
+            }
+            self.conn_parse_url_into_fields();
+        }
+    }
+
+    /// Conecta con lo que haya en el formulario (URL canónica).
+    fn conn_submit(&mut self) {
+        // Si el foco está en un campo individual, reconstruir primero
+        let rebuild = self.connection_form.as_ref().is_some_and(|form| {
+            matches!(
+                form.active,
+                ConnField::Host | ConnField::Port | ConnField::User | ConnField::Pass
+                    | ConnField::Db
+            )
+        });
+        if rebuild {
+            self.conn_rebuild_url_from_fields();
+        }
+        let url = self
+            .connection_form
+            .as_ref()
+            .map(|f| f.url.clone())
+            .unwrap_or_default();
+        // Purga final antes de conectar (defensa en profundidad contra \n)
+        let url = url.trim().replace(['\n', '\r'], "");
+        if url.trim().is_empty() {
+            self.status = "Escribe una URL o ruta para conectar".to_string();
+            return;
+        }
+        tracing::debug!(url = %url, rebuild, "conn_submit: url a conectar");
+        // Conexión real (sync por ahora; el spinner se limpia después)
+        self.connection_form.as_mut().unwrap().connecting = true;
+        self.connect_sqlite(&url);
+        // REGLA DE ORO: el formulario persiste en el estado; el render lo
+        // oculta mientras haya db (`db_path.is_some()`). Al desconectar,
+        // reaparece automáticamente.
+        if let Some(form) = self.connection_form.as_mut() {
+            form.connecting = false;
+            form.url_debounce_scheduled = false;
+        }
+        if self.db_path.is_none() {
+            self.status = format!("No se pudo conectar a {url}");
+        }
+    }
+
+    /// Maneja las teclas del formulario de conexión.
+    // `drop(form)` termina el borrow de `self.connection_form` (NLL) antes de
+    // llamar a `self.conn_*`; es un no-op para clippy pero necesario aquí.
+    #[allow(clippy::too_many_lines)]
+    fn handle_connection_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = self.connection_form.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => {
+                // REGLA DE ORO: el formulario nunca se cierra sin db. Esc solo
+                // mueve el foco a Fuentes (la conexión queda pendiente).
+                self.active_panel = PanelKind::Sources;
+                self.status = "Conexión pendiente: el formulario queda en el panel Detalle".to_string();
+            }
+            // Ctrl+U: limpiar el campo activo (estándar readline)
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let active = form.active;
+                let mut rebuild = false;
+                match active {
+                    ConnField::Url => {
+                        form.url.clear();
+                        form.url_last_edit = None;
+                        form.url_debounce_scheduled = false;
+                        form.detected_note.clear();
+                    }
+                    ConnField::Host => {
+                        form.host.clear();
+                        rebuild = true;
+                    }
+                    ConnField::Port => {
+                        form.port.clear();
+                        rebuild = true;
+                    }
+                    ConnField::User => {
+                        form.user.clear();
+                        rebuild = true;
+                    }
+                    ConnField::Pass => {
+                        form.pass.clear();
+                        rebuild = true;
+                    }
+                    ConnField::Db => {
+                        form.db.clear();
+                        rebuild = true;
+                    }
+                    _ => {}
+                }
+                if rebuild {
+                    let _ = form;
+                    self.conn_rebuild_url_from_fields();
+                }
+            }
+            // Ctrl+L: limpiar TODO el formulario (empezar de cero)
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                *form = ConnectionFormState::default();
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                let next = match form.active {
+                    ConnField::Url => ConnField::Kind,
+                    ConnField::Kind => ConnField::Host,
+                    ConnField::Host => ConnField::Port,
+                    ConnField::Port => ConnField::User,
+                    ConnField::User => ConnField::Pass,
+                    ConnField::Pass => ConnField::Db,
+                    ConnField::Db => ConnField::Connect,
+                    ConnField::Connect => ConnField::Url,
+                };
+                form.active = next;
+            }
+            KeyCode::Up => {
+                let prev = match form.active {
+                    ConnField::Url => ConnField::Connect,
+                    ConnField::Kind => ConnField::Url,
+                    ConnField::Host => ConnField::Kind,
+                    ConnField::Port => ConnField::Host,
+                    ConnField::User => ConnField::Port,
+                    ConnField::Pass => ConnField::User,
+                    ConnField::Db => ConnField::Pass,
+                    ConnField::Connect => ConnField::Db,
+                };
+                form.active = prev;
+            }
+            KeyCode::Enter => {
+                let on_url = form.active == ConnField::Url;
+                let _ = form; // termina el borrow antes de llamar &mut self
+                if on_url {
+                    // Enter en la URL: parsea Y conecta de una (el usuario
+                    // escribió la URL completa y quiere entrar).
+                    let parsed = self.conn_parse_url_into_fields();
+                    if parsed {
+                        self.conn_submit();
+                    }
+                } else {
+                    self.conn_submit();
+                }
+            }
+            KeyCode::Backspace => {
+                let active = form.active;
+                let mut rebuild = false;
+                match active {
+                    ConnField::Url => {
+                        form.url.pop();
+                        form.url_last_edit = Some(std::time::Instant::now());
+                        form.url_debounce_scheduled = true;
+                    }
+                    // Host/Port/User/Pass/Db: pop + reconstruir la URL
+                    other @ (ConnField::Host
+                    | ConnField::Port
+                    | ConnField::User
+                    | ConnField::Pass
+                    | ConnField::Db) => {
+                        let field = match other {
+                            ConnField::Host => &mut form.host,
+                            ConnField::Port => &mut form.port,
+                            ConnField::User => &mut form.user,
+                            ConnField::Pass => &mut form.pass,
+                            _ => &mut form.db,
+                        };
+                        field.pop();
+                        rebuild = true;
+                    }
+                    _ => {}
+                }
+                if rebuild {
+                    let _ = form;
+                    self.conn_rebuild_url_from_fields();
+                }
+            }
+            KeyCode::Char(c) => {
+                let active = form.active;
+                let mut rebuild = false;
+                match active {
+                    ConnField::Url => {
+                        form.url.push(c);
+                        form.url_last_edit = Some(std::time::Instant::now());
+                        form.url_debounce_scheduled = true;
+                    }
+                    // Kind y Connect no aceptan chars (Kind: h/l cambia el tipo)
+                    ConnField::Kind | ConnField::Connect => {}
+                    other @ (ConnField::Host
+                    | ConnField::Port
+                    | ConnField::User
+                    | ConnField::Pass
+                    | ConnField::Db) => {
+                        let field = match other {
+                            ConnField::Host => &mut form.host,
+                            ConnField::Port => &mut form.port,
+                            ConnField::User => &mut form.user,
+                            ConnField::Pass => &mut form.pass,
+                            _ => &mut form.db,
+                        };
+                        if other == ConnField::Port {
+                            if c.is_ascii_digit() {
+                                field.push(c);
+                                rebuild = true;
+                            }
+                        } else {
+                            field.push(c);
+                            rebuild = true;
+                        }
+                    }
+                }
+                if rebuild {
+                    let _ = form;
+                    self.conn_rebuild_url_from_fields();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Teclas del prompt de contraseña (servidor detectado): Esc cancela,
     /// Enter autentica, el resto alimenta el buffer enmascarado.
     fn handle_password_prompt_key(&mut self, key: KeyEvent) {
@@ -2286,10 +2781,32 @@ impl App {
             }
             KeyCode::Enter => {
                 let prompt = std::mem::take(&mut self.password_prompt).expect("estado presente");
+                // URL postgres:// → autenticar en postgres; el resto (mysql://)
+                // cae al bloque mysql. Con un solo backend compilado, la rama
+                // inexistente desaparece y el `else` muestra el mensaje genérico.
+                #[cfg(feature = "postgres")]
                 if prompt.server_url.starts_with("postgres://") {
                     self.connect_postgres_server_with_password(prompt);
                 } else {
+                    #[cfg(feature = "mysql")]
                     self.connect_mysql_server_with_password(prompt);
+                    #[cfg(not(feature = "mysql"))]
+                    {
+                        let _ = prompt;
+                        self.password_prompt = None;
+                        self.status = "Servidor remoto no soportado en este build".to_string();
+                    }
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    #[cfg(feature = "mysql")]
+                    self.connect_mysql_server_with_password(prompt);
+                    #[cfg(not(any(feature = "mysql", feature = "postgres")))]
+                    {
+                        let _ = prompt;
+                        self.password_prompt = None;
+                        self.status = "Servidor remoto no soportado en este build".to_string();
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -2365,7 +2882,20 @@ impl App {
             self.show_error("Sin conexión", "Conecta una base primero (`:`)");
             return;
         };
-        let sql = sql.to_string();
+        // NoSQL (mongo): el modal `:` recibe un filtro JSON que se aplica
+        // sobre la colección seleccionada. Viaja embebido en el sql interno
+        // (`@<coleccion> <json>`) porque el query runner resuelve un adapter
+        // nuevo y no conoce la colección activa.
+        let sql = if self.is_nosql {
+            let coll = self.selected_object_name();
+            if coll.is_empty() || coll == "-" {
+                self.show_error("Sin colección", "Selecciona una colección antes de filtrar");
+                return;
+            }
+            format!("@{coll} {sql}")
+        } else {
+            sql.to_string()
+        };
 
         self.state.add_query_history(&sql);
         let _ = self.state.save();
@@ -2386,8 +2916,10 @@ impl App {
         self.status = "Ejecutando query...".to_string();
         self.is_loading = true;
 
+        // Provider: reusar la conexión activa (evita re-handshake en remoto)
+        let adapter = self.adapter_arc();
         tokio::spawn(async move {
-            let res = query::execute_query(&path, &sql, query::QUERY_RESULT_LIMIT).await;
+            let res = query::execute_query(adapter, &path, &sql, query::QUERY_RESULT_LIMIT).await;
             let _ = tx.send(query::QueryMsg::Free(generation, sql, res));
         });
     }
@@ -2511,15 +3043,23 @@ impl App {
         }
     }
 
+    /// Adapter de la conexión activa (compartido). `None` si no hay db.
+    /// Referencia clonada al adapter activo (no presta `self`).
+    fn adapter_arc(&self) -> Option<std::sync::Arc<dyn crate::db::adapter::DbAdapter>> {
+        self.active_adapter.as_ref().map(std::sync::Arc::clone)
+    }
+
     /// Cierra la conexión actual y vuelve el foco a Fuentes.
     fn disconnect_db(&mut self) {
         self.db_path = None;
         self.db_size_bytes = None;
+        self.active_adapter = None;
         self.tables.clear();
         self.views.clear();
         self.advanced.clear();
-        self.preview_rows = vec!["Sin conexion SQLite".to_string()];
+        self.preview_rows.clear();
         self.preview_data = None;
+        self.connection_form = Some(ConnectionFormState::default());
         self.total_rows = 0;
         self.preview_loaded_offset = 0;
         self.current_page = 0;
@@ -2616,23 +3156,42 @@ impl App {
     /// actualmente seleccionada en el Detail. Se puede llamar en caliente
     /// (mientras el modal está abierto) para seguir la navegación ↑/↓.
     fn refresh_row_inspector(&mut self) {
-        let Some(path) = self.db_path.as_deref() else {
-            return;
-        };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             return;
         }
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
-            return;
-        };
-        let Ok(columns) = adapter.column_names(&object) else {
+        let Some(adapter) = self.adapter_arc() else {
             return;
         };
 
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1); // skip header
         #[allow(clippy::cast_possible_truncation)]
         let offset = self.preview_loaded_offset + row_idx as u32;
+
+        // NoSQL (mongo): el backend entrega directo los pares clave→valor SOLO
+        // de los campos presentes en este documento. Cada fila puede tener
+        // campos distintos; los ausentes no se muestran ni se desalinean.
+        // También entregamos el JSON formateado (modo JSON del modal).
+        if let Some(pairs) = adapter.row_inspector_pairs(&object, offset) {
+            self.row_inspector_pairs = pairs;
+            self.inspector_json_text =
+                adapter.row_inspector_json(&object, offset).unwrap_or_default();
+            self.inspector_scroll.reset();
+            return;
+        }
+
+        // SQL (esquema fijo): flujo clásico por índice. Las columnas ya vienen
+        // en `preview_data` (TableData del Data tab): reutilizarlas evita una
+        // consulta `column_names()` aparte por cada apertura del modal.
+        let columns: Vec<crate::db::Column> = self
+            .preview_data
+            .as_ref()
+            .map(|data| data.columns.clone())
+            .or_else(|| adapter.column_names(&object).ok())
+            .unwrap_or_default();
+        if columns.is_empty() {
+            return;
+        }
         // Celdas expandidas (multilínea): los tipos compuestos de DuckDB
         // (list/struct/map/union/array) se muestran completos en el modal.
         let Ok(rows) = adapter.table_data_rows_pretty(&object, 1, offset) else {
@@ -2658,6 +3217,20 @@ impl App {
     #[allow(clippy::missing_const_for_fn)]
     fn close_row_inspector(&mut self) {
         self.show_row_inspector = false;
+    }
+
+    /// Etiqueta del modo de visualización del modal `NoSQL` (para el título).
+    pub const fn inspector_mode_label(&self) -> &'static str {
+        if self.inspector_json_mode { "Pares" } else { "Modo JSON" }
+    }
+
+    /// Alterna pares ↔ JSON del documento en el modal `NoSQL`. No hace nada
+    /// si el backend no entregó JSON (SQL o doc sin datos).
+    pub fn toggle_inspector_json_mode(&mut self) {
+        if !self.inspector_json_text.is_empty() {
+            self.inspector_json_mode = !self.inspector_json_mode;
+            self.inspector_scroll.reset();
+        }
     }
 
     /// Copia el ítem seleccionado al portapapeles del sistema.
@@ -2868,7 +3441,6 @@ impl App {
     ///
     /// Devuelve `true` si saltó (la fila tenía una FK resuelta).
     fn fk_jump(&mut self) -> bool {
-        let Some(path) = self.db_path.as_deref() else { return false };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             return false;
@@ -2877,7 +3449,7 @@ impl App {
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1);
         let Some(row) = data.rows.get(row_idx) else { return false };
 
-        let Some(adapter) = db::resolver::resolve_backend(path) else {
+        let Some(adapter) = self.adapter_arc() else {
             return false;
         };
         let Ok(fks) = adapter.foreign_keys(&object) else {
@@ -2924,18 +3496,16 @@ impl App {
 
         // Cambiar al objeto referenciado (recargando tablas si no estaba)
         if !self.tables.contains(&fk.table) {
-            if let Some(path) = self.db_path.as_deref() {
-                if let Some(adapter) = db::resolver::resolve_backend(path) {
-                    if let Ok(tables) = adapter.list_objects_by_type("table") {
-                        self.tables = tables;
-                        self.sources = Self::build_sources(
-                            &self.state,
-                            self.source_tab,
-                            Some(path),
-                            &self.health,
-                            &self.detected_servers,
-                        );
-                    }
+            if let Some(adapter) = self.adapter_arc() {
+                if let Ok(tables) = adapter.list_objects_by_type("table") {
+                    self.tables = tables;
+                    self.sources = Self::build_sources(
+                        &self.state,
+                        self.source_tab,
+                        self.db_path.as_deref(),
+                        &self.health,
+                        &self.detected_servers,
+                    );
                 }
             }
         }
@@ -2993,6 +3563,9 @@ impl App {
             s if s.starts_with("postgres://") || s.starts_with("postgresql://") => {
                 self.connect_sqlite(s);
             }
+            s if s.starts_with("mongodb://") => {
+                self.connect_sqlite(s);
+            }
             s if s.contains(" => ") => {
                 let path = s.split_once(" => ").map(|(_, p)| p.to_string()).unwrap_or_default();
                 self.connect_sqlite(&path);
@@ -3004,7 +3577,16 @@ impl App {
                         || ext.eq_ignore_ascii_case("sqlite3")
                         || ext.eq_ignore_ascii_case("duckdb")
                         || ext.eq_ignore_ascii_case("ddb")
-                        || crate::db::backends::file::kind_for(s).is_some()
+                        || {
+                            #[cfg(feature = "files")]
+                            {
+                                crate::db::backends::file::kind_for(s).is_some()
+                            }
+                            #[cfg(not(feature = "files"))]
+                            {
+                                false
+                            }
+                        }
                 }) =>
             {
                 self.connect_sqlite(s);
@@ -3051,6 +3633,68 @@ impl App {
         }
     }
 
+    /// Pegado del portapapeles (bracketed paste). Se enruta al estado activo
+    /// que acepte texto; los `\n` se sanitizan (las URLs de `CleverCloud` se
+    /// parten en 2 líneas y el `\n` no debe disparar Enter).
+    pub fn on_paste(&mut self, text: &str) {
+        let clean = text.replace(['\n', '\r'], "");
+        if clean.is_empty() {
+            return;
+        }
+
+        // Formulario de conexión: pegar en el campo URL (o el campo activo)
+        if self.connection_form.is_some() && self.db_path.is_none() {
+            if let Some(form) = self.connection_form.as_mut() {
+                let target = match form.active {
+                    ConnField::Url => &mut form.url,
+                    ConnField::Host => &mut form.host,
+                    ConnField::Port => &mut form.port,
+                    ConnField::User => &mut form.user,
+                    ConnField::Pass => &mut form.pass,
+                    ConnField::Db => &mut form.db,
+                    _ => return,
+                };
+                target.push_str(&clean);
+                if form.active == ConnField::Url {
+                    form.url_last_edit = Some(std::time::Instant::now());
+                    form.url_debounce_scheduled = true;
+                }
+            }
+            // Reconstruir la URL si se pegó en un campo individual
+            if let Some(form) = self.connection_form.as_ref() {
+                if matches!(
+                    form.active,
+                    ConnField::Host | ConnField::Port | ConnField::User | ConnField::Pass
+                        | ConnField::Db
+                ) {
+                    self.conn_rebuild_url_from_fields();
+                }
+            }
+            return;
+        }
+
+        // Input de query (`:`)
+        if self.query_input.is_some() {
+            if let Some(state) = self.query_input.as_mut() {
+                state.buffer.push_str(&clean);
+            }
+            return;
+        }
+
+        // Prompt de contraseña
+        if self.password_prompt.is_some() {
+            if let Some(state) = self.password_prompt.as_mut() {
+                state.buffer.push_str(&clean);
+            }
+            return;
+        }
+
+        // Modo filtro
+        if self.input_mode == InputMode::Filtering {
+            self.filter_query.push_str(&clean);
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         // ── modo filtro: capturar teclas antes del mapeo de acciones ──
         if self.input_mode == InputMode::Filtering {
@@ -3068,16 +3712,31 @@ impl App {
             return;
         }
 
+        // ── modales superpuestos: el prompt de contraseña y el picker de
+        // bases capturan SIEMPRE primero (se abren sobre el formulario de
+        // conexión cuando conectas a un servidor remoto). ──
+        if self.password_prompt.is_some() {
+            self.handle_password_prompt_key(key);
+            return;
+        }
+        if self.db_picker.is_some() {
+            self.handle_db_picker_key(key);
+            return;
+        }
+
+        // ── formulario de nueva conexión (captura TODO solo cuando el foco
+        // está en el panel Detail y NO hay db conectada; los chars alimentan
+        // el campo activo). Con foco en otro panel, `:` y las teclas globales
+        // siguen funcionando normal. ──
+        if self.db_path.is_none() && self.active_panel == PanelKind::Detail {
+            self.handle_connection_form_key(key);
+            return;
+        }
+
         // ── input SQL (modal `:` — captura TODO mientras está abierto,
         // incluidos chars no mapeados a ninguna acción) ──
         if self.query_input.is_some() {
             self.handle_query_input_key(key);
-            return;
-        }
-
-        // ── prompt de contraseña (modal de servidor detectado) ──
-        if self.password_prompt.is_some() {
-            self.handle_password_prompt_key(key);
             return;
         }
 
@@ -3144,6 +3803,12 @@ impl App {
                 self.move_selection(1);
                 self.refresh_row_inspector();
             }
+            // NoSQL: alternar pares ↔ JSON del documento (solo tiene sentido
+            // si el backend entregó JSON; SQL ignora el toggle).
+            keys::AppAction::ToggleInspectorJson if !self.inspector_json_text.is_empty() => {
+                self.inspector_json_mode = !self.inspector_json_mode;
+                self.inspector_scroll.reset();
+            }
             _ => {}
         }
     }
@@ -3202,6 +3867,9 @@ impl App {
                 self.actions_menu_idx = 0;
                 self.status = "Menu de acciones abierto".to_string();
             }
+            // Fuera del modal no aplica: el toggle se maneja en
+            // `handle_row_inspector_key` (solo dentro del modal NoSQL).
+            keys::AppAction::ToggleInspectorJson => {}
             keys::AppAction::ToggleHelp => {
                 self.show_help = !self.show_help;
                 if self.show_help {
@@ -3782,9 +4450,37 @@ impl App {
         p.selected_idx = new;
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn on_mouse_click(&mut self, x: u16, y: u16, width: u16, height: u16) {
         if width < 40 || height < 10 {
             return;
+        }
+
+        // Formulario de nueva conexión (sin db): click en el botón
+        // "[Conectar]" conecta; click en cualquier otra zona del Detail
+        // enfoca el panel para que el teclado alimente los campos.
+        if self.db_path.is_none() && self.connection_form.is_some() {
+            if let Some(&(_, rect)) =
+                self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
+            {
+                let inside = x >= rect.x
+                    && x < rect.x.saturating_add(rect.width)
+                    && y >= rect.y
+                    && y < rect.y.saturating_add(rect.height);
+                if inside {
+                    // El botón vive en la fila inner.y + 11 del formulario
+                    // (URL + nota + separador + Tipo + 5 campos + hueco).
+                    let inner_y = rect.y.saturating_add(1);
+                    let connect_row = inner_y.saturating_add(11);
+                    if y == connect_row && x > rect.x {
+                        self.conn_submit();
+                        return;
+                    }
+                    // Cualquier otra zona: enfocar Detail (captura teclas)
+                    self.active_panel = PanelKind::Detail;
+                    return;
+                }
+            }
         }
 
         // Click fuera del modal de inspector de fila → cerrarlo y continuar
@@ -3797,7 +4493,11 @@ impl App {
             let inside =
                 x >= mx && x < mx.saturating_add(mw) && y >= my && y < my.saturating_add(mh);
             if inside {
-                // Click dentro del modal: sin acción
+                // Botón del modo NoSQL (`[J: json]` / `[J: pares]`): vive en el
+                // título (fila superior del borde del modal), lado derecho.
+                if self.is_nosql && y == my {
+                    self.toggle_inspector_json_mode();
+                }
                 return;
             }
             self.close_row_inspector();
@@ -3932,6 +4632,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "mysql", feature = "postgres"))]
+    fn strip_url_credentials_quita_user_pass_y_devuelve_el_user() {
+        let (clean, user) =
+            strip_url_credentials("postgresql://uo8h6cfqdm4u5xv6lfqq:secret@host:5432/db");
+        assert_eq!(clean, "postgresql://host:5432/db");
+        assert_eq!(user.as_deref(), Some("uo8h6cfqdm4u5xv6lfqq"));
+
+        // Sin credenciales: intacta y user None
+        let (clean, user) = strip_url_credentials("postgres://localhost:5432");
+        assert_eq!(clean, "postgres://localhost:5432");
+        assert_eq!(user, None);
+
+        let (clean, user) = strip_url_credentials("mysql://root:root@127.0.0.1:3306");
+        assert_eq!(clean, "mysql://127.0.0.1:3306");
+        assert_eq!(user.as_deref(), Some("root"));
+    }
+
+    #[test]
+    #[cfg(any(feature = "mysql", feature = "postgres"))]
     fn server_url_has_database_distingue_servidor_de_bd() {
         // URLs de scan_local_servers: servidor sin base
         assert!(!server_url_has_database("mysql://127.0.0.1:3306"));
@@ -3946,6 +4665,10 @@ mod tests {
         assert!(!server_url_has_database("postgres://postgres:secret@127.0.0.1:5432"));
         assert!(server_url_has_database("postgres://127.0.0.1:5432/sakila"));
         assert!(server_url_has_database("postgresql://user:pw@localhost:5432/mydb"));
+        // URI real de CleverCloud (producción): con base → NO es servidor
+        assert!(server_url_has_database(
+            "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/bh4bhaewrpd8qqcreso5"
+        ));
         // No-servidor no entra en el flujo
         assert!(!server_url_has_database("/tmp/x.db"));
     }
@@ -4073,6 +4796,8 @@ mod tests {
         assert_eq!(source_kind("mysql://127.0.0.1:3306/lazy"), SourceKind::Localhost);
         assert_eq!(source_kind("postgres://[::1]:5432/prod"), SourceKind::Localhost);
         assert_eq!(source_kind("postgres://db.azure.com:5432/prod"), SourceKind::Online);
+        assert_eq!(source_kind("mongodb://127.0.0.1:27017"), SourceKind::Localhost);
+        assert_eq!(source_kind("mongodb://mongo.atlas.cloud:27017/db"), SourceKind::Online);
         assert_eq!(source_kind("https://api.example.com/db"), SourceKind::Online);
         assert_eq!(source_kind("ssh://host/db"), SourceKind::Online);
         // sqlite:// y rutas de archivo SIEMPRE son File (antes se confundían)
@@ -4087,6 +4812,7 @@ mod tests {
         assert_eq!(url_host("mysql://localhost/db"), Some("localhost"));
         assert_eq!(url_host("postgres://[::1]:5432/x"), Some("[::1]"));
         assert_eq!(url_host("postgres://db.azure.com:5432/prod"), Some("db.azure.com"));
+        assert_eq!(url_host("mongodb://127.0.0.1:27017"), Some("127.0.0.1"));
         assert_eq!(url_host("sqlite:///tmp/x.db"), Some(""));
     }
 
@@ -4095,11 +4821,38 @@ mod tests {
         assert_eq!(db_type_mark("postgres://db.azure.com/prod"), 'P');
         assert_eq!(db_type_mark("postgresql://127.0.0.1/lazy"), 'P');
         assert_eq!(db_type_mark("mysql://localhost/lazy"), 'M');
+        assert_eq!(db_type_mark("mongodb://127.0.0.1:27017"), 'N');
         assert_eq!(db_type_mark("https://api.x/db"), '⊙');
         assert_eq!(db_type_mark("base.duckdb"), 'D');
         assert_eq!(db_type_mark("otra.ddb"), 'D');
         assert_eq!(db_type_mark("sakila.db"), '▣');
         assert_eq!(db_type_mark("sqlite:///tmp/x.db"), '▣');
+    }
+
+    #[test]
+    fn build_sources_servidor_mongo_no_se_normaliza_como_path() {
+        // Regresión del bug: `entry()` normalizaba `mongodb://127.0.0.1:27017`
+        // como path de archivo (is_url no la reconocía) → la URL se rompía.
+        let state = state_de_prueba();
+        let sources = App::build_sources(
+            &state,
+            SourceTab::All,
+            None,
+            &HashMap::new(),
+            &["mongodb://127.0.0.1:27017".to_string()],
+        );
+        let entry = sources
+            .iter()
+            .find(|s| s.contains("mongodb://"))
+            .expect("el servidor mongo debe aparecer en las fuentes");
+        assert!(
+            entry.contains("mongodb://127.0.0.1:27017"),
+            "la URL debe quedar intacta (no un path normalizado): {entry}"
+        );
+        assert!(
+            !entry.contains("lazydb/mongodb"),
+            "no debe mezclarse con el cwd: {entry}"
+        );
     }
 
     #[test]
@@ -4144,6 +4897,8 @@ mod tests {
         );
         // Sin puerto → default del esquema
         assert_eq!(source_host_port("mysql://localhost/lazy"), Some(("localhost".into(), 3306)));
+        assert_eq!(source_host_port("mongodb://localhost/mydb"), Some(("localhost".into(), 27017)));
+        assert_eq!(source_host_port("mongodb://127.0.0.1:27017"), Some(("127.0.0.1".into(), 27017)));
         assert_eq!(
             source_host_port("https://api.example.com/x"),
             Some(("api.example.com".into(), 443))
@@ -4180,6 +4935,9 @@ mod tests {
         let port = listener.local_addr().expect("puerto local").port();
         let url = format!("mysql://127.0.0.1:{port}/lazy");
         assert!(probe_source(&url), "servicio escuchando debe dar ✓: {url}");
+        // MongoDB usa el mismo probe TCP (puerto explícito en la URL)
+        let url_mongo = format!("mongodb://127.0.0.1:{port}/lazy");
+        assert!(probe_source(&url_mongo), "servicio mongo escuchando debe dar ✓: {url_mongo}");
         drop(listener);
 
         // Puerto cerrado: debe dar ✗ (refused es inmediato)
@@ -4591,6 +5349,7 @@ mod tests {
     /// picker con las bases reales, y elegir `lazydb_demo` conecta el catálogo.
     /// Requiere `MariaDB` local con la env var `LAZYDB_MYSQL_URL` (ver el archivo `AGENTS.md`).
     #[test]
+    #[cfg(feature = "mysql")]
     #[ignore = "requiere MariaDB local (LAZYDB_MYSQL_URL)"]
     fn smoke_flujo_servidor_picker_conecta_bd_real() {
         let Ok(server_url) = std::env::var("LAZYDB_MYSQL_SERVER_URL") else {
@@ -4627,5 +5386,299 @@ mod tests {
         app.connect_sqlite(&url);
         assert!(app.tables.contains(&"categories".to_string()), "tablas: {:?}", app.tables);
         assert!(app.views.contains(&"view_order_summary".to_string()), "vistas: {:?}", app.views);
+    }
+
+    /// Smoke del flujo mongo: abrir `mongodb://host:puerto` (sin base) desde
+    /// servidores locales abre el picker con las bases reales, y elegir una
+    /// conecta el catálogo (colecciones). Requiere `MongoDB` local
+    /// (`LAZYDB_MONGO_URI`).
+    #[test]
+    #[cfg(feature = "mongodb")]
+    #[ignore = "requiere MongoDB local (LAZYDB_MONGO_URI)"]
+    fn smoke_flujo_servidor_mongo_picker_conecta_colecciones() {
+        let Ok(server_url) = std::env::var("LAZYDB_MONGO_SERVER_URL") else {
+            return;
+        };
+        let mut app = App::new();
+        // Mismo path que la UI al presionar Enter sobre el servidor detectado
+        app.connect_sqlite(&server_url);
+        let Some(picker) = &app.db_picker else {
+            panic!("debe abrirse el picker (status: {})", app.status);
+        };
+        assert!(
+            picker.dbs.iter().any(|d| d == "lazydb_probe"),
+            "bases: {:?}",
+            picker.dbs
+        );
+        // Elegir la base por índice → connect_sqlite conecta el catálogo
+        let idx = picker.dbs.iter().position(|d| d == "lazydb_probe").unwrap();
+        let picker = app.db_picker.take().unwrap();
+        let db = picker.dbs[idx].clone();
+        let mut url = picker.server_url;
+        url.push('/');
+        url.push_str(&db);
+        app.connect_sqlite(&url);
+        assert!(
+            app.tables.iter().any(|c| c == "test_probe"),
+            "colecciones: {:?}",
+            app.tables
+        );
+    }
+
+    /// Enter en el campo URL con URL válida → parsea Y conecta (no solo
+    /// rellena campos). Regresión del "le doy enter y nada".
+    #[test]
+    #[cfg(feature = "mongodb")]
+    #[ignore = "requiere MongoDB local (LAZYDB_MONGO_SERVER_URL)"]
+    fn enter_en_url_del_formulario_conecta() {
+        let Ok(server_url) = std::env::var("LAZYDB_MONGO_SERVER_URL") else {
+            return;
+        };
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail;
+        app.connection_form = Some(ConnectionFormState::default());
+        // Escribir la URL con base y Enter → debe conectar directo
+        let mut url = server_url;
+        url.push('/');
+        url.push_str("lazydb_probe");
+        for c in url.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.db_path.is_some(),
+            "Enter en URL válida debe conectar (status: {})",
+            app.status
+        );
+        assert!(
+            app.active_adapter.is_some(),
+            "el adapter debe compartirse en active_adapter tras conectar"
+        );
+        assert!(
+            app.tables.iter().any(|c| c == "test_probe"),
+            "colecciones: {:?}",
+            app.tables
+        );
+    }
+
+    #[test]
+    fn sin_db_el_detail_muestra_el_formulario_de_conexion() {
+        // Al arrancar (sin db): el Detail debe ofrecer el formulario de
+        // conexión con el foco en la URL (nada del placeholder viejo).
+        let app = App::new();
+        let Some(form) = app.connection_form.as_ref() else {
+            panic!("debe existir el formulario de conexión al arrancar");
+        };
+        assert_eq!(form.active, ConnField::Url, "foco inicial en la URL");
+        assert!(app.preview_rows.is_empty(), "sin items de lista");
+    }
+
+    #[test]
+    fn regla_de_oro_el_formulario_nunca_se_cierra_sin_db() {
+        // Esc con el foco en Detail no cierra el formulario: solo mueve el
+        // foco a Fuentes. El estado `connection_form` persiste.
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.connection_form.is_some(),
+            "Esc no debe cerrar el formulario sin db abierta"
+        );
+        assert_eq!(app.active_panel, PanelKind::Sources, "Esc mueve el foco a Fuentes");
+
+        // Navegar a otros paneles no elimina el formulario tampoco
+        app.active_panel = PanelKind::Tables;
+        assert!(app.connection_form.is_some(), "el formulario persiste en cualquier panel");
+    }
+
+    #[test]
+    fn esc_cierra_el_prompt_de_contrasena_aunque_el_formulario_este_activo() {
+        // El prompt de contraseña (modal superpuesto) captura las teclas
+        // ANTES que el formulario de conexión: Esc debe cerrarlo siempre,
+        // no "mover el foco" (que dejaba el modal colgado).
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail; // el formulario está activo
+        app.connection_form = Some(ConnectionFormState::default());
+        app.password_prompt = Some(PasswordPromptState {
+            server_url: "mysql://127.0.0.1:3306".to_string(),
+            user: "root".to_string(),
+            buffer: "x".to_string(),
+        });
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.password_prompt.is_none(),
+            "Esc debe cerrar el prompt de contraseña (no lo intercepta el formulario)"
+        );
+        assert_eq!(app.active_panel, PanelKind::Detail, "el foco no debe moverse");
+    }
+
+    #[test]
+    fn conectar_con_exito_oculta_el_formulario_y_desconectar_lo_reactiva() {
+        // Simula el contrato de la regla de oro: el render muestra el
+        // formulario cuando `db_path.is_none()`, sea cual sea el panel.
+        let app = App::new();
+        assert!(app.db_path.is_none());
+        assert!(app.connection_form.is_some(), "sin db → formulario presente");
+    }
+
+    #[test]
+    fn conn_parse_url_rellena_los_campos() {
+        let mut app = App::new();
+        app.connection_form = Some(ConnectionFormState::default());
+        app.connection_form.as_mut().unwrap().url =
+            "mysql://user:pass@localhost:3306/lazy".to_string();
+        assert!(app.conn_parse_url_into_fields());
+        let form = app.connection_form.as_ref().unwrap();
+        assert_eq!(form.kind, crate::db::connection::ConnectionType::Mysql);
+        assert_eq!(form.host, "localhost");
+        assert_eq!(form.port, "3306");
+        assert_eq!(form.user, "user");
+        assert_eq!(form.pass, "pass");
+        assert_eq!(form.db, "lazy");
+        assert!(form.detected_note.contains("MySQL"), "nota: {}", form.detected_note);
+    }
+
+    #[test]
+    fn conn_parse_url_uri_clevercloud_rellena_credenciales() {
+        let mut app = App::new();
+        app.connection_form = Some(ConnectionFormState::default());
+        app.connection_form.as_mut().unwrap().url = concat!(
+            "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@",
+            "bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/",
+            "bh4bhaewrpd8qqcreso5"
+        )
+        .to_string();
+        assert!(app.conn_parse_url_into_fields());
+        let form = app.connection_form.as_ref().unwrap();
+        assert_eq!(form.user, "uo8h6cfqdm4u5xv6lfqq");
+        assert_eq!(form.pass, "dsJBQr44561wnu9YizPLTeP1GFh0eO");
+        assert_eq!(form.port, "5432");
+        assert_eq!(form.db, "bh4bhaewrpd8qqcreso5");
+    }
+
+    #[test]
+    fn ctrl_u_limpia_el_campo_activo_y_ctrl_l_limpia_todo() {
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail; // el formulario captura con foco en Detail
+        app.connection_form = Some(ConnectionFormState::default());
+        app.connection_form.as_mut().unwrap().url = "mysql://user:pass@localhost:3306/lazy".to_string();
+        app.connection_form.as_mut().unwrap().host = "localhost".to_string();
+        app.connection_form.as_mut().unwrap().active = ConnField::Url;
+
+        // Ctrl+U limpia el campo URL activo
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.connection_form.as_ref().unwrap().url, "");
+        assert_eq!(
+            app.connection_form.as_ref().unwrap().host,
+            "localhost",
+            "otros campos intactos con Ctrl+U"
+        );
+
+        // Ctrl+L limpia todo el formulario
+        app.connection_form.as_mut().unwrap().host = "localhost".to_string();
+        app.on_key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL,
+        ));
+        let form = app.connection_form.as_ref().unwrap();
+        assert!(form.host.is_empty(), "Ctrl+L limpia todo");
+        assert!(form.url.is_empty());
+        assert_eq!(form.active, ConnField::Url, "el foco vuelve a la URL");
+    }
+
+    #[test]
+    fn conn_parse_url_incompleta_no_toca_campos() {
+        let mut app = App::new();
+        app.connection_form = Some(ConnectionFormState::default());
+        {
+            let form = app.connection_form.as_mut().unwrap();
+            form.url = "mysql:/".to_string(); // incompleta: sin `//host`
+            form.host = "ya-editado".to_string();
+        }
+        assert!(!app.conn_parse_url_into_fields());
+        let form = app.connection_form.as_ref().unwrap();
+        assert_eq!(form.host, "ya-editado", "no debe sobreescribir campos manuales");
+    }
+
+    #[test]
+    fn conn_rebuild_url_desde_campos() {
+        let mut app = App::new();
+        app.connection_form = Some(ConnectionFormState::default());
+        {
+            let form = app.connection_form.as_mut().unwrap();
+            form.kind = crate::db::connection::ConnectionType::Mysql;
+            form.host = "db.azure.com".to_string();
+            form.port = "3306".to_string();
+            form.user = "admin".to_string();
+            form.pass = "secreto".to_string();
+            form.db = "prod".to_string();
+        }
+        app.conn_rebuild_url_from_fields();
+        assert_eq!(
+            app.connection_form.as_ref().unwrap().url,
+            "mysql://admin:secreto@db.azure.com:3306/prod"
+        );
+    }
+
+    /// Reproducción del bug reportado: pegar la `URI` de `CleverCloud` (con base
+    /// y credenciales) y dar Enter NO debe abrir el prompt de contraseña —
+    /// la URL ya trae `user:pass` y `/db`. Sin red, el resolver falla con
+    /// error de conexión, pero NUNCA debe activar `password_prompt`.
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn uri_clevercloud_con_base_no_abre_prompt_de_contrasena() {
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail;
+        app.connection_form = Some(ConnectionFormState::default());
+        let uri = concat!(
+            "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@",
+            "bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/",
+            "bh4bhaewrpd8qqcreso5"
+        );
+        app.connection_form.as_mut().unwrap().url = uri.to_string();
+        // Enter en el campo URL → parsea + conecta
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.password_prompt.is_none(),
+            "la URI con /db y credenciales NO debe pedir contraseña (status: {})",
+            app.status
+        );
+    }
+
+    /// Regresión: una URL pegada PARTIDA por un `\n` (`CleverCloud` la parte en
+    /// dos líneas) debe purgarse antes de analizar/conectar: sin saltos de
+    /// línea y con la base registrada. Nunca debe ir al flujo de servidor.
+    #[test]
+    fn on_paste_sanitiza_nueva_linea_y_conn_parse_purga_la_url() {
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail;
+        app.connection_form = Some(ConnectionFormState::default());
+
+        // Simula el pegado de la URL partida (con \n entre el puerto y la db)
+        let pegada = concat!(
+            "postgresql://uo8h6cfqdm4u5xv6lfqq:secret@host:5432/\n",
+            "bh4bhaewrpd8qqcreso5"
+        );
+        app.on_paste(pegada);
+        let url_limpia = app.connection_form.as_ref().unwrap().url.clone();
+        assert!(
+            !url_limpia.contains('\n'),
+            "el paste debe quitar el \\n: {url_limpia:?}"
+        );
+        assert!(
+            url_limpia.ends_with("bh4bhaewrpd8qqcreso5"),
+            "la base debe quedar al final: {url_limpia:?}"
+        );
+
+        // Enter → parsea (con purga) y no debe ir al flujo de servidor
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.password_prompt.is_none(),
+            "URL purgada no debe pedir contraseña (status: {})",
+            app.status
+        );
     }
 }

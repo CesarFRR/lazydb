@@ -12,8 +12,9 @@ use std::{fs, io, path::PathBuf, time::Duration};
 use app::App;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+        MouseEventKind,
     },
     execute,
 };
@@ -72,10 +73,15 @@ async fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
     install_panic_hook();
     execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    // Bracketed paste: pegar texto multilínea (p.ej. URLs partidas por
+    // CleverCloud) llega como UN Event::Paste en vez de chars sueltos
+    // donde el `\n` se interpretaría como Enter.
+    execute!(terminal.backend_mut(), EnableBracketedPaste)?;
 
     let mut app = App::new();
     let result = run_app(&mut terminal, &mut app);
 
+    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
     let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     ratatui::restore();
     tracing::debug!(salida = ?result.is_ok(), "cerrando lazydb");
@@ -101,6 +107,12 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result
         if event::poll(Duration::from_millis(50))? {
             loop {
                 match event::read()? {
+                    // Bracketed paste: texto pegado (puede ser multilínea,
+                    // p.ej. URLs de CleverCloud partidas). Va directo al
+                    // estado activo (formulario de conexión, input, etc.).
+                    Event::Paste(text) => {
+                        app.on_paste(&text);
+                    }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         // Ctrl+C = cierre seguro: primero cierra filtro/menús/
                         // modales abiertos, y solo sale si no queda nada abierto

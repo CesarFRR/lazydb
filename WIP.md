@@ -552,15 +552,54 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 - `files` depende de `duckdb`: el backend de archivos (parquet/csv/json/
   geojson/gpkg) lee con duckdb internamente (file.rs usa
   `duckdb::cell_value_to_pretty` etc.).
-- Verificado: `cargo check` default y `--all-features` → idénticos (~5.5s);
-  `--no-default-features --features local/remote` → falla E0432 (esperado:
-  el código aún no está gateado, es la Fase B).
 - CI: `--all-features` deja de ser no-op conceptual (ya expresa intención).
-- **Pendiente Fase B**: `#[cfg(feature = "...")]` en backends + puntos de
-  contacto (resolver, controller, servers, query, UI) para poder compilar
-  subconjuntos. Disparador: añadir MongoDB (crate `mongodb` pesado) o
-  distribuir binarios.
 
+### ✅ Features Cargo por backend — Fase B: gateo del código (HECHO, 2026-08-04, rama `feat/nosql-backend`)
+
+- Cada backend (y su adapter) en `db/backends/mod.rs` con `#[cfg(feature = "...")]`.
+- `db/mod.rs`: `rt` (runtime tokio) solo con `any(mysql, postgres)` — los
+  backends locales son sync puro.
+- `resolver.rs`: imports y ramas de resolución gateadas por feature.
+- `error.rs`: impls `From<...>` de rusqlite/duckdb/mysql_async/tokio-postgres/
+  deadpool gateados; variante `Sqlite` con `cfg_attr(dead_code)` en builds sin
+  ningún backend.
+- `pretty.rs`: parser de arrays PG + `prettify_rows`/`pretty_cell_or_plain`
+  con `any(sqlite, mysql, postgres)`; `pretty_json_or_plain` solo con `duckdb`.
+- `controller.rs`: flujo de servidores mysql/postgres (connect_*_server,
+  password prompt, picker) gateado; `file::kind_for` con `files`.
+- Tests gateados por feature (smokes de MySQL/duckdb/files, helpers de query).
+- Verificado 0 warnings + tests OK en: `[]`, `sqlite`, `duckdb`, `files`,
+  `mysql`, `postgres`, `local`, `remote`, default y `--all-features`.
+  `cargo test` default: 111 ok / 8 ignored; clippy `--all-targets` 0 warnings.
+- Disparador cumplido: añadir MongoDB ahora solo exige declarar la feature
+  `mongodb` + gatear sus módulos.
+
+### ✅ Backend MongoDB (HECHO, 2026-08-04, rama `feat/nosql-backend`)
+
+- Feature `mongodb` + meta-feature `nosql` en Cargo.toml. Crate oficial
+  `mongodb` 3.8 con `default-features=false` + `compat-3-3-0` + `bson-2` +
+  `rustls-tls` (sin openssl). Dep `futures-util` para iterar cursores.
+- **Interfaz de bajo nivel con `bson::Document` crudo** (decisión post-Reddit):
+  sin serde tipado, porque los docs de mongo son dinámicos.
+- `src/db/backends/mongo.rs`: connect (URI), list_databases (filtra
+  admin/config/local), list_collections, observed_keys (unión de claves de la
+  primera página → "columnas"), render BSON compacto (`bson_to_string`) y
+  pretty (`render_doc_pretty` con indentación para el inspector), docs_page
+  (find + limit/skip/sort), collection_count (estimatedDocumentCount),
+  row_offset_of (recorrido secuencial), query_free (filtro JSON).
+- `src/db/backends/mongo_adapter.rs`: implementa `DbAdapter` con client
+  lazy-init en `Mutex<Option<Client>>`, igual que mysql/postgres.
+- `resolver.rs`: rama `mongodb://` → `MongoAdapter`.
+- `controller.rs`: `connect_mongo_server` (listar bases → picker) para URLs
+  `mongodb://` sin base + fix de normalización: cualquier URL con `://` se
+  preserva (antes solo mysql/postgresql; `mongodb://127.0.0.1:27017` se
+  convertía en path relativo).
+- API del driver 3.8: "actions" (`IntoFuture`) → cada llamada envuelta en
+  `block_on(async { action.await })`; cursores con `TryStreamExt::try_next`.
+- Smoke real contra mongo local (env `LAZYDB_MONGO_URI`/`LAZYDB_MONGO_SERVER_URL`):
+  lista bases → picker → catálogo con colecciones → rows compactas/pretty.
+- Verificado: 115 tests (2 mongo nuevos + 1 controller), clippy 0, 0 warnings
+  en todas las combinaciones de features.
 
 ### Drivers verificados (jul 2026, Gemini + crates.io cruzados)
 
@@ -570,7 +609,7 @@ proyecto `en curso`). 51 tests verdes, clippy `-D warnings` limpio.
 | DuckDB | `duckdb` (~1.10505) | sync, FFI | ✅ muy activo | API estilo rusqlite → copia directa del patrón sqlite.rs |
 | PostgreSQL | `postgres` (sync) / `tokio-postgres` (async) | protocolo nativo | ✅ vigente | **sync para nosotros** + `spawn_blocking`. Pool bb8/deadpool si hace falta. Pipelining nativo (tip gemini) |
 | MySQL/MariaDB | `mysql` (sync) / `mysql_async` | protocolo binario puro | ✅ vigente | sync para nosotros; protocolo binario sin capa de red |
-| MongoDB | `mongodb` (oficial) | async, 100% Rust | ✅ | Fase 3; bson para bytes |
+| MongoDB | `mongodb` (oficial) | async, 100% Rust | ✅ vigente (3.8) | ✅ HECHO. Feature `mongodb`; `bson::Document` crudo (sin serde) |
 | Redis | `redis-rs` (+ `fred` para clustering masivo) | async | ✅ | Fase 3; redis-rs basta (fred = overkill para TUI) |
 | ClickHouse | `clickhouse` | async, columnar | ✅ | Fase 3; formato nativo de bloques |
 | ScyllaDB | `scylla` | async | ✅ | opcional, solo si el usuario lo pide |

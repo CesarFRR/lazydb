@@ -40,15 +40,38 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     // Inspector de fila (modal tabla con word-wrap)
     if app.show_row_inspector {
-        widgets::modal::render_table(
-            frame,
-            area,
-            &format!("▸ {}", app.selected_object()),
-            &app.row_inspector_pairs,
-            &mut app.inspector_scroll,
-            70,
-            70,
-        );
+        // NoSQL: botón de modo en el título (`[J: json]` / `[J: pares]`).
+        // El mismo texto es la zona clicable (ver `on_mouse_click`).
+        let title = if app.is_nosql {
+            format!("▸ {}   [Shift+J: {}]", app.selected_object(), app.inspector_mode_label())
+        } else {
+            format!("▸ {}", app.selected_object())
+        };
+        if app.inspector_json_mode {
+            // NoSQL en modo JSON: el documento completo formateado.
+            let lines: Vec<ratatui::text::Line<'_>> =
+                app.inspector_json_text.lines().map(ratatui::text::Line::from).collect();
+            widgets::modal::render_lines(
+                frame,
+                area,
+                &title,
+                &lines,
+                &mut app.inspector_scroll,
+                70,
+                70,
+                None,
+            );
+        } else {
+            widgets::modal::render_table(
+                frame,
+                area,
+                &title,
+                &app.row_inspector_pairs,
+                &mut app.inspector_scroll,
+                70,
+                70,
+            );
+        }
     }
 
     // Menú de acciones (modal overlay)
@@ -102,6 +125,13 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
     let title = app.title_for(kind);
     let items = app.items_for(kind);
     let focused = app.active_panel == kind;
+
+    // Formulario de nueva conexión: REGLA DE ORO — sin db abierta, el Detail
+    // SIEMPRE muestra el formulario, sin importar el panel enfocado ni Esc.
+    if kind == PanelKind::Detail && app.db_path.is_none() {
+        widgets::connection_form::render(frame, area, app);
+        return;
+    }
 
     // Tabla de datos con columnas reales para Detail + Data tab
     let new_scroll = if kind == PanelKind::Detail && app.detail_tab == DetailTab::Data {

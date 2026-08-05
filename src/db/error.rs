@@ -13,6 +13,12 @@ pub enum DbError {
     #[error("Error abriendo la base de datos: {0}")]
     Open(String),
     /// Error de `SQLite` (parseo, ejecución, lectura de fila, ...).
+    /// Lo construyen los backends (sqlite/duckdb/files/mysql/postgres) al
+    /// mapear errores de ejecución SQL.
+    #[cfg_attr(
+        not(any(feature = "sqlite", feature = "duckdb", feature = "mysql", feature = "postgres")),
+        allow(dead_code)
+    )]
     #[error("Error de SQLite: {0}")]
     Sqlite(String),
     /// Error de E/S del sistema.
@@ -23,12 +29,14 @@ pub enum DbError {
     Join(String),
 }
 
+#[cfg(feature = "sqlite")]
 impl From<rusqlite::Error> for DbError {
     fn from(err: rusqlite::Error) -> Self {
         Self::Sqlite(err.to_string())
     }
 }
 
+#[cfg(feature = "duckdb")]
 impl From<duckdb::Error> for DbError {
     fn from(err: duckdb::Error) -> Self {
         Self::Sqlite(err.to_string())
@@ -47,21 +55,31 @@ impl From<tokio::task::JoinError> for DbError {
     }
 }
 
+#[cfg(feature = "mysql")]
 impl From<mysql_async::Error> for DbError {
     fn from(err: mysql_async::Error) -> Self {
         Self::Sqlite(format!("MySQL: {err}"))
     }
 }
 
+#[cfg(feature = "postgres")]
 impl From<tokio_postgres::Error> for DbError {
     fn from(err: tokio_postgres::Error) -> Self {
         Self::Sqlite(format!("PostgreSQL: {err}"))
     }
 }
 
+#[cfg(feature = "postgres")]
 impl From<deadpool_postgres::PoolError> for DbError {
     fn from(err: deadpool_postgres::PoolError) -> Self {
         Self::Sqlite(format!("PostgreSQL (pool): {err}"))
+    }
+}
+
+#[cfg(feature = "mongodb")]
+impl From<mongodb::error::Error> for DbError {
+    fn from(err: mongodb::error::Error) -> Self {
+        Self::Sqlite(format!("MongoDB: {err}"))
     }
 }
 
@@ -79,6 +97,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sqlite")]
     fn from_convierte_errores_de_rusqlite() {
         let msg = DbError::from(rusqlite::Error::InvalidQuery).to_string();
         assert!(

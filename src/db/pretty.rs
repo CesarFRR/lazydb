@@ -6,10 +6,13 @@
 //! arrays de postgres `{a,b}`) — aquí está el formateo común que aplica
 //! esas mismas reglas a cadenas ya renderizadas.
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 use crate::db::model::Row;
 
 /// Texto que parece JSON (empieza por `{` o `[`) → pretty de `serde_json`.
-/// Cualquier otro texto se devuelve tal cual.
+/// Cualquier otro texto se devuelve tal cual. Solo `duckdb` (tipos tipados)
+/// lo usa directamente; el resto pasa por `pretty_cell_or_plain`.
+#[cfg(feature = "duckdb")]
 pub fn pretty_json_or_plain(t: &str) -> String {
     let trimmed = t.trim();
     let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
@@ -25,6 +28,9 @@ pub fn pretty_json_or_plain(t: &str) -> String {
 
 /// Celda → texto bonito: JSON pretty si parsea; si no, array de postgres
 /// (`{a,b}` / `{{1,2},{3,4}}`) → estilo numpy de duckdb; si no, tal cual.
+/// Lo usan los backends que reciben el dato como texto crudo (sqlite,
+/// mysql, postgres); duckdb y file ya renderizan compuestos tipados.
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub fn pretty_cell_or_plain(t: &str) -> String {
     let trimmed = t.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -45,6 +51,7 @@ pub fn pretty_cell_or_plain(t: &str) -> String {
 
 /// Aplica `pretty_cell_or_plain` a todas las celdas de las filas (en el
 /// lugar). Para backends cuyas celdas ya son texto del servidor.
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 pub fn prettify_rows(rows: Vec<Row>) -> Vec<Row> {
     rows.into_iter()
         .map(|mut row| {
@@ -59,7 +66,9 @@ pub fn prettify_rows(rows: Vec<Row>) -> Vec<Row> {
 // El formato textual de un array en postgres es `{elem,elem,...}` con
 // strings entre comillas dobles (`{"a,b","c"}`), escapes `\"`/`\\` y
 // anidamiento `{{1,2},{3,4}}`. El literal `NULL` sin comillas es NULL.
+// Solo lo usa el formateo de texto crudo (sqlite/mysql/postgres), no duckdb.
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 #[derive(Debug, PartialEq)]
 enum PgElem {
     Null,
@@ -69,6 +78,7 @@ enum PgElem {
 
 /// Parsea un array de postgres completo (`{...}`). Devuelve `None` si la
 /// entrada no es un array bien formado.
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 fn parse_pg_array(s: &str) -> Option<PgElem> {
     let mut it = s.trim().chars().peekable();
     let elems = parse_pg_array_inner(&mut it)?;
@@ -78,6 +88,7 @@ fn parse_pg_array(s: &str) -> Option<PgElem> {
 
 /// Parsea el contenido tras el `{` de apertura; consume hasta el `}` de
 /// cierre INCLUSIVE y devuelve los elementos. `None` si mal formado.
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 fn parse_pg_array_inner(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Vec<PgElem>> {
     if it.next() != Some('{') {
         return None;
@@ -126,6 +137,7 @@ fn parse_pg_array_inner(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Op
 
 /// String entre comillas con escapes `\"` y `\\`. Consume hasta la comilla
 /// de cierre (exclusive).
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 fn parse_pg_quoted(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
     let mut out = String::new();
     loop {
@@ -144,6 +156,7 @@ fn parse_pg_quoted(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<
 /// Render estilo duckdb (`list_to_pretty`): si todos los elementos son
 /// escalares → una línea `[a, b]`; si hay anidados → cada elemento en su
 /// línea y los sub-arrays compactos (numpy style).
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 fn render_pg_array(elems: &[PgElem], indent: usize) -> String {
     if elems.is_empty() {
         return "[]".to_string();
@@ -171,11 +184,13 @@ fn render_pg_array(elems: &[PgElem], indent: usize) -> String {
 }
 
 /// Sub-array compacto (una línea) para filas de matrices.
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 fn render_pg_compact(elems: &[PgElem]) -> String {
     let inner: Vec<String> = elems.iter().map(render_pg_scalar).collect();
     format!("[{}]", inner.join(", "))
 }
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
 fn render_pg_scalar(elem: &PgElem) -> String {
     match elem {
         PgElem::Null => "[NULL]".to_string(),
@@ -186,9 +201,11 @@ fn render_pg_scalar(elem: &PgElem) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres", feature = "duckdb"))]
     use super::*;
 
     #[test]
+    #[cfg(feature = "duckdb")]
     fn json_pretty_inline() {
         assert_eq!(pretty_json_or_plain("hola"), "hola");
         assert_eq!(pretty_json_or_plain("NULL"), "NULL");
@@ -196,12 +213,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
     fn json_invalido_queda_tal_cual() {
         assert_eq!(pretty_cell_or_plain("no json"), "no json");
         assert_eq!(pretty_cell_or_plain("hola"), "hola");
     }
 
     #[test]
+    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
     fn array_postgres_plano() {
         assert_eq!(pretty_cell_or_plain("{rust}"), "[rust]");
         assert_eq!(pretty_cell_or_plain("{a,b,c}"), "[a, b, c]");
@@ -211,11 +230,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
     fn array_postgres_matriz_2d() {
         assert_eq!(pretty_cell_or_plain("{{1,2},{3,4}}"), "[\n  [1, 2],\n  [3, 4]\n]");
     }
 
     #[test]
+    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
     fn array_postgres_matriz_3d_compacta_interna() {
         // numpy style: solo el primer nivel va por línea
         assert_eq!(
@@ -225,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
     fn array_postgres_strings_con_coma_y_escapados() {
         // Los strings desescapan y pierden las comillas (formato de array)
         assert_eq!(pretty_cell_or_plain("{\"a,b\",c}"), "[a,b, c]");
@@ -232,11 +254,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
     fn array_postgres_null() {
         assert_eq!(pretty_cell_or_plain("{NULL,hola}"), "[[NULL], hola]");
     }
 
     #[test]
+    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres"))]
     fn json_gana_sobre_array() {
         // Un jsonb object es JSON válido → pretty de serde_json
         assert_eq!(
