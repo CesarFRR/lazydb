@@ -161,13 +161,67 @@ impl DbAdapter for MongoAdapter {
 
     fn query(&self, sql: &str, limit: u32) -> Result<Vec<String>, DbError> {
         self.with_client(|client, db| {
-            crate::db::backends::mongo::query_free(client, db, sql, limit)
+            let (coll, filter) = split_collection_filter(sql);
+            if coll.is_empty() {
+                return Err(DbError::Open(
+                    "selecciona una colección antes de filtrar".into(),
+                ));
+            }
+            crate::db::backends::mongo::query_free(client, db, &coll, &filter, limit)
         })
     }
 
-    fn count(&self, _sql: &str) -> Result<u32, DbError> {
-        // COUNT(*) de un find: usamos el conteo de la colección completa.
-        // El SQL no es real en mongo; el modal `:` de lazydb no aplica.
-        Ok(0)
+    fn count(&self, sql: &str) -> Result<u32, DbError> {
+        self.with_client(|client, db| {
+            let (coll, filter) = split_collection_filter(sql);
+            if coll.is_empty() {
+                return Ok(0);
+            }
+            crate::db::backends::mongo::count_free(client, db, &coll, &filter)
+        })
+    }
+}
+
+/// El sql interno de mongo es `@<coleccion> <filtro JSON>` (lo inyecta el
+/// controller en `execute_user_query`). Separa ambos; si no hay prefijo
+/// `@`, colección vacía (error controlado por el caller).
+fn split_collection_filter(sql: &str) -> (String, String) {
+    if let Some(rest) = sql.strip_prefix('@') {
+        let trimmed = rest.trim_start();
+        if let Some(space) = trimmed.find(char::is_whitespace) {
+            let (coll, filter) = trimmed.split_at(space);
+            return (coll.to_string(), filter.trim().to_string());
+        }
+        return (trimmed.to_string(), String::new());
+    }
+    (String::new(), sql.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_collection_filter;
+
+    #[test]
+    fn split_separa_coleccion_y_filtro() {
+        assert_eq!(
+            split_collection_filter("@test_probe {\"name\": \"cesar\"}"),
+            ("test_probe".to_string(), "{\"name\": \"cesar\"}".to_string())
+        );
+    }
+
+    #[test]
+    fn split_sin_filtro_devuelve_solo_coleccion() {
+        assert_eq!(
+            split_collection_filter("@test_probe"),
+            ("test_probe".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn split_sin_prefijo_devuelve_coleccion_vacia() {
+        assert_eq!(
+            split_collection_filter("{\"name\": \"x\"}"),
+            (String::new(), "{\"name\": \"x\"}".to_string())
+        );
     }
 }

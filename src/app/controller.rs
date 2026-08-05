@@ -2457,7 +2457,20 @@ impl App {
             self.show_error("Sin conexión", "Conecta una base primero (`:`)");
             return;
         };
-        let sql = sql.to_string();
+        // NoSQL (mongo): el modal `:` recibe un filtro JSON que se aplica
+        // sobre la colección seleccionada. Viaja embebido en el sql interno
+        // (`@<coleccion> <json>`) porque el query runner resuelve un adapter
+        // nuevo y no conoce la colección activa.
+        let sql = if self.is_nosql {
+            let coll = self.selected_object_name();
+            if coll.is_empty() || coll == "-" {
+                self.show_error("Sin colección", "Selecciona una colección antes de filtrar");
+                return;
+            }
+            format!("@{coll} {sql}")
+        } else {
+            sql.to_string()
+        };
 
         self.state.add_query_history(&sql);
         let _ = self.state.save();
@@ -2776,7 +2789,7 @@ impl App {
 
     /// Etiqueta del modo de visualización del modal `NoSQL` (para el título).
     pub const fn inspector_mode_label(&self) -> &'static str {
-        if self.inspector_json_mode { "json" } else { "pares" }
+        if self.inspector_json_mode { "Pares" } else { "Modo JSON" }
     }
 
     /// Alterna pares ↔ JSON del documento en el modal `NoSQL`. No hace nada

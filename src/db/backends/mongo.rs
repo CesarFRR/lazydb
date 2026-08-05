@@ -546,32 +546,51 @@ pub fn row_offset_of(
     })
 }
 
-/// Query libre: Mongo no entiende SQL. Recibe un filtro JSON (`{"campo": v}`)
-/// y devuelve los docs que lo cumplen como líneas compactas.
+/// Query libre: Mongo no entiende SQL. Recibe el filtro JSON del modal `:`
+/// (`{"campo": v}`) aplicado sobre la colección `collection`, y devuelve los
+/// docs que lo cumplen como líneas compactas. `filter` vacío = primera página.
 pub fn query_free(
     client: &Client,
     db_name: &str,
+    collection: &str,
     filter_json: &str,
     limit: u32,
 ) -> Result<Vec<String>, DbError> {
     let filter = parse_filter(filter_json);
-    let coll = db(client, db_name).collection::<Document>(filter_json.trim());
+    let coll = db(client, db_name).collection::<Document>(collection);
     block_on(async {
         let mut cursor = coll
             .find(filter)
             .limit(i64::from(limit))
             .await
-            .map_err(|e| DbError::Open(format!("find: {e}")))?;
+            .map_err(|e| DbError::Open(format!("{collection}.find: {e}")))?;
         let mut out = Vec::new();
         while let Some(doc) = cursor
             .try_next()
             .await
-            .map_err(|e| DbError::Open(format!("find cursor: {e}")))?
+            .map_err(|e| DbError::Open(format!("{collection}.find cursor: {e}")))?
         {
             out.push(render_doc_compact(&doc));
         }
         Ok(out)
     })
+}
+
+/// Conteo de documentos que cumplen el filtro JSON del modal `:` sobre la
+/// colección `collection`. Usa `count_documents` (respeta el filtro), no
+/// `estimatedDocumentCount`. Filtro vacío = colección completa.
+pub fn count_free(
+    client: &Client,
+    db_name: &str,
+    collection: &str,
+    filter_json: &str,
+) -> Result<u32, DbError> {
+    let filter = parse_filter(filter_json);
+    let coll = db(client, db_name).collection::<Document>(collection);
+    let count = block_on(async { coll.count_documents(filter).await })
+        .map_err(|e| DbError::Open(format!("{collection}.countDocuments: {e}")))?;
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    Ok(count as u32)
 }
 
 /// Parsea el filtro del modal de query. Si es JSON válido → se usa tal cual;
@@ -748,5 +767,15 @@ mod tests {
                 "ana no tiene meta; no debe listarse: {keys_ana:?}"
             );
         }
+
+        // count_free: COUNT con filtro JSON (el modal `:` de mongo).
+        let total = count_free(&client, &db, &coll_name, "").expect("count sin filtro");
+        let cesar = count_free(&client, &db, &coll_name, "{\"name\": \"cesar\"}")
+            .expect("count con filtro");
+        println!("COUNT total: {total}, con filtro name=cesar: {cesar}");
+        assert_eq!(total, collection_count(&client, &db, &coll_name).expect("estimated"),
+            "count sin filtro ≈ estimatedDocumentCount");
+        assert!(cesar >= 1, "debe haber al menos 1 doc cesar");
+        assert!(cesar <= total, "el filtro no puede contar más que el total");
     }
 }
