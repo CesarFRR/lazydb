@@ -2634,7 +2634,12 @@ impl App {
                 let on_url = form.active == ConnField::Url;
                 let _ = form; // termina el borrow antes de llamar &mut self
                 if on_url {
-                    self.conn_parse_url_into_fields();
+                    // Enter en la URL: parsea Y conecta de una (el usuario
+                    // escribió la URL completa y quiere entrar).
+                    let parsed = self.conn_parse_url_into_fields();
+                    if parsed {
+                        self.conn_submit();
+                    }
                 } else {
                     self.conn_submit();
                 }
@@ -4323,9 +4328,37 @@ impl App {
         p.selected_idx = new;
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn on_mouse_click(&mut self, x: u16, y: u16, width: u16, height: u16) {
         if width < 40 || height < 10 {
             return;
+        }
+
+        // Formulario de nueva conexión (sin db): click en el botón
+        // "[Conectar]" conecta; click en cualquier otra zona del Detail
+        // enfoca el panel para que el teclado alimente los campos.
+        if self.db_path.is_none() && self.connection_form.is_some() {
+            if let Some(&(_, rect)) =
+                self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
+            {
+                let inside = x >= rect.x
+                    && x < rect.x.saturating_add(rect.width)
+                    && y >= rect.y
+                    && y < rect.y.saturating_add(rect.height);
+                if inside {
+                    // El botón vive en la fila inner.y + 11 del formulario
+                    // (URL + nota + separador + Tipo + 5 campos + hueco).
+                    let inner_y = rect.y.saturating_add(1);
+                    let connect_row = inner_y.saturating_add(11);
+                    if y == connect_row && x > rect.x {
+                        self.conn_submit();
+                        return;
+                    }
+                    // Cualquier otra zona: enfocar Detail (captura teclas)
+                    self.active_panel = PanelKind::Detail;
+                    return;
+                }
+            }
         }
 
         // Click fuera del modal de inspector de fila → cerrarlo y continuar
@@ -5241,6 +5274,38 @@ mod tests {
         url.push('/');
         url.push_str(&db);
         app.connect_sqlite(&url);
+        assert!(
+            app.tables.iter().any(|c| c == "test_probe"),
+            "colecciones: {:?}",
+            app.tables
+        );
+    }
+
+    /// Enter en el campo URL con URL válida → parsea Y conecta (no solo
+    /// rellena campos). Regresión del "le doy enter y nada".
+    #[test]
+    #[cfg(feature = "mongodb")]
+    #[ignore = "requiere MongoDB local (LAZYDB_MONGO_SERVER_URL)"]
+    fn enter_en_url_del_formulario_conecta() {
+        let Ok(server_url) = std::env::var("LAZYDB_MONGO_SERVER_URL") else {
+            return;
+        };
+        let mut app = App::new();
+        app.active_panel = PanelKind::Detail;
+        app.connection_form = Some(ConnectionFormState::default());
+        // Escribir la URL con base y Enter → debe conectar directo
+        let mut url = server_url;
+        url.push('/');
+        url.push_str("lazydb_probe");
+        for c in url.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.db_path.is_some(),
+            "Enter en URL válida debe conectar (status: {})",
+            app.status
+        );
         assert!(
             app.tables.iter().any(|c| c == "test_probe"),
             "colecciones: {:?}",
