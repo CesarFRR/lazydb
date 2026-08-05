@@ -65,11 +65,7 @@ impl DbAdapter for MongoAdapter {
 
     fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
         self.with_client(|client, db| {
-            let columns =
-                crate::db::backends::mongo::observed_columns(client, db, table_name)?;
-            let rows =
-                crate::db::backends::mongo::table_rows(client, db, table_name, limit, offset)?;
-            Ok(TableData { columns, rows })
+            crate::db::backends::mongo::table_rows(client, db, table_name, limit, offset)
         })
     }
 
@@ -93,6 +89,7 @@ impl DbAdapter for MongoAdapter {
     ) -> Result<Vec<Row>, DbError> {
         self.with_client(|client, db| {
             crate::db::backends::mongo::table_rows(client, db, table_name, limit, offset)
+                .map(|data| data.rows)
         })
     }
 
@@ -115,12 +112,9 @@ impl DbAdapter for MongoAdapter {
         order_col: Option<(&str, bool)>,
     ) -> Result<TableData, DbError> {
         self.with_client(|client, db| {
-            let columns =
-                crate::db::backends::mongo::observed_columns(client, db, table_name)?;
-            let rows = crate::db::backends::mongo::table_rows_sorted(
+            crate::db::backends::mongo::table_rows_sorted(
                 client, db, table_name, limit, offset, order_col,
-            )?;
-            Ok(TableData { columns, rows })
+            )
         })
     }
 

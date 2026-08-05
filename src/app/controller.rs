@@ -2716,10 +2716,18 @@ impl App {
             return;
         }
 
-        // SQL (esquema fijo): flujo clásico por índice.
-        let Ok(columns) = adapter.column_names(&object) else {
+        // SQL (esquema fijo): flujo clásico por índice. Las columnas ya vienen
+        // en `preview_data` (TableData del Data tab): reutilizarlas evita una
+        // consulta `column_names()` aparte por cada apertura del modal.
+        let columns: Vec<crate::db::Column> = self
+            .preview_data
+            .as_ref()
+            .map(|data| data.columns.clone())
+            .or_else(|| adapter.column_names(&object).ok())
+            .unwrap_or_default();
+        if columns.is_empty() {
             return;
-        };
+        }
         // Celdas expandidas (multilínea): los tipos compuestos de DuckDB
         // (list/struct/map/union/array) se muestran completos en el modal.
         let Ok(rows) = adapter.table_data_rows_pretty(&object, 1, offset) else {

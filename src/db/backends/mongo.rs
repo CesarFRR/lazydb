@@ -19,7 +19,7 @@
 //! con `futures_util::stream::TryStreamExt`.
 
 use crate::db::rt::block_on;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row};
+use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
 
 use futures_util::stream::TryStreamExt;
 use mongodb::bson::{Bson, Document};
@@ -201,7 +201,7 @@ async fn docs_page_async(
     limit: u32,
     offset: u32,
     sort: Option<(&str, bool)>,
-) -> Result<Vec<Row>, DbError> {
+) -> Result<TableData, DbError> {
     let coll = db(client, db_name).collection::<Document>(collection);
 
     let mut find = coll.find(Document::new());
@@ -227,7 +227,7 @@ async fn docs_page_async(
     }
 
     let keys = observed_keys(&docs);
-    Ok(docs
+    let rows: Vec<Row> = docs
         .iter()
         .map(|doc| {
             let cells = keys
@@ -236,7 +236,11 @@ async fn docs_page_async(
                 .collect();
             Row { cells }
         })
-        .collect())
+        .collect();
+    Ok(TableData {
+        columns: keys.into_iter().map(|name| Column { name, dtype: "bson".into() }).collect(),
+        rows,
+    })
 }
 
 /// Igual que `docs_page_async` pero con los compuestos expandidos en
@@ -295,7 +299,7 @@ pub fn table_rows(
     collection: &str,
     limit: u32,
     offset: u32,
-) -> Result<Vec<Row>, DbError> {
+) -> Result<TableData, DbError> {
     block_on(docs_page_async(client, db_name, collection, limit, offset, None))
 }
 
@@ -317,7 +321,7 @@ pub fn table_rows_sorted(
     limit: u32,
     offset: u32,
     order_col: Option<(&str, bool)>,
-) -> Result<Vec<Row>, DbError> {
+) -> Result<TableData, DbError> {
     block_on(docs_page_async(client, db_name, collection, limit, offset, order_col))
 }
 
@@ -614,8 +618,12 @@ mod tests {
             .iter()
             .find(|c| c.contains("smoke") || c.contains("probe"))
             .map_or_else(|| cols[0].clone(), ToString::to_string);
-        let rows = table_rows(&client, &db, &coll_name, 5, 0).expect("leer docs");
-        println!("FILAS (compacto): {rows:?}");
+        let data = table_rows(&client, &db, &coll_name, 5, 0).expect("leer docs");
+        println!("COLUMNAS de la página: {:?}", data.columns);
+        println!("FILAS (compacto): {:?}", data.rows);
+        // Las columnas vienen INCLUIDAS en la misma query (1 round-trip):
+        // el adapter ya no hace `observed_columns` aparte para el Data tab.
+        assert!(data.columns.iter().any(|c| c.name == "_id"), "columnas: {:?}", data.columns);
         let pretty =
             table_data_rows_pretty(&client, &db, &coll_name, 5, 0).expect("docs pretty");
         println!("FILAS (pretty): {pretty:?}");
