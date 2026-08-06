@@ -49,13 +49,6 @@ impl DbAdapter for FileAdapter {
         crate::db::backends::file::table_columns(&self.path)
     }
 
-    fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
-        if table_name != self.dataset() {
-            return Err(DbError::Sqlite(format!("objeto desconocido: {table_name}")));
-        }
-        crate::db::backends::file::table_rows_sorted(&self.path, limit, offset, None)
-    }
-
     fn table_row_count(&self, table_name: &str) -> Result<u32, DbError> {
         if table_name != self.dataset() {
             return Err(DbError::Sqlite(format!("objeto desconocido: {table_name}")));

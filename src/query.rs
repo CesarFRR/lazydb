@@ -20,7 +20,6 @@ pub enum QueryMsg {
 /// la DB entera en el preview).
 pub const QUERY_RESULT_LIMIT: u32 = 500;
 
-#[allow(dead_code)]
 pub struct QueryResult {
     pub rows: Vec<String>,
     pub error: Option<String>,

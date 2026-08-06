@@ -558,7 +558,7 @@ mod tests {
             Ok(cols) => println!("  COLUMNAS categories: {cols:?}"),
             Err(err) => println!("  ERROR COLUMNAS: {err:?}"),
         }
-        match adapter.table_rows("categories", 3, 0) {
+        match adapter.table_rows_sorted("categories", 3, 0, None) {
             Ok(data) => {
                 for row in &data.rows {
                     println!("    row: {row:?}");

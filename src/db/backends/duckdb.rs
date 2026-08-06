@@ -205,15 +205,6 @@ fn rows_impl(
 }
 
 /// Filas + columnas, para el preview de datos.
-pub fn table_rows(
-    path: &str,
-    table_name: &str,
-    limit: u32,
-    offset: u32,
-) -> Result<TableData, DbError> {
-    table_rows_sorted(path, table_name, limit, offset, None)
-}
-
 /// Filas + columnas, con ORDER BY opcional. El contrato del dominio habla
 /// en modelos (`TableData`), no en strings formateados.
 pub fn table_rows_sorted(
@@ -1043,7 +1034,7 @@ mod tests {
             }
             let n = table_row_count(path, t).expect("count");
             println!("  {t}: {n} filas");
-            let data = table_rows(path, t, 3, 0).expect("rows");
+            let data = table_rows_sorted(path, t, 3, 0, None).expect("rows");
             for r in &data.rows {
                 println!("    row: {:?}", r.cells);
             }
@@ -1161,7 +1152,7 @@ mod tests {
                 Ok(cols) => println!("  COLUMNAS: {cols:?}"),
                 Err(err) => println!("  ERROR COLUMNAS: {err:?}"),
             }
-            match adapter.table_rows(&dataset, 2, 0) {
+            match adapter.table_rows_sorted(&dataset, 2, 0, None) {
                 Ok(data) => {
                     for row in &data.rows {
                         println!("    row: {row:?}");
@@ -1237,7 +1228,7 @@ mod tests {
             Ok(cols) => println!("  COLUMNAS categories: {cols:?}"),
             Err(err) => println!("  ERROR COLUMNAS: {err:?}"),
         }
-        match adapter.table_rows("categories", 3, 0) {
+        match adapter.table_rows_sorted("categories", 3, 0, None) {
             Ok(data) => {
                 for row in &data.rows {
                     println!("    row: {row:?}");

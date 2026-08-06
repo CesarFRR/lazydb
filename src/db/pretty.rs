@@ -201,7 +201,12 @@ fn render_pg_scalar(elem: &PgElem) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "postgres", feature = "duckdb"))]
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "mysql",
+        feature = "postgres",
+        feature = "duckdb"
+    ))]
     use super::*;
 
     #[test]

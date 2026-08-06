@@ -83,8 +83,8 @@ pub fn analyze_connection(input: &str) -> ConnectionSpec {
             kind: ConnectionType::Unknown,
             is_url: false,
             host: None,
-        user: None,
-        pass: None,
+            user: None,
+            pass: None,
             port: None,
             db_name: None,
             file_path: None,
@@ -97,7 +97,7 @@ pub fn analyze_connection(input: &str) -> ConnectionSpec {
         match scheme_lower.as_str() {
             "mysql" => return parse_remote(input, ConnectionType::Mysql, Some(3306)),
             "postgres" | "postgresql" => {
-                return parse_remote(input, ConnectionType::Postgres, Some(5432))
+                return parse_remote(input, ConnectionType::Postgres, Some(5432));
             }
             "mongodb" => return parse_remote(input, ConnectionType::Mongo, Some(27017)),
             "sqlite" => {
@@ -105,8 +105,8 @@ pub fn analyze_connection(input: &str) -> ConnectionSpec {
                     kind: ConnectionType::Sqlite,
                     is_url: true,
                     host: None,
-        user: None,
-        pass: None,
+                    user: None,
+                    pass: None,
                     port: None,
                     db_name: None,
                     file_path: Some(rest.to_string()),
@@ -117,8 +117,8 @@ pub fn analyze_connection(input: &str) -> ConnectionSpec {
                     kind: ConnectionType::Duckdb,
                     is_url: true,
                     host: None,
-        user: None,
-        pass: None,
+                    user: None,
+                    pass: None,
                     port: None,
                     db_name: None,
                     file_path: Some(rest.to_string()),
@@ -133,8 +133,9 @@ pub fn analyze_connection(input: &str) -> ConnectionSpec {
         let kind = match ext.to_ascii_lowercase().as_str() {
             "db" | "sqlite" | "sqlite3" => ConnectionType::Sqlite,
             "duckdb" | "ddb" => ConnectionType::Duckdb,
-            "csv" | "tsv" | "parquet" | "pq" | "json" | "jsonl" | "ndjson"
-            | "geojson" | "gpkg" => ConnectionType::File,
+            "csv" | "tsv" | "parquet" | "pq" | "json" | "jsonl" | "ndjson" | "geojson" | "gpkg" => {
+                ConnectionType::File
+            }
             _ => ConnectionType::Unknown,
         };
         if kind != ConnectionType::Unknown {
@@ -142,8 +143,8 @@ pub fn analyze_connection(input: &str) -> ConnectionSpec {
                 kind,
                 is_url: false,
                 host: None,
-        user: None,
-        pass: None,
+                user: None,
+                pass: None,
                 port: None,
                 db_name: None,
                 file_path: Some(input.to_string()),
@@ -157,8 +158,8 @@ pub fn analyze_connection(input: &str) -> ConnectionSpec {
             kind: ConnectionType::Sqlite,
             is_url: false,
             host: None,
-        user: None,
-        pass: None,
+            user: None,
+            pass: None,
             port: None,
             db_name: None,
             file_path: Some(input.to_string()),
@@ -193,14 +194,12 @@ fn parse_remote(input: &str, kind: ConnectionType, default_port: Option<u16>) ->
         let (u, p) = creds.split_once(':').unwrap_or((creds, ""));
         (Some((u, p)), host)
     });
-    let (user, pass) = user_part.map_or((None, None), |(u, p)| {
-        (Some(u.to_string()), Some(p.to_string()))
-    });
+    let (user, pass) =
+        user_part.map_or((None, None), |(u, p)| (Some(u.to_string()), Some(p.to_string())));
 
     // `host:port/db` o `host/db`
-    let (host_and_port, db_name) = host_part.split_once('/').map_or((host_part, None), |(hp, d)| {
-        (hp, Some(d.to_string()))
-    });
+    let (host_and_port, db_name) =
+        host_part.split_once('/').map_or((host_part, None), |(hp, d)| (hp, Some(d.to_string())));
     let (host, port) = host_and_port.rfind(':').map_or((host_and_port, default_port), |colon| {
         let h = &host_and_port[..colon];
         let p = host_and_port[colon + 1..].parse::<u16>().ok().or(default_port);

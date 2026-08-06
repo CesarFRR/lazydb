@@ -165,15 +165,6 @@ pub fn table_data_rows_pretty(
 }
 
 /// Filas + columnas, para el preview de datos.
-pub fn table_rows(
-    path: &str,
-    table_name: &str,
-    limit: u32,
-    offset: u32,
-) -> Result<TableData, DbError> {
-    table_rows_sorted(path, table_name, limit, offset, None)
-}
-
 /// Filas + columnas, con ORDER BY opcional. El contrato del dominio habla
 /// en modelos (`TableData`), no en strings formateados.
 pub fn table_rows_sorted(

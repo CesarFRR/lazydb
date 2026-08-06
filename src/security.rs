@@ -36,9 +36,7 @@ fn key_for(url: &str) -> String {
 
 /// ¿La URL trae credenciales embebidas (`user:pass@`)?
 pub fn has_credentials(url: &str) -> bool {
-    url.find("://")
-        .and_then(|i| url[i + 3..].find('@'))
-        .is_some_and(|at| at > 0)
+    url.find("://").and_then(|i| url[i + 3..].find('@')).is_some_and(|at| at > 0)
 }
 
 /// Extrae `(user, pass)` de una URL `scheme://user:pass@host...`.
@@ -117,8 +115,7 @@ pub fn save_credentials(url: &str) -> Result<Option<(String, String)>, DbError> 
     // viaja en la URL limpia de recents).
     let payload = format!("{user}\n{pass}");
     let ok = secret_store(&key, &payload)
-        || keyring::Entry::new(SERVICE, &key)
-            .is_ok_and(|e| e.set_password(&payload).is_ok());
+        || keyring::Entry::new(SERVICE, &key).is_ok_and(|e| e.set_password(&payload).is_ok());
     if !ok {
         return Err(DbError::Open(format!(
             "no se pudieron guardar credenciales en el almacén del SO ({key})"
@@ -135,11 +132,8 @@ pub fn save_credentials(url: &str) -> Result<Option<(String, String)>, DbError> 
 pub fn get_credentials(url: &str) -> Result<Option<(String, String)>, DbError> {
     let key = key_for(url);
     // Linux: secret-tool primero; fallback keyring.
-    let pass = secret_lookup(&key).or_else(|| {
-        keyring::Entry::new(SERVICE, &key)
-            .ok()
-            .and_then(|e| e.get_password().ok())
-    });
+    let pass = secret_lookup(&key)
+        .or_else(|| keyring::Entry::new(SERVICE, &key).ok().and_then(|e| e.get_password().ok()));
     pass.map_or(Ok(None), |payload| {
         // Payload = `user\npass` (guardado así para recuperar ambos).
         let mut lines = payload.splitn(2, '\n');
@@ -155,8 +149,7 @@ pub fn get_credentials(url: &str) -> Result<Option<(String, String)>, DbError> {
 pub fn forget_credentials(url: &str) -> Result<(), DbError> {
     let key = key_for(url);
     let ok = secret_clear(&key)
-        || keyring::Entry::new(SERVICE, &key)
-            .is_ok_and(|e| e.delete_credential().is_ok());
+        || keyring::Entry::new(SERVICE, &key).is_ok_and(|e| e.delete_credential().is_ok());
     if ok {
         tracing::info!(key = %key, "credenciales eliminadas del almacén");
     }
@@ -169,10 +162,9 @@ mod tests {
 
     #[test]
     fn extrae_user_pass_de_la_url() {
-        let (user, pass) = extract_credentials(
-            "postgresql://uo8h6cfqdm4u5xv6lfqq:secret@host:5432/db",
-        )
-        .expect("credenciales");
+        let (user, pass) =
+            extract_credentials("postgresql://uo8h6cfqdm4u5xv6lfqq:secret@host:5432/db")
+                .expect("credenciales");
         assert_eq!(user, "uo8h6cfqdm4u5xv6lfqq");
         assert_eq!(pass, "secret");
     }
@@ -191,10 +183,7 @@ mod tests {
             "postgresql://host:5432/db"
         );
         assert_eq!(strip_credentials("sqlite:///tmp/x.db"), "sqlite:///tmp/x.db");
-        assert_eq!(
-            strip_credentials("mysql://root:root@127.0.0.1:3306"),
-            "mysql://127.0.0.1:3306"
-        );
+        assert_eq!(strip_credentials("mysql://root:root@127.0.0.1:3306"), "mysql://127.0.0.1:3306");
     }
 
     #[test]

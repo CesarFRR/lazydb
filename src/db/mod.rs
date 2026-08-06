@@ -10,7 +10,6 @@ pub mod resolver;
 #[cfg(any(feature = "mysql", feature = "postgres", feature = "mongodb"))]
 pub mod rt;
 pub mod servers;
-pub mod service;
 
 pub use error::DbError;
 pub use model::{Column, ColumnInfo, ForeignKey, Row, TableData};

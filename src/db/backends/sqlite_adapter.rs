@@ -31,10 +31,6 @@ impl DbAdapter for SqliteAdapter {
         crate::db::backends::sqlite::table_columns(&self.path, table_name)
     }
 
-    fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
-        crate::db::backends::sqlite::table_rows(&self.path, table_name, limit, offset)
-    }
-
     fn table_row_count(&self, table_name: &str) -> Result<u32, DbError> {
         crate::db::backends::sqlite::table_row_count(&self.path, table_name)
     }

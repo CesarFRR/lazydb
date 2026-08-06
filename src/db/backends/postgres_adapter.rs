@@ -59,14 +59,6 @@ impl DbAdapter for PostgresAdapter {
         self.with_pool(|pool, db| crate::db::backends::postgres::column_info(pool, db, table_name))
     }
 
-    fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
-        self.with_pool(|pool, db| {
-            crate::db::backends::postgres::table_rows_sorted(
-                pool, db, table_name, limit, offset, None,
-            )
-        })
-    }
-
     fn table_row_count(&self, table_name: &str) -> Result<u32, DbError> {
         self.with_pool(|pool, db| {
             crate::db::backends::postgres::table_row_count(pool, db, table_name)

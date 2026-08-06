@@ -90,7 +90,6 @@ impl AppState {
     }
 
     /// Agrega/actualiza un favorito
-    #[allow(dead_code)]
     pub fn add_favorite(&mut self, name: String, path: String) {
         self.favorites.insert(name, path);
     }
@@ -115,7 +114,6 @@ impl AppState {
     }
 
     /// Remueve un favorito
-    #[allow(dead_code)]
     pub fn remove_favorite(&mut self, name: &str) {
         self.favorites.remove(name);
     }
@@ -201,8 +199,7 @@ mod tests {
         // password embebido, lo que persiste NO debe contenerlo (el password
         // vive en el keyring, no en recents.json).
         let mut s = AppState::new();
-        let url_con_creds =
-            "postgresql://user:supersecreto@host:5432/db".to_string();
+        let url_con_creds = "postgresql://user:supersecreto@host:5432/db".to_string();
         // El controller aplica strip ANTES de add_recent (seguridad)
         let limpia = crate::security::strip_credentials(&url_con_creds);
         s.add_recent(limpia);

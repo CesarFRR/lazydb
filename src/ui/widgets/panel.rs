@@ -157,11 +157,8 @@ pub fn render_data_table(
     } else {
         items[0].split(" | ").collect()
     };
-    let headers_display: Vec<&str> = if typed {
-        display.iter().map(String::as_str).collect()
-    } else {
-        headers.clone()
-    };
+    let headers_display: Vec<&str> =
+        if typed { display.iter().map(String::as_str).collect() } else { headers.clone() };
 
     let col_count = headers.len().max(1);
 
