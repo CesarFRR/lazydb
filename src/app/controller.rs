@@ -539,8 +539,14 @@ impl SourceList<'_> {
             health_mark
         );
         match display {
-            Some(name) => self.out.push(format!("{mark}{prefix}{name} => {path}")),
-            None => self.out.push(format!("{mark}{prefix}{path}")),
+            Some(name) => self.out.push(format!(
+                "{mark}{prefix}{name} => {}",
+                crate::security::strip_credentials(&path)
+            )),
+            None => self.out.push(format!(
+                "{mark}{prefix}{}",
+                crate::security::strip_credentials(&path)
+            )),
         }
     }
 
@@ -1609,8 +1615,13 @@ impl App {
         self.actions_menu_idx
     }
 
-    pub fn db_path_display(&self) -> &str {
-        self.db_path.as_deref().unwrap_or("-")
+    /// Versión SEGURA del path para mostrar en la UI: quita las credenciales
+    /// (`user:pass@`) — el password NUNCA debe aparecer en pantalla ni en
+    /// logs de estado.
+    pub fn db_path_safe(&self) -> String {
+        self.db_path
+            .as_deref()
+            .map_or_else(|| "-".to_string(), crate::security::strip_credentials)
     }
 
     pub fn db_size_display(&self) -> String {
@@ -1641,7 +1652,7 @@ impl App {
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
     #[cfg(feature = "mysql")]
     fn connect_mysql_server(&mut self, url: &str) {
-        self.status = format!("Conectando a {url}...");
+        self.status = format!("Conectando a {}...", crate::security::strip_credentials(url));
         // Si la URL YA trae credenciales (`user:pass@`), se conservan: es una
         // conexión a servidor autenticada desde el inicio.
         let has_creds = url
@@ -1673,7 +1684,7 @@ impl App {
             Err(err) => {
                 // Sin acceso (auth o red): pedir contraseña. URL limpia (sin
                 // credenciales) y el user de la URL si lo traía.
-                tracing::warn!(url = %url, error = ?err, "servidor sin acceso, pidiendo contraseña");
+                tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "servidor sin acceso, pidiendo contraseña");
                 self.status = String::new();
                 let (clean_url, user) = strip_url_credentials(url);
                 self.password_prompt = Some(PasswordPromptState {
@@ -1721,7 +1732,7 @@ impl App {
     /// abre el prompt de contraseña con user `postgres` por defecto.
     #[cfg(feature = "postgres")]
     fn connect_postgres_server(&mut self, url: &str) {
-        self.status = format!("Conectando a {url}...");
+        self.status = format!("Conectando a {}...", crate::security::strip_credentials(url));
         // Normalizamos `postgresql://` → `postgres://` (el crate solo entiende
         // el segundo). Si la URL YA trae credenciales (`user:pass@`), se
         // conservan: es una conexión a servidor autenticada desde el inicio.
@@ -1756,7 +1767,7 @@ impl App {
                     Some(DbPickerState { server_url: scheme_normalized.clone(), dbs, idx: 0 });
             }
             Err(err) => {
-                tracing::warn!(url = %url, error = ?err, "servidor postgres sin acceso, pidiendo contraseña");
+                tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "servidor postgres sin acceso, pidiendo contraseña");
                 self.status = String::new();
                 // Prompt con URL SIN credenciales (no repetir la password en
                 // pantalla) y el user de la URL si lo traía.
@@ -1805,7 +1816,7 @@ impl App {
     /// credenciales en la URL, el connect las usa.
     #[cfg(feature = "mongodb")]
     fn connect_mongo_server(&mut self, url: &str) {
-        self.status = format!("Conectando a {url}...");
+        self.status = format!("Conectando a {}...", crate::security::strip_credentials(url));
         let result = crate::db::rt::block_on(async {
             let (client, db_name) = crate::db::backends::mongo::connect(url)?;
             let dbs = crate::db::backends::mongo::list_databases(&client)?;
@@ -1821,7 +1832,7 @@ impl App {
                 self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
-                tracing::warn!(url = %url, error = ?err, "mongo sin acceso");
+                tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "mongo sin acceso");
                 self.show_error("No se pudo conectar a MongoDB", &err.to_string());
             }
         }
@@ -1829,7 +1840,9 @@ impl App {
 
     /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
-    fn connect_sqlite(&mut self, path: &str) {        // Choke point de normalización: solo para rutas de archivo. Las URLs
+    #[allow(clippy::too_many_lines)]
+    fn connect_sqlite(&mut self, path: &str) {
+        // Choke point de normalización: solo para rutas de archivo. Las URLs
         // (`mysql://`, `duckdb://` remotos) no se tocan.
         let mut path = if path.starts_with('/') || path.starts_with("mysql://") {
             path.to_string()
@@ -1873,10 +1886,10 @@ impl App {
         // URL mysql:// SIN base → conexión a nivel de SERVIDOR: listar los
         // esquemas (SHOW DATABASES) y dejar que el usuario elija. Las URLs
         // detectadas por `scan_local_servers` llegan sin `/bd`.
-        tracing::debug!(path = %path, "connect_sqlite: url normalizada");
+        tracing::debug!(path = %crate::security::strip_credentials(&path), "connect_sqlite: url normalizada");
         #[cfg(feature = "mysql")]
         if path.starts_with("mysql://") && !server_url_has_database(&path) {
-            tracing::debug!(path = %path, "mysql sin base → flujo de servidor");
+            tracing::debug!(path = %crate::security::strip_credentials(&path), "mysql sin base → flujo de servidor");
             self.connect_mysql_server(&path);
             return;
         }
@@ -1884,7 +1897,7 @@ impl App {
         if (path.starts_with("postgres://") || path.starts_with("postgresql://"))
             && !server_url_has_database(&path)
         {
-            tracing::debug!(path = %path, "postgres sin base → flujo de servidor");
+            tracing::debug!(path = %crate::security::strip_credentials(&path), "postgres sin base → flujo de servidor");
             self.connect_postgres_server(&path);
             return;
         }
@@ -1897,13 +1910,19 @@ impl App {
             return;
         }
         self.is_loading = true;
-        self.status = format!("Conectando a {path}...");
+        self.status = format!("Conectando a {}...", crate::security::strip_credentials(&path));
 
         // Backend resuelto por extensión: sqlite (.db/.sqlite) o duckdb (.duckdb/.ddb)
         let Some(adapter) = db::resolver::resolve_backend(&path) else {
             self.is_loading = false;
-            self.show_error("No se pudo abrir la base", &format!("{path}: fuente no soportada"));
-            tracing::error!(path = %path, "fuente no soportada por el resolver");
+            self.show_error(
+                "No se pudo abrir la base",
+                &format!("{}: fuente no soportada", crate::security::strip_credentials(&path)),
+            );
+            tracing::error!(
+                path = %crate::security::strip_credentials(&path),
+                "fuente no soportada por el resolver"
+            );
             return;
         };
         // Compartir el adapter: la conexión/pool se crea UNA vez y se reusa
@@ -1949,8 +1968,14 @@ impl App {
             self.detail_tab = DetailTab::Data;
 
             self.refresh_preview_from_selected_object();
-            self.status = format!("Conectado en modo read-only: {path}");
-            tracing::info!(path = %path, tablas = self.tables.len(), vistas = self.views.len(), "conectado");
+            self.status =
+                format!("Conectado en modo read-only: {}", crate::security::strip_credentials(&path));
+            tracing::info!(
+                path = %crate::security::strip_credentials(&path),
+                tablas = self.tables.len(),
+                vistas = self.views.len(),
+                "conectado"
+            );
 
             // Mover foco a Tablas
             self.set_focus(PanelKind::Tables);
@@ -1960,7 +1985,10 @@ impl App {
                 "No se pudo abrir la base",
                 &format!("{path}: no se pudo leer el catálogo"),
             );
-            tracing::error!(path = %path, "no se pudo abrir: catálogo ilegible");
+            tracing::error!(
+                path = %crate::security::strip_credentials(&path),
+                "no se pudo abrir: catálogo ilegible"
+            );
         }
     }
 
@@ -2173,7 +2201,7 @@ impl App {
             DetailTab::Meta => {
                 self.preview_data = None;
                 self.preview_rows = vec![
-                    format!("db_path: {}", self.db_path_display()),
+                    format!("db_path: {}", self.db_path_safe()),
                     format!("db_size: {}", self.db_size_display()),
                     format!("source_tab: {}", self.source_tab.label()),
                     format!("object_section: {}", self.object_section.label()),
@@ -2626,7 +2654,7 @@ impl App {
             self.status = "Escribe una URL o ruta para conectar".to_string();
             return;
         }
-        tracing::debug!(url = %url, rebuild, "conn_submit: url a conectar");
+        tracing::debug!(url = %crate::security::strip_credentials(&url), rebuild, "conn_submit: url a conectar");
         // Conexión real (sync por ahora; el spinner se limpia después)
         self.connection_form.as_mut().unwrap().connecting = true;
         self.connect_sqlite(&url);

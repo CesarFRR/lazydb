@@ -198,6 +198,23 @@ mod tests {
     }
 
     #[test]
+    fn ui_nunca_muestra_el_password() {
+        // REGLA DE SEGURIDAD DE UI: cualquier string que se renderice en
+        // pantalla (status bar, Meta tab, panel Fuentes) debe pasar por
+        // strip_credentials. Verificamos los formatos que produce la UI.
+        let url = "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@host:5432/db";
+        let safe = strip_credentials(url);
+        // Meta tab: `db_path: <safe>`
+        assert!(!format!("db_path: {safe}").contains("dsJBQr"), "Meta tab filtra password");
+        // Status: `Conectando a <safe>...`
+        assert!(!format!("Conectando a {safe}...").contains("dsJBQr"));
+        // Error: `<safe>: fuente no soportada`
+        assert!(!format!("{safe}: fuente no soportada").contains("dsJBQr"));
+        // El host y la base se conservan (info útil)
+        assert!(safe.contains("host:5432/db"), "el host/db no debe perderse: {safe}");
+    }
+
+    #[test]
     fn key_for_es_estable_y_sin_credenciales() {
         let k1 = key_for("postgresql://user:pass@host:5432/db");
         let k2 = key_for("postgres://host:5432/db");
