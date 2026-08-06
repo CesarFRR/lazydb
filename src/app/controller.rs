@@ -8,7 +8,6 @@ use crate::ui::layout::{self, ComputedLayout};
 use crate::ui::widgets::panel::MIN_COL_W;
 use crate::{config, db, keys, query, storage};
 
-#[allow(dead_code)]
 const LARGE_WIDTH: u16 = 120;
 const KB_BYTES: u64 = 1024;
 const MB_BYTES: u64 = KB_BYTES * 1024;
@@ -390,8 +389,7 @@ fn strip_url_credentials(url: &str) -> (String, Option<String>) {
     };
     let creds = &rest[..at_mark];
     let host = &rest[at_mark + 1..];
-    let user =
-        creds.split_once(':').map_or(Some(creds), |(u, _)| Some(u)).map(ToString::to_string);
+    let user = creds.split_once(':').map_or(Some(creds), |(u, _)| Some(u)).map(ToString::to_string);
     (format!("{scheme_part}{host}"), user)
 }
 
@@ -543,10 +541,9 @@ impl SourceList<'_> {
                 "{mark}{prefix}{name} => {}",
                 crate::security::strip_credentials(&path)
             )),
-            None => self.out.push(format!(
-                "{mark}{prefix}{}",
-                crate::security::strip_credentials(&path)
-            )),
+            None => self
+                .out
+                .push(format!("{mark}{prefix}{}", crate::security::strip_credentials(&path))),
         }
     }
 
@@ -805,7 +802,8 @@ pub struct App {
     /// conexiones lentas (`CleverCloud`) por límite de conexiones.
     /// `Rc` permite clonar la referencia sin prestar `self` (los métodos
     /// que usan el adapter también asignan campos de `self`).
-    pub active_adapter: Option<std::sync::Arc<dyn crate::db::adapter::DbAdapter>>,    pub db_size_bytes: Option<u64>,
+    pub active_adapter: Option<std::sync::Arc<dyn crate::db::adapter::DbAdapter>>,
+    pub db_size_bytes: Option<u64>,
     /// ¿El backend conectado es `NoSQL` (mongo)? La UI cambia terminología
     /// (`row` → `doc`) y muestra el toggle JSON del modal.
     pub is_nosql: bool,
@@ -1619,9 +1617,7 @@ impl App {
     /// (`user:pass@`) — el password NUNCA debe aparecer en pantalla ni en
     /// logs de estado.
     pub fn db_path_safe(&self) -> String {
-        self.db_path
-            .as_deref()
-            .map_or_else(|| "-".to_string(), crate::security::strip_credentials)
+        self.db_path.as_deref().map_or_else(|| "-".to_string(), crate::security::strip_credentials)
     }
 
     pub fn db_size_display(&self) -> String {
@@ -1674,11 +1670,17 @@ impl App {
         });
         match result {
             Ok((db_name, dbs)) if dbs.is_empty() => {
-                self.status =
-                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario (BD actual: {db_name})",
+                    crate::security::strip_credentials(url)
+                );
             }
             Ok((_db_name, dbs)) => {
-                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(url),
+                    dbs.len()
+                );
                 self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
@@ -1706,7 +1708,8 @@ impl App {
             || server_url.clone(),
             |host_port| format!("mysql://{user}:{buffer}@{host_port}"),
         );
-        self.status = format!("Autenticando en {server_url}...");
+        self.status =
+            format!("Autenticando en {}...", crate::security::strip_credentials(&server_url));
         let result = crate::db::rt::block_on(async {
             let (pool, _db_name) = crate::db::backends::mysql::connect(&url)?;
             let dbs = crate::db::backends::mysql::list_databases(&pool)?;
@@ -1714,14 +1717,21 @@ impl App {
         });
         match result {
             Ok(dbs) if dbs.is_empty() => {
-                self.status = format!("Servidor {server_url}: sin bases de usuario");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario",
+                    crate::security::strip_credentials(&server_url)
+                );
             }
             Ok(dbs) => {
-                self.status = format!("Servidor {server_url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(&server_url),
+                    dbs.len()
+                );
                 self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
             }
             Err(err) => {
-                tracing::warn!(url = %server_url, error = ?err, "credenciales rechazadas");
+                tracing::warn!(url = %crate::security::strip_credentials(&server_url), error = ?err, "credenciales rechazadas");
                 self.show_error("No se pudo autenticar", &err.to_string());
             }
         }
@@ -1758,11 +1768,17 @@ impl App {
         });
         match result {
             Ok((db_name, dbs)) if dbs.is_empty() => {
-                self.status =
-                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario (BD actual: {db_name})",
+                    crate::security::strip_credentials(url)
+                );
             }
             Ok((_db_name, dbs)) => {
-                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(url),
+                    dbs.len()
+                );
                 self.db_picker =
                     Some(DbPickerState { server_url: scheme_normalized.clone(), dbs, idx: 0 });
             }
@@ -1790,7 +1806,8 @@ impl App {
             || server_url.clone(),
             |host_port| format!("postgres://{user}:{buffer}@{host_port}"),
         );
-        self.status = format!("Autenticando en {server_url}...");
+        self.status =
+            format!("Autenticando en {}...", crate::security::strip_credentials(&server_url));
         let result = crate::db::rt::block_on(async {
             let (pool, _db_name) = crate::db::backends::postgres::connect(&url)?;
             let dbs = crate::db::backends::postgres::list_databases(&pool)?;
@@ -1798,14 +1815,21 @@ impl App {
         });
         match result {
             Ok(dbs) if dbs.is_empty() => {
-                self.status = format!("Servidor {server_url}: sin bases de usuario");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario",
+                    crate::security::strip_credentials(&server_url)
+                );
             }
             Ok(dbs) => {
-                self.status = format!("Servidor {server_url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(&server_url),
+                    dbs.len()
+                );
                 self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
             }
             Err(err) => {
-                tracing::warn!(url = %server_url, error = ?err, "credenciales postgres rechazadas");
+                tracing::warn!(url = %crate::security::strip_credentials(&server_url), error = ?err, "credenciales postgres rechazadas");
                 self.show_error("No se pudo autenticar", &err.to_string());
             }
         }
@@ -1824,11 +1848,17 @@ impl App {
         });
         match result {
             Ok((db_name, dbs)) if dbs.is_empty() => {
-                self.status =
-                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario (BD actual: {db_name})",
+                    crate::security::strip_credentials(url)
+                );
             }
             Ok((_db_name, dbs)) => {
-                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(url),
+                    dbs.len()
+                );
                 self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
@@ -1968,8 +1998,10 @@ impl App {
             self.detail_tab = DetailTab::Data;
 
             self.refresh_preview_from_selected_object();
-            self.status =
-                format!("Conectado en modo read-only: {}", crate::security::strip_credentials(&path));
+            self.status = format!(
+                "Conectado en modo read-only: {}",
+                crate::security::strip_credentials(&path)
+            );
             tracing::info!(
                 path = %crate::security::strip_credentials(&path),
                 tablas = self.tables.len(),
@@ -2636,18 +2668,17 @@ impl App {
         let rebuild = self.connection_form.as_ref().is_some_and(|form| {
             matches!(
                 form.active,
-                ConnField::Host | ConnField::Port | ConnField::User | ConnField::Pass
+                ConnField::Host
+                    | ConnField::Port
+                    | ConnField::User
+                    | ConnField::Pass
                     | ConnField::Db
             )
         });
         if rebuild {
             self.conn_rebuild_url_from_fields();
         }
-        let url = self
-            .connection_form
-            .as_ref()
-            .map(|f| f.url.clone())
-            .unwrap_or_default();
+        let url = self.connection_form.as_ref().map(|f| f.url.clone()).unwrap_or_default();
         // Purga final antes de conectar (defensa en profundidad contra \n)
         let url = url.trim().replace(['\n', '\r'], "");
         if url.trim().is_empty() {
@@ -2666,7 +2697,8 @@ impl App {
             form.url_debounce_scheduled = false;
         }
         if self.db_path.is_none() {
-            self.status = format!("No se pudo conectar a {url}");
+            self.status =
+                format!("No se pudo conectar a {}", crate::security::strip_credentials(&url));
         }
     }
 
@@ -2681,7 +2713,8 @@ impl App {
                 // REGLA DE ORO: el formulario nunca se cierra sin db. Esc solo
                 // mueve el foco a Fuentes (la conexión queda pendiente).
                 self.active_panel = PanelKind::Sources;
-                self.status = "Conexión pendiente: el formulario queda en el panel Detalle".to_string();
+                self.status =
+                    "Conexión pendiente: el formulario queda en el panel Detalle".to_string();
             }
             // Ctrl+U: limpiar el campo activo (estándar readline)
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3662,7 +3695,8 @@ impl App {
                 self.connect_sqlite(s);
             }
             _ => {
-                self.status = format!("No se puede conectar: {clean}");
+                self.status =
+                    format!("No se puede conectar: {}", crate::security::strip_credentials(&clean));
             }
         }
     }
@@ -3734,7 +3768,10 @@ impl App {
             if let Some(form) = self.connection_form.as_ref() {
                 if matches!(
                     form.active,
-                    ConnField::Host | ConnField::Port | ConnField::User | ConnField::Pass
+                    ConnField::Host
+                        | ConnField::Port
+                        | ConnField::User
+                        | ConnField::Pass
                         | ConnField::Db
                 ) {
                     self.conn_rebuild_url_from_fields();
@@ -4919,10 +4956,7 @@ mod tests {
             entry.contains("mongodb://127.0.0.1:27017"),
             "la URL debe quedar intacta (no un path normalizado): {entry}"
         );
-        assert!(
-            !entry.contains("lazydb/mongodb"),
-            "no debe mezclarse con el cwd: {entry}"
-        );
+        assert!(!entry.contains("lazydb/mongodb"), "no debe mezclarse con el cwd: {entry}");
     }
 
     #[test]
@@ -4968,7 +5002,10 @@ mod tests {
         // Sin puerto → default del esquema
         assert_eq!(source_host_port("mysql://localhost/lazy"), Some(("localhost".into(), 3306)));
         assert_eq!(source_host_port("mongodb://localhost/mydb"), Some(("localhost".into(), 27017)));
-        assert_eq!(source_host_port("mongodb://127.0.0.1:27017"), Some(("127.0.0.1".into(), 27017)));
+        assert_eq!(
+            source_host_port("mongodb://127.0.0.1:27017"),
+            Some(("127.0.0.1".into(), 27017))
+        );
         assert_eq!(
             source_host_port("https://api.example.com/x"),
             Some(("api.example.com".into(), 443))
@@ -5475,11 +5512,7 @@ mod tests {
         let Some(picker) = &app.db_picker else {
             panic!("debe abrirse el picker (status: {})", app.status);
         };
-        assert!(
-            picker.dbs.iter().any(|d| d == "lazydb_probe"),
-            "bases: {:?}",
-            picker.dbs
-        );
+        assert!(picker.dbs.iter().any(|d| d == "lazydb_probe"), "bases: {:?}", picker.dbs);
         // Elegir la base por índice → connect_sqlite conecta el catálogo
         let idx = picker.dbs.iter().position(|d| d == "lazydb_probe").unwrap();
         let picker = app.db_picker.take().unwrap();
@@ -5488,11 +5521,7 @@ mod tests {
         url.push('/');
         url.push_str(&db);
         app.connect_sqlite(&url);
-        assert!(
-            app.tables.iter().any(|c| c == "test_probe"),
-            "colecciones: {:?}",
-            app.tables
-        );
+        assert!(app.tables.iter().any(|c| c == "test_probe"), "colecciones: {:?}", app.tables);
     }
 
     /// Enter en el campo URL con URL válida → parsea Y conecta (no solo
@@ -5524,11 +5553,7 @@ mod tests {
             app.active_adapter.is_some(),
             "el adapter debe compartirse en active_adapter tras conectar"
         );
-        assert!(
-            app.tables.iter().any(|c| c == "test_probe"),
-            "colecciones: {:?}",
-            app.tables
-        );
+        assert!(app.tables.iter().any(|c| c == "test_probe"), "colecciones: {:?}", app.tables);
     }
 
     #[test]
@@ -5550,10 +5575,7 @@ mod tests {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            app.connection_form.is_some(),
-            "Esc no debe cerrar el formulario sin db abierta"
-        );
+        assert!(app.connection_form.is_some(), "Esc no debe cerrar el formulario sin db abierta");
         assert_eq!(app.active_panel, PanelKind::Sources, "Esc mueve el foco a Fuentes");
 
         // Navegar a otros paneles no elimina el formulario tampoco
@@ -5631,15 +5653,13 @@ mod tests {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail; // el formulario captura con foco en Detail
         app.connection_form = Some(ConnectionFormState::default());
-        app.connection_form.as_mut().unwrap().url = "mysql://user:pass@localhost:3306/lazy".to_string();
+        app.connection_form.as_mut().unwrap().url =
+            "mysql://user:pass@localhost:3306/lazy".to_string();
         app.connection_form.as_mut().unwrap().host = "localhost".to_string();
         app.connection_form.as_mut().unwrap().active = ConnField::Url;
 
         // Ctrl+U limpia el campo URL activo
-        app.on_key(KeyEvent::new(
-            KeyCode::Char('u'),
-            KeyModifiers::CONTROL,
-        ));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(app.connection_form.as_ref().unwrap().url, "");
         assert_eq!(
             app.connection_form.as_ref().unwrap().host,
@@ -5649,10 +5669,7 @@ mod tests {
 
         // Ctrl+L limpia todo el formulario
         app.connection_form.as_mut().unwrap().host = "localhost".to_string();
-        app.on_key(KeyEvent::new(
-            KeyCode::Char('l'),
-            KeyModifiers::CONTROL,
-        ));
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         let form = app.connection_form.as_ref().unwrap();
         assert!(form.host.is_empty(), "Ctrl+L limpia todo");
         assert!(form.url.is_empty());
@@ -5734,10 +5751,7 @@ mod tests {
         );
         app.on_paste(pegada);
         let url_limpia = app.connection_form.as_ref().unwrap().url.clone();
-        assert!(
-            !url_limpia.contains('\n'),
-            "el paste debe quitar el \\n: {url_limpia:?}"
-        );
+        assert!(!url_limpia.contains('\n'), "el paste debe quitar el \\n: {url_limpia:?}");
         assert!(
             url_limpia.ends_with("bh4bhaewrpd8qqcreso5"),
             "la base debe quedar al final: {url_limpia:?}"
