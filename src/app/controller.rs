@@ -575,7 +575,7 @@ impl SourceList<'_> {
         }
     }
 
-    fn add_detected(&mut self, detected_servers: &[String]) {
+    fn add_detected(&mut self, detected_servers: &[String], cwd_databases: &[String]) {
         // Servidores SQL locales detectados por puerto (escaneo cacheable)
         if !detected_servers.is_empty() {
             self.section("SERVIDORES LOCALES");
@@ -586,10 +586,10 @@ impl SourceList<'_> {
             }
         }
 
-        // DBs SQLite de la carpeta actual (donde se ejecuta lazydb)
-        let scanned = scan_cwd_databases();
+        // DBs SQLite de la carpeta actual (donde se ejecuta lazydb). El
+        // escaneo se cachea en `App::new` (I/O de filesystem bloqueante).
         let fresh: Vec<String> =
-            scanned.iter().filter(|p| !self.seen.contains(*p)).cloned().collect();
+            cwd_databases.iter().filter(|p| !self.seen.contains(*p)).cloned().collect();
         if fresh.is_empty() {
             return;
         }
@@ -779,6 +779,11 @@ pub struct App {
     /// el escaneo es bloqueante y no debe repetirse en cada render). Cada
     /// entrada es una URL sin credenciales, p. ej. `mysql://127.0.0.1:3306`.
     pub detected_servers: Vec<String>,
+    /// DBs de archivo del cwd (escaneadas UNA vez en `new`, igual que
+    /// `detected_servers`): `build_sources` corre dentro del frame loop
+    /// (`poll_probe_results`) y un `read_dir` + `stat` por frame hacía el
+    /// panel de Fuentes notablemente lento.
+    pub cwd_databases: Vec<String>,
     pub source_tab: SourceTab,
     pub tables: Vec<String>,
     pub views: Vec<String>,
@@ -919,6 +924,10 @@ impl App {
         let detected_servers =
             crate::db::servers::scan_local_servers(std::time::Duration::from_millis(300));
 
+        // DBs de archivo del cwd: escaneo de filesystem bloqueante, se cachea
+        // UNA vez igual que los servidores (build_sources corre en cada frame).
+        let cwd_databases = scan_cwd_databases();
+
         tracing::debug!(
             recents = state.recents.len(),
             keymap = %keymap.binding_count(),
@@ -944,9 +953,11 @@ impl App {
                 None,
                 &HashMap::new(),
                 &detected_servers,
+                &cwd_databases,
             ),
             source_tab,
             detected_servers,
+            cwd_databases,
             health: HashMap::new(),
             probing: HashSet::new(),
             probe_rx: Some(probe_rx),
@@ -1158,22 +1169,28 @@ impl App {
     /// `compute_layout`) y dispara los probes pendientes: la fuente recién
     /// seleccionada y las nuevas filas visibles de Fuentes.
     fn poll_probe_results(&mut self) {
-        let Some(rx) = self.probe_rx.as_mut() else { return };
-        while let Ok((path, ok)) = rx.try_recv() {
+        // Drenar el canal primero (evita el doble borrow de `self` entre el
+        // receiver y el rebuild de `sources`).
+        let mut resolved: Vec<(String, bool)> = Vec::new();
+        if let Some(rx) = self.probe_rx.as_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                resolved.push(msg);
+            }
+        }
+        let mut changed = false;
+        for (path, ok) in resolved {
             // Rebuild solo si el estado cambió (primera verificación o ✗ ↔ ok)
-            let changed = self.health.get(&path) != Some(&ok);
+            if self.health.get(&path) != Some(&ok) {
+                changed = true;
+            }
             self.health.insert(path.clone(), ok);
             self.probing.remove(&path);
-            if changed {
-                tracing::debug!(path = %path, ok, "probe resuelto (estado cambiado)");
-                self.sources = Self::build_sources(
-                    &self.state,
-                    self.source_tab,
-                    self.db_path.as_deref(),
-                    &self.health,
-                    &self.detected_servers,
-                );
-            }
+            tracing::debug!(path = %path, ok, "probe resuelto");
+        }
+        if changed {
+            // Preservar la selección: el rebuild no debe saltar el cursor
+            // a otra fuente (los probes reordenan marcas, no la lista).
+            self.rebuild_sources(None);
         }
 
         // Selección de Sources bajo el cursor: la navegación (flechas, click,
@@ -1495,6 +1512,7 @@ impl App {
         connected: Option<&str>,
         health: &HashMap<String, bool>,
         detected_servers: &[String],
+        cwd_databases: &[String],
     ) -> Vec<String> {
         let mut list = SourceList {
             state,
@@ -1509,12 +1527,12 @@ impl App {
             SourceTab::All => {
                 list.add_favs(SourceFilter::All);
                 list.add_recents(SourceFilter::All);
-                list.add_detected(detected_servers);
+                list.add_detected(detected_servers, cwd_databases);
             }
             SourceTab::Local => {
                 list.add_favs(SourceFilter::Local);
                 list.add_recents(SourceFilter::Local);
-                list.add_detected(detected_servers);
+                list.add_detected(detected_servers, cwd_databases);
             }
             SourceTab::Online => {
                 list.add_favs(SourceFilter::Online);
@@ -1525,6 +1543,43 @@ impl App {
         list.finish(source_tab)
     }
 
+    /// Reconstruye `sources` preservando la selección POR PATH (no por
+    /// índice numérico): `add_recent`/`add_favorite` reordenan la lista y
+    /// el índice viejo quedaría apuntando a OTRA fuente ("se abre una db
+    /// pero otra queda seleccionada"). Guarda el path seleccionado, hace el
+    /// rebuild y re-ubica el cursor en el mismo path. `prefer` (p. ej. la
+    /// fuente recién conectada) gana sobre la selección previa.
+    fn rebuild_sources(&mut self, prefer: Option<&str>) {
+        let current = self
+            .items_for(PanelKind::Sources)
+            .get(self.selected_idx(PanelKind::Sources))
+            .and_then(|item| Self::source_probe_path(item));
+
+        self.sources = Self::build_sources(
+            &self.state,
+            self.source_tab,
+            self.db_path.as_deref(),
+            &self.health,
+            &self.detected_servers,
+            &self.cwd_databases,
+        );
+
+        // Path objetivo: el preferido o el que estaba seleccionado.
+        let target = prefer.or(current.as_deref());
+        let Some(target) = target else { return };
+        // Comparación canónica: la lista guarda paths normalizados y SIN
+        // credenciales (display), así que el target se normaliza igual.
+        let norm = crate::paths::normalize_path(target);
+        let norm_clean = crate::security::strip_credentials(&norm);
+        if let Some(idx) = self.sources.iter().position(|item| {
+            Self::source_probe_path(item).is_some_and(|p| {
+                crate::security::strip_credentials(&crate::paths::normalize_path(&p)) == norm_clean
+            })
+        }) {
+            self.set_selected_idx(PanelKind::Sources, idx);
+        }
+    }
+
     fn set_source_tab(&mut self, tab: SourceTab) {
         self.source_tab = tab;
         self.sources = Self::build_sources(
@@ -1533,6 +1588,7 @@ impl App {
             self.db_path.as_deref(),
             &self.health,
             &self.detected_servers,
+            &self.cwd_databases,
         );
         self.set_selected_idx(PanelKind::Sources, 0);
     }
@@ -1969,13 +2025,10 @@ impl App {
             let path_str = crate::security::strip_credentials(&path);
             self.state.add_recent(path_str);
             let _ = self.state.save();
-            self.sources = Self::build_sources(
-                &self.state,
-                self.source_tab,
-                Some(&path),
-                &self.health,
-                &self.detected_servers,
-            );
+            // add_recent movió la fuente al frente → rebuild y re-ubicar la
+            // selección en la fuente recién conectada (no dejar el cursor
+            // en el índice viejo, que ahora es OTRA fuente).
+            self.rebuild_sources(Some(&path));
 
             self.db_path = Some(path.clone());
             // ¿NoSQL? (mongo): cambia la terminología de la UI (row→doc) y
@@ -3021,13 +3074,7 @@ impl App {
 
         self.state.add_query_history(&sql);
         let _ = self.state.save();
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            Some(&path),
-            &self.health,
-            &self.detected_servers,
-        );
+        self.rebuild_sources(None);
 
         tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query_gen + 1);
         self.query_gen += 1;
@@ -3075,13 +3122,7 @@ impl App {
 
         self.state.add_favorite(favorite_name.clone(), path.to_string());
         let _ = self.state.save();
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-        );
+        self.rebuild_sources(None);
         self.status = format!("Favorito guardado: {favorite_name}");
     }
 
@@ -3114,13 +3155,7 @@ impl App {
         }
 
         let _ = self.state.save();
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-        );
+        self.rebuild_sources(None);
     }
 
     /// `d` en el panel Fuentes: olvida la fuente bajo el cursor (la quita de
@@ -3154,13 +3189,7 @@ impl App {
         if self.db_path.as_deref() == Some(canonical.as_str()) {
             self.disconnect_db();
         } else {
-            self.sources = Self::build_sources(
-                &self.state,
-                self.source_tab,
-                self.db_path.as_deref(),
-                &self.health,
-                &self.detected_servers,
-            );
+            self.rebuild_sources(None);
             self.status = format!("Fuente olvidada: {path}");
         }
     }
@@ -3196,6 +3225,7 @@ impl App {
             None,
             &self.health,
             &self.detected_servers,
+            &self.cwd_databases,
         );
         self.set_focus(PanelKind::Sources);
         self.set_selected_idx(PanelKind::Sources, 0);
@@ -3504,13 +3534,7 @@ impl App {
     fn reload_runtime_config(&mut self) {
         self.keymap = keys::Keymap::load();
         self.state = storage::AppState::load();
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-        );
+        self.rebuild_sources(None);
 
         let ui_config = config::Config::load().ui;
         self.rows_per_page = ui_config.rows_per_page;
@@ -3621,13 +3645,7 @@ impl App {
             if let Some(adapter) = self.adapter_arc() {
                 if let Ok(tables) = adapter.list_objects_by_type("table") {
                     self.tables = tables;
-                    self.sources = Self::build_sources(
-                        &self.state,
-                        self.source_tab,
-                        self.db_path.as_deref(),
-                        &self.health,
-                        &self.detected_servers,
-                    );
+                    self.rebuild_sources(None);
                 }
             }
         }
@@ -4819,7 +4837,8 @@ mod tests {
     fn build_sources_online_agrupa_favoritos_y_recents() {
         let mut state = state_de_prueba();
         state.favorites.insert("remote".to_string(), "https://remote.example/db".to_string());
-        let sources = App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[]);
+        let sources =
+            App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[], &[]);
 
         // Sin sección FAVORITOS: la ★ identifica al favorito, va el primero
         assert!(
@@ -4842,7 +4861,7 @@ mod tests {
     fn build_sources_pon_los_favoritos_de_primeras() {
         // En el tab All: favoritos al inicio (sin sección), luego RECIENTES
         let state = state_de_prueba(); // favorito "one => /a/one.db", recientes /a/one.db + https
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
 
         assert!(sources.first().is_some_and(|s| s.starts_with("★ one => /a/one.db")));
         let recents_idx = sources
@@ -4858,8 +4877,14 @@ mod tests {
     #[test]
     fn build_sources_marca_la_conectada() {
         let state = state_de_prueba();
-        let sources =
-            App::build_sources(&state, SourceTab::All, Some("/a/one.db"), &HashMap::new(), &[]);
+        let sources = App::build_sources(
+            &state,
+            SourceTab::All,
+            Some("/a/one.db"),
+            &HashMap::new(),
+            &[],
+            &[],
+        );
         assert!(sources.iter().any(|s| s.starts_with("● ★ one => /a/one.db")));
     }
 
@@ -4872,7 +4897,7 @@ mod tests {
         // colapsar en UNA sola entrada: el `seen` compara rutas canónicas.
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string(), "https://remote.example/db".to_string()];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
 
         let matches = sources
             .iter()
@@ -4892,7 +4917,7 @@ mod tests {
         state.recents = vec!["one.db".to_string()];
         let connected = crate::paths::normalize_path("one.db");
         let sources =
-            App::build_sources(&state, SourceTab::All, Some(&connected), &HashMap::new(), &[]);
+            App::build_sources(&state, SourceTab::All, Some(&connected), &HashMap::new(), &[], &[]);
         assert!(
             sources.iter().any(|s| s.starts_with(&format!("● ▣ {connected}"))),
             "la entrada absoluta debe llevar ●: {sources:?}"
@@ -4904,7 +4929,7 @@ mod tests {
         // El reciente relativo "one.db" debe mostrarse en su forma canónica.
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string()];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
         let shown = sources.iter().find_map(|s| {
             let p = source_path_of(s);
             (!is_source_section(s) && p != "Abrir sakila.db" && p != "Buscar archivo .db")
@@ -4966,6 +4991,7 @@ mod tests {
             None,
             &HashMap::new(),
             &["mongodb://127.0.0.1:27017".to_string()],
+            &[],
         );
         let entry = sources
             .iter()
@@ -4986,7 +5012,7 @@ mod tests {
             "one.db".to_string(),
             "https://remote.example/db".to_string(),
         ];
-        let local = App::build_sources(&state, SourceTab::Local, None, &HashMap::new(), &[]);
+        let local = App::build_sources(&state, SourceTab::Local, None, &HashMap::new(), &[], &[]);
         assert!(
             local.iter().any(|s| s.starts_with("M mysql://127.0.0.1:3306/lazy")),
             "mysql de localhost debe estar en el tab Local: {local:?}"
@@ -4997,7 +5023,7 @@ mod tests {
             "lo online NO debe filtrarse al tab Local"
         );
 
-        let online = App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[]);
+        let online = App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[], &[]);
         assert!(
             online.iter().any(|s| s.starts_with("⊙ https://remote.example/db")),
             "lo online debe estar en el tab Online: {online:?}"
@@ -5079,7 +5105,7 @@ mod tests {
         let canonical_caida = crate::paths::normalize_path("caida.db");
 
         // Sin caché → sin marcas de salud en absoluto (nada de ✓ por defecto)
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
         assert!(
             sources.iter().any(|s| s.contains(&canonical_ok) && !s.starts_with("✗ ")),
             "la fuente sana no debe llevar marca: {sources:?}"
@@ -5087,14 +5113,14 @@ mod tests {
 
         let mut health = HashMap::new();
         health.insert(canonical_caida.clone(), false);
-        let sources = App::build_sources(&state, SourceTab::All, None, &health, &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &health, &[], &[]);
         assert!(
             sources.iter().any(|s| s.starts_with(&format!("✗ ▣ {canonical_caida}"))),
             "fuente caída debe llevar ✗: {sources:?}"
         );
         // Conectada y caída combina ● + ✗
         let sources_connected =
-            App::build_sources(&state, SourceTab::All, Some(&canonical_caida), &health, &[]);
+            App::build_sources(&state, SourceTab::All, Some(&canonical_caida), &health, &[], &[]);
         assert!(
             sources_connected.iter().any(|s| s.starts_with(&format!("● ✗ ▣ {canonical_caida}"))),
             "conectada + caída = '● ✗': {sources_connected:?}"
@@ -5157,7 +5183,7 @@ mod tests {
             "mysql://localhost/lazy".to_string(),
             "postgres://db.azure.com/prod".to_string(),
         ];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
         assert!(sources.iter().any(|s| s.starts_with("D ")), "DuckDB debe marcarse D");
         assert!(sources.iter().any(|s| s.starts_with("M ")), "MySQL debe marcarse M");
         assert!(sources.iter().any(|s| s.starts_with("P ")), "Postgres debe marcarse P");
@@ -5936,5 +5962,99 @@ mod tests {
         let fila_global =
             app.preview_loaded_offset as usize + app.selected_idx(PanelKind::Detail) - 1;
         assert_eq!(fila_global, 100);
+    }
+
+    // ── panel Fuentes: rebuild y selección (regresión) ────────────────
+
+    /// REGRESIÓN: `add_recent` mueve la fuente conectada al FRENTE de la
+    /// lista. Antes, `connect_sqlite` reconstruía `sources` sin re-ubicar la
+    /// selección → el cursor quedaba en el índice viejo (OTRA fuente): "se
+    /// abre una db pero otra queda seleccionada". Ahora `rebuild_sources`
+    /// re-ubica la selección por PATH.
+    #[test]
+    fn rebuild_sources_sigue_a_la_fuente_conectada() {
+        let mut state = storage::AppState::new();
+        // 3 recientes: la que se conecta es la 3ª (índice 2, bajo el cursor)
+        state.recents =
+            vec!["/a/one.db".to_string(), "/b/two.db".to_string(), "/c/three.db".to_string()];
+
+        let mut app = App::new();
+        app.state = state;
+        app.source_tab = SourceTab::All;
+        app.detected_servers = Vec::new();
+        app.cwd_databases = Vec::new();
+        // El usuario posiciona el cursor sobre la 3ª fuente
+        app.sources = App::build_sources(
+            &app.state,
+            SourceTab::All,
+            None,
+            &app.health,
+            &app.detected_servers,
+            &app.cwd_databases,
+        );
+        let idx_three = app
+            .sources
+            .iter()
+            .position(|s| s.contains("/c/three.db"))
+            .expect("three.db debe estar en la lista");
+        app.set_selected_idx(PanelKind::Sources, idx_three);
+
+        // Simula connect_sqlite: add_recent + rebuild con la fuente conectada
+        app.state.add_recent("/c/three.db".to_string());
+        app.rebuild_sources(Some("/c/three.db"));
+
+        // La selección debe seguir a three.db (ahora en el frente), NO
+        // quedarse en el índice viejo apuntando a otra fuente.
+        let new_idx = app.selected_idx(PanelKind::Sources);
+        let selected = &app.sources[new_idx];
+        assert!(
+            selected.contains("/c/three.db"),
+            "la selección debe apuntar a la fuente conectada, quedó en: {selected}"
+        );
+        // Y debe ser la PRIMERA fuente de la lista (add_recent la movió al
+        // frente de RECIENTES; el índice 0 es el header de la sección).
+        assert_eq!(new_idx, 1, "three.db recién conectada debe quedar al frente");
+    }
+
+    /// REGRESIÓN (perf): `build_sources` ya no re-escanea el cwd en cada
+    /// llamada — usa la lista cacheada que se construyó UNA vez en `new`.
+    /// Este test asegura que un rebuild tras un probe no cambia la selección
+    /// del usuario.
+    #[test]
+    fn rebuild_sources_preserva_seleccion_cuando_el_path_sigue() {
+        let mut state = storage::AppState::new();
+        state.recents =
+            vec!["/a/one.db".to_string(), "/b/two.db".to_string(), "/c/three.db".to_string()];
+
+        let mut app = App::new();
+        app.state = state;
+        app.source_tab = SourceTab::All;
+        app.detected_servers = Vec::new();
+        app.cwd_databases = Vec::new();
+        app.sources = App::build_sources(
+            &app.state,
+            SourceTab::All,
+            None,
+            &app.health,
+            &app.detected_servers,
+            &app.cwd_databases,
+        );
+        // Seleccionar la 2ª fuente
+        let idx_two = app
+            .sources
+            .iter()
+            .position(|s| s.contains("/b/two.db"))
+            .expect("two.db debe estar en la lista");
+        app.set_selected_idx(PanelKind::Sources, idx_two);
+
+        // Un probe resuelto (cambio de marca ✗/✓) dispara rebuild
+        app.rebuild_sources(None);
+
+        let new_idx = app.selected_idx(PanelKind::Sources);
+        let selected = &app.sources[new_idx];
+        assert!(
+            selected.contains("/b/two.db"),
+            "el rebuild no debe saltar la selección: {selected}"
+        );
     }
 }
