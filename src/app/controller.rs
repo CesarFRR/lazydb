@@ -2298,6 +2298,15 @@ impl App {
                 return;
             }
             self.preview_rows.extend(data.rows.iter().map(|row| row.to_line(" | ")));
+            // Sincronizar las celdas tipadas del render 2D: el viewport usa
+            // `preview_data.rows.len()` como tope (`rows_hint`) — sin esto el
+            // scroll se congela en la primera página mientras el label de
+            // `row X/Y` sigue avanzando (bug "la vista no baja").
+            if let Some(existing) = self.preview_data.take() {
+                let mut rows = existing.rows;
+                rows.extend(data.rows);
+                self.preview_data = Some(crate::db::TableData { columns: existing.columns, rows });
+            }
         }
         self.is_loading = false;
     }
@@ -2366,6 +2375,16 @@ impl App {
             // (las filas nuevas se anteponen; la vista no salta).
             let cur = self.selected_idx(PanelKind::Detail);
             self.set_selected_idx(PanelKind::Detail, cur.saturating_add(n));
+
+            // El viewport (`scroll_offset`) también se desplaza +n: las filas
+            // nuevas entraron ARRIBA del buffer y la vista debe seguir
+            // mostrando las mismas filas globales de antes. Sin esto, el
+            // render ve la selección "lejos" del scroll viejo y salta la
+            // vista hacia abajo ("cambio de página" fantasma con la rueda:
+            // baja N filas de golpe y la fila enfocada queda abajo).
+            let p = self.panel_mut(PanelKind::Detail);
+            let so = p.scroll_offset.get();
+            p.scroll_offset.set(so.saturating_add(n));
         }
         self.is_loading = false;
     }
@@ -5764,5 +5783,158 @@ mod tests {
             "URL purgada no debe pedir contraseña (status: {})",
             app.status
         );
+    }
+
+    // ── scroll infinito del Data tab (regresión) ──────────────────────
+
+    /// Adapter fake: simula una tabla con `total` filas. Cada página
+    /// (`table_rows_sorted`) devuelve `limit` filas a partir de `offset`,
+    /// con celdas `v{idx}` — suficiente para ejercitar el scroll infinito
+    /// sin tocar una BD real.
+    struct FakeScrollAdapter {
+        total: u32,
+    }
+
+    impl crate::db::adapter::DbAdapter for FakeScrollAdapter {
+        fn list_objects_by_type(&self, _object_type: &str) -> Result<Vec<String>, db::DbError> {
+            Ok(vec![])
+        }
+        fn list_advanced_objects(&self) -> Result<Vec<String>, db::DbError> {
+            Ok(vec![])
+        }
+        fn object_sql(&self, _object_name: &str) -> Result<String, db::DbError> {
+            Ok(String::new())
+        }
+        fn table_columns(&self, _table_name: &str) -> Result<Vec<db::ColumnInfo>, db::DbError> {
+            Ok(vec![])
+        }
+        fn table_row_count(&self, _table_name: &str) -> Result<u32, db::DbError> {
+            Ok(self.total)
+        }
+        fn column_names(&self, _table_name: &str) -> Result<Vec<db::Column>, db::DbError> {
+            Ok(vec![])
+        }
+        fn table_data_rows(
+            &self,
+            _table_name: &str,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<Vec<db::Row>, db::DbError> {
+            Ok(vec![])
+        }
+        fn table_rows_sorted(
+            &self,
+            _table_name: &str,
+            limit: u32,
+            offset: u32,
+            _order_col: Option<(&str, bool)>,
+        ) -> Result<db::TableData, db::DbError> {
+            let columns = vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }];
+            let rows: Vec<db::Row> = (offset..offset.saturating_add(limit))
+                .filter(|i| *i < self.total)
+                .map(|i| db::Row { cells: vec![format!("v{i}")] })
+                .collect();
+            Ok(db::TableData { columns, rows })
+        }
+        fn foreign_keys(&self, _table_name: &str) -> Result<Vec<db::ForeignKey>, db::DbError> {
+            Ok(vec![])
+        }
+        fn row_offset_of(
+            &self,
+            _table_name: &str,
+            _col: &str,
+            _value: &str,
+        ) -> Result<Option<u32>, db::DbError> {
+            Ok(None)
+        }
+        fn query(&self, _sql: &str, _limit: u32) -> Result<Vec<String>, db::DbError> {
+            Ok(vec![])
+        }
+        fn count(&self, _sql: &str) -> Result<u32, db::DbError> {
+            Ok(self.total)
+        }
+    }
+
+    fn app_con_scroll_fake(total: u32, page: u32) -> App {
+        let mut app = App::new();
+        app.active_adapter = Some(std::sync::Arc::new(FakeScrollAdapter { total }));
+        app.active_panel = PanelKind::Detail;
+        app.detail_tab = DetailTab::Data;
+        app.tables = vec!["t".to_string()];
+        app.object_section = ObjectSection::Tables;
+        app.set_selected_idx(PanelKind::Tables, 0);
+        app.rows_per_page = page;
+        app.total_rows = total;
+        app
+    }
+
+    /// Llena `preview_rows` (header + `n` filas) y `preview_data` (tipado)
+    /// con `n` filas — el estado exacto tras cargar una página.
+    fn cargar_pagina(app: &mut App, n: u32) {
+        let rows: Vec<db::Row> = (0..n).map(|i| db::Row { cells: vec![format!("v{i}")] }).collect();
+        app.preview_data = Some(db::TableData {
+            columns: vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }],
+            rows: rows.clone(),
+        });
+        let mut lines = vec!["id".to_string()];
+        lines.extend(rows.iter().map(|r| r.to_line(" | ")));
+        app.preview_rows = lines;
+    }
+
+    /// REGRESIÓN: el scroll hacia abajo se congelaba porque
+    /// `scroll_down_infinite` extendía `preview_rows` (strings) pero NO
+    /// `preview_data` (celdas tipadas). El render usa `data.rows.len()`
+    /// como tope del viewport → la vista se quedaba en la primera página
+    /// mientras el label `row X/Y` seguía subiendo.
+    #[tokio::test]
+    async fn scroll_down_infinite_mantiene_preview_data_sincronizado() {
+        let mut app = app_con_scroll_fake(250, 25);
+        cargar_pagina(&mut app, 25); // página 1 cargada (25 filas)
+
+        app.scroll_down_infinite(); // carga la página 2
+
+        let data_len = app.preview_data.as_ref().expect("preview_data").rows.len();
+        assert_eq!(data_len, 50, "preview_data debe crecer con cada página");
+        assert_eq!(
+            app.preview_rows.len(),
+            data_len + 1,
+            "preview_rows (con header) debe seguir a preview_data"
+        );
+    }
+
+    /// REGRESIÓN: al hacer scroll hacia arriba en el borde, el prepend de N
+    /// filas saltaba la vista hacia abajo ("cambio de página" con la rueda):
+    /// la selección se desplazaba +N pero `scroll_offset` (viewport) no, y
+    /// el render "corregía" saltando la página. Ahora el viewport se
+    /// desplaza junto con la selección y la vista queda estable.
+    #[tokio::test]
+    async fn scroll_up_infinite_desplaza_viewport_con_la_seleccion() {
+        let mut app = app_con_scroll_fake(250, 25);
+        // Simula haber bajado 4 páginas: buffer con 25 filas, offset global 100
+        let rows: Vec<db::Row> =
+            (0..25).map(|i| db::Row { cells: vec![format!("v{}", i + 100)] }).collect();
+        app.preview_data = Some(db::TableData {
+            columns: vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }],
+            rows: rows.clone(),
+        });
+        let mut lines = vec!["id".to_string()];
+        lines.extend(rows.iter().map(|r| r.to_line(" | ")));
+        app.preview_rows = lines;
+        app.preview_loaded_offset = 100;
+        // El usuario está en la PRIMERA fila del buffer (borde superior)
+        app.set_selected_idx(PanelKind::Detail, 1);
+        app.panel_mut(PanelKind::Detail).scroll_offset.set(0);
+
+        app.scroll_up_infinite(); // prepend de la página anterior (25 filas)
+
+        // El viewport debe desplazarse +25 igual que la selección
+        assert_eq!(app.panel(PanelKind::Detail).scroll_offset.get(), 25);
+        assert_eq!(app.selected_idx(PanelKind::Detail), 26, "selección +25");
+        assert_eq!(app.preview_loaded_offset, 75, "offset global retrocede 25");
+        // Invariante de fila global: misma fila visible que antes del prepend
+        // (100 global antes == 75 + (26 - 1) después)
+        let fila_global =
+            app.preview_loaded_offset as usize + app.selected_idx(PanelKind::Detail) - 1;
+        assert_eq!(fila_global, 100);
     }
 }
