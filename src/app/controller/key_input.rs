@@ -210,6 +210,17 @@ impl App {
             return;
         }
 
+        // ── pestaña Query: el foco en Detail + tab Query escribe en el
+        // buffer compartido (sin abrir el modal). Enter ejecuta, Ctrl+U
+        // limpia, ↑/↓ historial, j/k scroll de resultados. ──
+        if self.db_path.is_some()
+            && self.active_panel == PanelKind::Detail
+            && self.data_view.detail_tab == DetailTab::Query
+        {
+            self.handle_query_tab_key(key);
+            return;
+        }
+
         // ── input SQL (modal `:` — captura TODO mientras está abierto,
         // incluidos chars no mapeados a ninguna acción) ──
         if self.query.query_input.is_some() {
@@ -410,7 +421,17 @@ impl App {
                 }
             }
             keys::AppAction::JumpToDetail => self.jump_to_detail(),
-            keys::AppAction::Enter => self.handle_enter(), // legacy, sin binding por defecto
+            keys::AppAction::Enter => {
+                // Pestaña Query: Enter ejecuta la query del buffer (sin abrir
+                // el modal `:`). En cualquier otro panel: comportamiento normal.
+                if self.data_view.detail_tab == DetailTab::Query
+                    && self.active_panel == PanelKind::Detail
+                {
+                    self.execute_query_tab();
+                } else {
+                    self.handle_enter();
+                }
+            }
             keys::AppAction::SourceTabRecents => self.set_source_tab(SourceTab::All),
             keys::AppAction::SourceTabFavorites => self.set_source_tab(SourceTab::Local),
             keys::AppAction::SourceTabNext => {
@@ -423,7 +444,7 @@ impl App {
             keys::AppAction::DetailTabNext => self.set_detail_tab(self.data_view.detail_tab.next()),
             keys::AppAction::DetailTabData => self.set_detail_tab(DetailTab::Data),
             keys::AppAction::DetailTabSchema => self.set_detail_tab(DetailTab::Schema),
-            keys::AppAction::DetailTabSql => self.set_detail_tab(DetailTab::Sql),
+            keys::AppAction::DetailTabQuery => self.set_detail_tab(DetailTab::Query),
             keys::AppAction::DetailTabMeta => self.set_detail_tab(DetailTab::Meta),
             keys::AppAction::ObjectSectionAdvanced => {
                 self.set_focus(PanelKind::Advanced);

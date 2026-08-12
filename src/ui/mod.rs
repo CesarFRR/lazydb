@@ -168,6 +168,11 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
             app.data_view.sort_column.as_deref(),
             app.data_view.sort_asc,
         )
+    } else if kind == PanelKind::Detail && app.data_view.detail_tab == DetailTab::Query {
+        // Pestaña Query: input de SQL arriba + resultados debajo (split).
+        render_query_tab(frame, area, &title, app);
+        // El scroll del panel no aplica (el layout interno maneja todo).
+        panel.scroll_offset.get()
     } else {
         widgets::panel::render(
             frame,
@@ -281,7 +286,13 @@ fn footer_bindings(app: &App) -> Vec<FooterBinding> {
                     });
                 }
             }
-            DetailTab::Schema | DetailTab::Sql | DetailTab::Meta => {
+            DetailTab::Query => {
+                out.push(FooterBinding { key: "enter", description: "ejecutar", style: accent });
+                out.push(FooterBinding { key: "ctrl+u", description: "limpiar", style: normal });
+                out.push(FooterBinding { key: "↑↓", description: "historial", style: normal });
+                out.push(FooterBinding { key: ":", description: "modal rápido", style: mode });
+            }
+            DetailTab::Schema | DetailTab::Meta => {
                 out.push(FooterBinding { key: "j/k", description: "scroll", style: normal });
             }
         },
@@ -516,6 +527,95 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 /// Modal de input SQL (`:`): buffer editable con cursor visible, historial
 /// navegable debajo (↑/↓, estilo fish) y hint de teclas al pie.
+/// Render de la pestaña Query (`DetailTab::Query`): input de SQL en la parte
+/// superior + resultados (o placeholder) debajo. Split vertical 1/4 - 3/4.
+/// Comparte `QueryInputState` con el modal `:` (un solo historial).
+fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let theme = &crate::ui::theme::THEME;
+    let inner = widgets::panel::inner_area_for_iteration(area);
+    if inner.height < 6 {
+        let block = widgets::panel::panel_block(title, app.active_panel == PanelKind::Detail);
+        frame.render_widget(block, area);
+        return;
+    }
+
+    // ── bloque exterior (título del panel) ──
+    let block = widgets::panel::panel_block(title, app.active_panel == PanelKind::Detail);
+    let body = block.inner(area);
+    frame.render_widget(block, area);
+
+    // ── split: input (3 filas) + resultados (resto) ──
+    let input_h = 3.min(body.height);
+    let input_area = Rect::new(body.x, body.y, body.width, input_h);
+    let results_area =
+        Rect::new(body.x, body.y + input_h, body.width, body.height.saturating_sub(input_h));
+
+    // ── input: prompt + buffer (placeholder según backend) ──
+    let state = app.query.query_input.as_ref();
+    let buffer = state.map_or("", |s| s.buffer.as_str());
+    let placeholder = if app.is_nosql {
+        "@coleccion { filtro JSON }"
+    } else {
+        "SELECT ... (dialecto del backend activo)"
+    };
+    let text = if buffer.is_empty() { placeholder } else { buffer };
+    let text_style = if buffer.is_empty() {
+        Style::default().fg(theme.dim)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("❯ ", Style::default().fg(theme.selection).add_modifier(Modifier::BOLD)),
+            Span::styled(text, text_style),
+        ])),
+        input_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "enter: ejecutar | ctrl+u: limpiar | ctrl+r: contar filas",
+            Style::default().fg(theme.dim),
+        ))),
+        Rect::new(body.x, body.y + 1, body.width, 1),
+    );
+    // separador sutil
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(usize::from(body.width.saturating_sub(1))),
+            Style::default().fg(theme.dim),
+        ))),
+        Rect::new(body.x, body.y + 2, body.width, 1),
+    );
+
+    // ── resultados: query_results o las líneas del preview ──
+    let results: &[String] = if app.query.query_results.is_empty() {
+        &app.data_view.preview_rows
+    } else {
+        &app.query.query_results
+    };
+    let scroll = app
+        .panels
+        .iter()
+        .find(|p| p.kind == PanelKind::Detail)
+        .map_or(0, |p| p.scroll_offset.get());
+    let max_visible = usize::from(results_area.height.saturating_sub(1));
+    let scroll = scroll.min(results.len().saturating_sub(max_visible));
+    let lines: Vec<Line<'_>> = results
+        .iter()
+        .skip(scroll)
+        .take(max_visible)
+        .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(theme.text))))
+        .collect();
+    #[allow(clippy::cast_possible_truncation)] // scroll < u16::MAX en terminales reales
+    let scroll_u16 = scroll as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll_u16, 0)), results_area);
+    // dibujar scrollbar vertical del área de resultados
+    widgets::panel::draw_v_scrollbar(frame, results_area, results.len(), scroll);
+}
+
 fn render_query_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};

@@ -58,7 +58,7 @@ pub enum AppAction {
     DetailTabNext,
     DetailTabData,
     DetailTabSchema,
-    DetailTabSql,
+    DetailTabQuery,
     DetailTabMeta,
     SourceTabNext,
     SourceTabPrev,
@@ -116,7 +116,7 @@ impl AppAction {
     pub const fn group(self) -> KeyGroup {
         use AppAction::{
             ClearQueryState, DetailTabData, DetailTabMeta, DetailTabNext, DetailTabPrev,
-            DetailTabSchema, DetailTabSql, Enter, ExportCsv, FavoriteCurrentDb, FocusAdvanced,
+            DetailTabQuery, DetailTabSchema, Enter, ExportCsv, FavoriteCurrentDb, FocusAdvanced,
             FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview, FocusSources,
             FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight, JumpToDetail,
             MoveDown, MoveUp, NextPage, ObjectSectionAdvanced, ObjectSectionTables,
@@ -139,7 +139,7 @@ impl AppAction {
             | DetailTabNext
             | DetailTabData
             | DetailTabSchema
-            | DetailTabSql
+            | DetailTabQuery
             | DetailTabMeta => KeyGroup::Tabs,
             RunCountQuery | ClearQueryState | ReloadRuntimeConfig | OpenQueryInput
             | HScrollLeft | HScrollRight => KeyGroup::Data,
@@ -152,7 +152,7 @@ impl AppAction {
     pub const fn description(self) -> &'static str {
         use AppAction::{
             ClearQueryState, DetailTabData, DetailTabMeta, DetailTabNext, DetailTabPrev,
-            DetailTabSchema, DetailTabSql, Enter, ExportCsv, FavoriteCurrentDb, FocusAdvanced,
+            DetailTabQuery, DetailTabSchema, Enter, ExportCsv, FavoriteCurrentDb, FocusAdvanced,
             FocusDetail, FocusNext, FocusObjects, FocusPrev, FocusPreview, FocusSources,
             FocusTables, FocusViews, ForgetSource, HScrollLeft, HScrollRight, JumpToDetail,
             MoveDown, MoveUp, NextPage, ObjectSectionAdvanced, ObjectSectionTables,
@@ -198,7 +198,7 @@ impl AppAction {
             DetailTabNext => "Pestaña Detalle siguiente",
             DetailTabData => "Pestaña Datos",
             DetailTabSchema => "Pestaña Esquema",
-            DetailTabSql => "Pestaña SQL",
+            DetailTabQuery => "Pestaña Query",
             DetailTabMeta => "Pestaña Meta",
             SourceTabNext => "Pestaña Fuentes siguiente",
             SourceTabPrev => "Pestaña Fuentes anterior",
@@ -453,7 +453,7 @@ fn action_from_name(name: &str) -> Option<AppAction> {
         "detail_tab_next" => Some(AppAction::DetailTabNext),
         "detail_tab_data" => Some(AppAction::DetailTabData),
         "detail_tab_schema" => Some(AppAction::DetailTabSchema),
-        "detail_tab_sql" => Some(AppAction::DetailTabSql),
+        "detail_tab_sql" => Some(AppAction::DetailTabQuery),
         "detail_tab_meta" => Some(AppAction::DetailTabMeta),
         "source_tab_next" => Some(AppAction::SourceTabNext),
         "source_tab_prev" => Some(AppAction::SourceTabPrev),

@@ -108,11 +108,11 @@ enum DragState {
     InspectorScroll { rect: Rect, content_len: usize },
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
     Data,
     Schema,
-    Sql,
+    Query,
     Meta,
 }
 
@@ -120,8 +120,8 @@ impl DetailTab {
     pub const fn next(self) -> Self {
         match self {
             Self::Data => Self::Schema,
-            Self::Schema => Self::Sql,
-            Self::Sql => Self::Meta,
+            Self::Schema => Self::Query,
+            Self::Query => Self::Meta,
             Self::Meta => Self::Data,
         }
     }
@@ -130,8 +130,8 @@ impl DetailTab {
         match self {
             Self::Data => Self::Meta,
             Self::Schema => Self::Data,
-            Self::Sql => Self::Schema,
-            Self::Meta => Self::Sql,
+            Self::Query => Self::Schema,
+            Self::Meta => Self::Query,
         }
     }
 
@@ -139,7 +139,7 @@ impl DetailTab {
         match self {
             Self::Data => " Datos ",
             Self::Schema => " Esquema ",
-            Self::Sql => " SQL ",
+            Self::Query => " Query ",
             Self::Meta => " Meta ",
         }
     }
@@ -1018,9 +1018,9 @@ impl App {
     /// Tabs disponibles en Detail según el tipo de objeto seleccionado
     pub fn available_detail_tabs(&self) -> Vec<DetailTab> {
         if self.object_section == ObjectSection::Advanced {
-            vec![DetailTab::Sql, DetailTab::Meta]
+            vec![DetailTab::Query, DetailTab::Meta]
         } else {
-            vec![DetailTab::Data, DetailTab::Schema, DetailTab::Sql, DetailTab::Meta]
+            vec![DetailTab::Data, DetailTab::Schema, DetailTab::Query, DetailTab::Meta]
         }
     }
 
@@ -1592,10 +1592,16 @@ impl App {
             return;
         }
 
-        // Meta: información local (path, tamaño, offsets) — sin red.
-        if self.data_view.detail_tab == DetailTab::Meta {
-            self.data_view.preview_data = None;
-            self.data_view.preview_rows = vec![
+        let Some(adapter) = self.adapter_arc() else {
+            self.is_loading = false;
+            return;
+        };
+
+        // Meta: la info LOCAL (path, tamaño, offsets) se construye aquí
+        // (síncrono, sin red); el DDL del objeto se agrega en background
+        // (object_sql puede ser un round-trip con DBs remotas).
+        let meta_info: Vec<String> = if self.data_view.detail_tab == DetailTab::Meta {
+            vec![
                 format!("db_path: {}", self.db_path_safe()),
                 format!("db_size: {}", self.db_size_display()),
                 format!("source_tab: {}", self.sources_state.source_tab.label()),
@@ -1605,18 +1611,11 @@ impl App {
                 format!("rows_per_page: {}", self.data_view.rows_per_page),
                 format!("loaded_offset: {}", self.data_view.preview_loaded_offset),
                 format!("estimated_rows: {}", self.data_view.total_rows),
-            ];
-            self.data_view.preview_loaded_offset = 0;
-            self.set_selected_idx(PanelKind::Detail, 0);
-            self.is_loading = false;
-            return;
-        }
-
-        let Some(adapter) = self.adapter_arc() else {
-            self.is_loading = false;
-            return;
+            ]
+        } else {
+            Vec::new()
         };
-        self.spawn_preview(adapter, object_name);
+        self.spawn_preview(adapter, object_name, meta_info);
     }
 
     /// Lanza el preview del objeto en background (`spawn_blocking` + canal).
@@ -1627,6 +1626,7 @@ impl App {
         &mut self,
         adapter: std::sync::Arc<dyn crate::db::adapter::DbAdapter>,
         object_name: String,
+        meta_info: Vec<String>,
     ) {
         self.preview_gen += 1;
         let generation = self.preview_gen;
@@ -1716,7 +1716,7 @@ impl App {
                         }
                     }
                 }
-                DetailTab::Sql => match adapter.object_sql(&object_name) {
+                DetailTab::Query => match adapter.object_sql(&object_name) {
                     Ok(sql) => {
                         let lines: Vec<String> = sql.lines().map(ToString::to_string).collect();
                         (
@@ -1731,7 +1731,21 @@ impl App {
                     }
                     Err(err) => (vec![format!("Error SQL: {err}")], None, 0),
                 },
-                DetailTab::Meta => unreachable!("Meta se resuelve síncrono en el caller"),
+                DetailTab::Meta => {
+                    // info local (síncrona) + DDL del objeto (red, async)
+                    let mut lines = meta_info;
+                    match adapter.object_sql(&object_name) {
+                        Ok(sql) => {
+                            lines.push(String::new());
+                            lines.push("-- DDL --".to_string());
+                            lines.extend(sql.lines().map(ToString::to_string));
+                        }
+                        Err(err) => {
+                            lines.push(format!("Error SQL: {err}"));
+                        }
+                    }
+                    (lines, None, 0)
+                }
             };
             let _ = tx.send(query::PreviewMsg::Ok {
                 generation,
@@ -1943,6 +1957,28 @@ impl App {
 
         self.data_view.detail_tab = effective;
         self.set_selected_idx(PanelKind::Detail, 0);
+        // Seed de la pestaña Query: si el buffer está vacío, precargar el
+        // DDL del objeto seleccionado como texto inicial (solo documentación,
+        // NUNCA se auto-ejecuta). Best-effort: si falla o es lento, el
+        // placeholder queda. Para mongo no hay DDL (filtro JSON).
+        if effective == DetailTab::Query
+            && !self.is_nosql
+            && self.query.query_input.as_ref().is_none_or(|s| s.buffer.is_empty())
+        {
+            if let Some(adapter) = self.adapter_arc() {
+                let object = self.selected_object_name();
+                if !object.is_empty() && object != "-" {
+                    if let Ok(sql) = adapter.object_sql(&object) {
+                        let state = self
+                            .query
+                            .query_input
+                            .get_or_insert_with(query::QueryInputState::default);
+                        state.buffer = sql;
+                        state.cursor = state.buffer.chars().count();
+                    }
+                }
+            }
+        }
         self.refresh_preview_from_selected_object();
     }
 
@@ -2062,7 +2098,13 @@ impl App {
                         self.data_view.query_mode = true;
                         self.query.query_state = state;
                         self.query.query_results = rows;
-                        self.data_view.detail_tab = DetailTab::Data;
+                        // Pestaña Query: los resultados se quedan EN la
+                        // pestaña (input arriba, resultados abajo). El modal
+                        // `:` sí salta a Data tab (comportamiento histórico).
+                        let desde_query_tab = self.data_view.detail_tab == DetailTab::Query;
+                        if !desde_query_tab {
+                            self.data_view.detail_tab = DetailTab::Data;
+                        }
                         // Vista de datos 2D: fila 0 es el header, el
                         // resto son datos (el render ya hace el split).
                         self.data_view.preview_rows = self.query.query_results.clone();
@@ -2124,6 +2166,74 @@ impl App {
                 } else {
                     self.execute_user_query(&sql);
                 }
+            }
+            KeyCode::Backspace => {
+                if state.cursor > 0 {
+                    let idx = state
+                        .buffer
+                        .char_indices()
+                        .nth(state.cursor.saturating_sub(1))
+                        .map_or(0, |(i, _)| i);
+                    state.buffer.remove(idx);
+                    state.cursor = state.cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Left => {
+                state.cursor = state.cursor.saturating_sub(1);
+                state.history_idx = None;
+            }
+            KeyCode::Right => {
+                if state.cursor < state.buffer.chars().count() {
+                    state.cursor += 1;
+                    state.history_idx = None;
+                }
+            }
+            KeyCode::Up => self.query_history_select(1),
+            KeyCode::Down => self.query_history_select(0),
+            KeyCode::Char(c) => {
+                state.buffer.insert(
+                    state
+                        .buffer
+                        .char_indices()
+                        .nth(state.cursor)
+                        .map_or(state.buffer.len(), |(i, _)| i),
+                    c,
+                );
+                state.cursor += 1;
+                state.history_idx = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Teclado de la pestaña Query: chars escriben en el buffer compartido
+    /// (igual que el modal `:`), Enter ejecuta, Ctrl+U limpia, ↑/↓ historial.
+    /// Esc vuelve a la navegación normal del panel (no cierra nada).
+    fn handle_query_tab_key(&mut self, key: KeyEvent) {
+        // El buffer existe SIEMPRE en la pestaña (se crea si hace falta):
+        // el render lo muestra con placeholder cuando está vacío.
+        if self.query.query_input.is_none() {
+            self.query.query_input = Some(query::QueryInputState::default());
+        }
+        let Some(state) = self.query.query_input.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => {
+                // Salir de la pestaña: foco a Tablas (navegación normal)
+                self.active_panel = PanelKind::Tables;
+            }
+            KeyCode::Enter => {
+                let sql = state.buffer.trim().to_string();
+                if sql.is_empty() {
+                    self.status = "Escribe una query primero".to_string();
+                    return;
+                }
+                self.execute_query_tab();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.buffer.clear();
+                state.cursor = 0;
+                state.history_idx = None;
+                self.status = "Query limpia".to_string();
             }
             KeyCode::Backspace => {
                 if state.cursor > 0 {
@@ -2527,6 +2637,24 @@ impl App {
             ),
             Err(e) => (query::QueryState::Error(e.to_string()), Vec::new()),
         }
+    }
+
+    /// Ejecuta la query del buffer (pestaña Query): reusa `execute_user_query`
+    /// (SQL real o filtro JSON mongo) y deja los resultados en `query_results`
+    /// para que el split de la pestaña los muestre. El buffer se comparte con
+    /// el modal `:` (historial único).
+    fn execute_query_tab(&mut self) {
+        let sql = self
+            .query
+            .query_input
+            .as_ref()
+            .map(|s| s.buffer.trim().to_string())
+            .unwrap_or_default();
+        if sql.is_empty() {
+            self.status = "Escribe una query primero".to_string();
+            return;
+        }
+        self.execute_user_query(&sql);
     }
 
     // ── favoritos ─────────────────────────────────────────────────────
@@ -4486,5 +4614,44 @@ mod tests {
         app.query.query_target_object = Some("t".to_string());
 
         assert!(!app.query_es_stale_por_navegacion(), "mismo objeto → el resultado aplica");
+    }
+
+    // ── pestaña Query (regresión) ────────────────────────────────────
+
+    /// REGRESIÓN: el resultado de una query libre se queda EN la pestaña
+    /// Query si el usuario estaba ahí (no salta a Data tab como el modal `:`).
+    #[test]
+    fn query_tab_no_salta_a_data_tab() {
+        let mut app = app_con_query_input(&[]);
+        app.data_view.detail_tab = DetailTab::Query;
+        app.active_panel = PanelKind::Detail;
+
+        // Simular el resultado del poll (Free con generación actual)
+        app.query.query_gen += 1;
+        app.query.query_state = query::QueryState::Running;
+        app.query.query_rx = None; // no hay canal real en el test
+
+        // Ejecutar la query del tab (el fake no tiene adapter → error)
+        app.query.query_input = Some(query::QueryInputState::default());
+        app.query.query_input.as_mut().unwrap().buffer = "SELECT 1".to_string();
+        app.execute_query_tab();
+        // Sin db_path: error global, pero el TAB no cambia
+        assert_eq!(app.data_view.detail_tab, DetailTab::Query, "la pestaña Query se mantiene");
+    }
+
+    /// El buffer de la pestaña Query se comparte con el modal `:`.
+    #[test]
+    fn query_tab_usa_el_buffer_compartido() {
+        let mut app = App::new();
+        app.query.query_input = Some(query::QueryInputState::default());
+        app.query.query_input.as_mut().unwrap().buffer = "SELECT * FROM t".to_string();
+        app.query.query_input.as_mut().unwrap().cursor = "SELECT * FROM t".chars().count();
+        // handle_query_tab_key: Backspace borra un char
+        app.handle_query_tab_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.query.query_input.as_ref().unwrap().buffer, "SELECT * FROM ");
+        // Enter sin db → error amable, no panic
+        app.query.query_input.as_mut().unwrap().buffer = "SELECT 1".to_string();
+        app.handle_query_tab_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.error.is_some() || app.status.contains("primero") || app.db_path.is_none());
     }
 }

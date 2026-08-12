@@ -631,7 +631,7 @@ fn render_expanded(
     scroll
 }
 
-fn panel_block(title: &str, focused: bool) -> Block<'_> {
+pub fn panel_block(title: &str, focused: bool) -> Block<'_> {
     let border_style = if focused {
         Style::default().fg(THEME.selection)
     } else {
@@ -691,7 +691,7 @@ pub fn draw_v_scrollbar(frame: &mut Frame<'_>, area: Rect, content_len: usize, o
 }
 
 /// Área utilizable (sin bordes) para iterar items.
-const fn inner_area_for_iteration(area: Rect) -> Rect {
+pub const fn inner_area_for_iteration(area: Rect) -> Rect {
     Rect {
         x: area.x + 1,
         y: area.y + 1,
