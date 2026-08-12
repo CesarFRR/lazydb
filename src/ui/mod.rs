@@ -105,17 +105,17 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // Input SQL (modal `:` — buffer con cursor + historial estilo fish)
-    if app.query_input.is_some() {
+    if app.query.query_input.is_some() {
         render_query_input(frame, area, app);
     }
 
     // Prompt de contraseña (servidor detectado)
-    if app.password_prompt.is_some() {
+    if app.connection.password_prompt.is_some() {
         render_password_prompt(frame, area, app);
     }
 
     // Pick de base de datos (servidor detectado: SHOW DATABASES)
-    if app.db_picker.is_some() {
+    if app.connection.db_picker.is_some() {
         render_db_picker(frame, area, app);
     }
 
@@ -154,19 +154,19 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
     }
 
     // Tabla de datos con columnas reales para Detail + Data tab
-    let new_scroll = if kind == PanelKind::Detail && app.detail_tab == DetailTab::Data {
+    let new_scroll = if kind == PanelKind::Detail && app.data_view.detail_tab == DetailTab::Data {
         widgets::panel::render_data_table(
             frame,
             area,
             &title,
-            app.preview_data.as_ref(),
+            app.data_view.preview_data.as_ref(),
             items,
             panel.selected_idx,
             panel.scroll_offset.get(),
             panel.h_scroll.get(),
             focused,
-            app.sort_column.as_deref(),
-            app.sort_asc,
+            app.data_view.sort_column.as_deref(),
+            app.data_view.sort_asc,
         )
     } else {
         widgets::panel::render(
@@ -193,7 +193,7 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Feedback inmediato: spinner mientras corre una query O una conexión
     // (Capa A: antes `is_loading` solo cambiaba el texto, sin animación).
-    let status = if app.is_loading || app.query_state == QueryState::Running {
+    let status = if app.is_loading || app.query.query_state == QueryState::Running {
         let spin = SPINNER[app.frame % SPINNER.len()];
         format!("{spin} {}", app.status)
     } else {
@@ -257,7 +257,7 @@ fn render_password_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-    let Some(state) = &app.password_prompt else { return };
+    let Some(state) = &app.connection.password_prompt else { return };
     let theme = &crate::ui::theme::THEME;
 
     let width = area.width.saturating_mul(70) / 100;
@@ -302,7 +302,7 @@ fn render_password_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_db_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState};
 
-    let Some(state) = &app.db_picker else { return };
+    let Some(state) = &app.connection.db_picker else { return };
     let theme = &crate::ui::theme::THEME;
 
     let width = area.width.min(52);
@@ -387,7 +387,7 @@ fn render_query_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-    let Some(state) = &app.query_input else { return };
+    let Some(state) = &app.query.query_input else { return };
     let theme = &crate::ui::theme::THEME;
 
     // Tamaño del modal: ancho 70%, alto = borde + input + hasta 8 historial + footer
@@ -500,14 +500,14 @@ mod tests {
         let mut app = App::new();
         // Data tab con MUCHAS columnas → h_scroll activo (thumb dibujado).
         // El resize a un frame pequeño hace que el rect del panel sobresalga.
-        app.detail_tab = DetailTab::Data;
+        app.data_view.detail_tab = DetailTab::Data;
         app.tables = vec!["t".to_string()];
         let headers: Vec<String> = (0..30).map(|i| format!("col_{i}")).collect();
         let mut rows = vec![headers.join(" | ")];
         rows.extend(
             (0..50).map(|i| (0..30).map(|c| format!("v{i}_{c}")).collect::<Vec<_>>().join(" | ")),
         );
-        app.preview_rows = rows;
+        app.data_view.preview_rows = rows;
 
         // Layout grande → frame pequeño (resize race)
         app.compute_layout(150, 40);

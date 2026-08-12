@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::Rect;
@@ -7,6 +7,17 @@ use crate::app::panel::{Panel, PanelKind};
 use crate::ui::layout::{self, ComputedLayout};
 use crate::ui::widgets::panel::MIN_COL_W;
 use crate::{config, db, keys, query, storage};
+// ── módulo del panel Fuentes (SourceList builder + helpers + probes) ──
+#[cfg(any(feature = "mysql", feature = "postgres", feature = "mongodb"))]
+use super::sources::server_url_has_database;
+#[cfg(any(feature = "mysql", feature = "postgres"))]
+use super::sources::strip_url_credentials;
+use super::sources::{
+    inject_credentials, is_remote_url, is_source_section, scan_cwd_databases, source_path_of,
+    strip_source_marks,
+};
+// Re-export para la UI (Fase 1: la UI aún importa desde controller).
+pub use super::sources::{SOURCE_SECTION_MARK, source_summary};
 
 const LARGE_WIDTH: u16 = 120;
 const KB_BYTES: u64 = 1024;
@@ -210,459 +221,6 @@ fn now_millis() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Clasificación tipada de una fuente, reemplaza la heurística de strings
-/// (`is_online_source`), que confundía `sqlite://` con online y ocultaba las
-/// URLs de localhost del tab Local.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SourceKind {
-    /// Archivo local: `.db`, `.sqlite`, `.duckdb` o URL `sqlite://`.
-    File,
-    /// Servicio en la propia máquina: `mysql://localhost/...`, `[::1]`, etc.
-    Localhost,
-    /// Servicio remoto: `http(s)://`, `ssh://` o DB URL con host no local.
-    Online,
-}
-
-fn source_kind(value: &str) -> SourceKind {
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("ssh://")
-    {
-        return SourceKind::Online;
-    }
-    if lower.starts_with("mysql://")
-        || lower.starts_with("postgres://")
-        || lower.starts_with("postgresql://")
-        || lower.starts_with("mongodb://")
-    {
-        let host = url_host(&lower);
-        let is_local =
-            host.is_none_or(|h| h == "localhost" || h == "127.0.0.1" || h == "[::1]" || h == "::1");
-        return if is_local { SourceKind::Localhost } else { SourceKind::Online };
-    }
-    // `sqlite://`, rutas relativas/absolutas y todo lo demás: archivo local
-    SourceKind::File
-}
-
-/// Host de una URL de conexión: `mysql://user:pass@127.0.0.1:3306/db` →
-/// `127.0.0.1`. Tolera IPv6 entre corchetes (`[::1]`).
-fn url_host(url: &str) -> Option<&str> {
-    let rest = url.split("://").nth(1)?;
-    let before_slash = rest.split('/').next()?;
-    let host_port = before_slash.rsplit('@').next()?;
-    host_port.find(']').map_or_else(
-        || Some(host_port.split(':').next().unwrap_or(host_port)),
-        |bracket_end| Some(&host_port[..=bracket_end]),
-    )
-}
-
-/// Host y puerto de una URL de conexión: `mysql://user:pass@db:3306/x` →
-/// `("db", 3306)`. Puertos por defecto: `MySQL` 3306, `PostgreSQL` 5432,
-/// `http` 80, `https` 443. Tolera IPv6 entre corchetes.
-fn source_host_port(url: &str) -> Option<(String, u16)> {
-    let lower = url.to_ascii_lowercase();
-    let default_port = if lower.starts_with("mysql://") {
-        3306
-    } else if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-        5432
-    } else if lower.starts_with("mongodb://") {
-        27017
-    } else if lower.starts_with("http://") {
-        80
-    } else if lower.starts_with("https://") {
-        443
-    } else {
-        return None;
-    };
-
-    let rest = url.split("://").nth(1)?;
-    let before_slash = rest.split('/').next()?;
-    let host_port = before_slash.rsplit('@').next()?;
-
-    let (host, port) = host_port.rfind(':').map_or((host_port, default_port), |colon| {
-        // "host:no-numérico" → puerto por defecto
-        host_port[colon + 1..]
-            .parse::<u16>()
-            .map_or((host_port, default_port), |p| (&host_port[..colon], p))
-    });
-    Some((host.trim_matches(['[', ']']).to_string(), port))
-}
-
-/// Máximo de probes de salud en paralelo. `probe_source` hace DNS + TCP
-/// síncrono (hasta 2s por fuente); con el runtime por defecto (workers =
-/// CPUs), un scroll rápido podía agotar los workers y frenar las queries.
-const PROBE_MAX_CONCURRENT: usize = 4;
-
-/// Probe de salud de una fuente (filosofía culling: se invoca solo sobre la
-/// fuente seleccionada, en segundo plano, y el resultado se cachea):
-/// - URLs (`mysql://`, `postgres://`, `http(s)://`…): conexión TCP al
-///   host:puerto con timeout de 2s (el servicio existe aunque luego falle la
-///   autenticación).
-/// - Archivos: comprobación de que existen y son legibles (no se abre la DB).
-fn probe_source(path: &str) -> bool {
-    match source_kind(path) {
-        SourceKind::File => {
-            let file = path
-                .strip_prefix("sqlite://")
-                .or_else(|| path.strip_prefix("duckdb://"))
-                .unwrap_or(path);
-            std::fs::metadata(file).is_ok_and(|meta| meta.is_file())
-        }
-        SourceKind::Localhost | SourceKind::Online => {
-            let Some((host, port)) = source_host_port(path) else {
-                return false;
-            };
-            // Hostname → resolución DNS bloqueante (aceptable: va en spawn_blocking)
-            let addr: Option<std::net::SocketAddr> = host
-                .parse::<std::net::IpAddr>()
-                .map(|ip| std::net::SocketAddr::new(ip, port))
-                .ok()
-                .or_else(|| {
-                    use std::net::ToSocketAddrs;
-                    (host.as_str(), port).to_socket_addrs().ok()?.next()
-                });
-            let Some(addr) = addr else { return false };
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
-        }
-    }
-}
-
-/// Marca de tipo de base de datos para el panel Fuentes (1 carácter).
-/// - `▣` `SQLite` (incluye URLs `sqlite://`) · `D` `DuckDB` · `M` `MySQL` ·
-///   `P` `PostgreSQL` · `⊙` endpoint genérico (`http`/`https`/`ssh`)
-fn db_type_mark(value: &str) -> char {
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-        'P'
-    } else if lower.starts_with("mysql://") {
-        'M'
-    } else if lower.starts_with("mongodb://") {
-        'N'
-    } else if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("ssh://")
-    {
-        '⊙'
-    } else {
-        let ext = std::path::Path::new(value).extension().and_then(|e| e.to_str()).unwrap_or("");
-        match ext.to_ascii_lowercase().as_str() {
-            "duckdb" | "ddb" => 'D',
-            "csv" => 'C',
-            "tsv" => 'T',
-            "parquet" | "pq" => 'P',
-            "json" | "jsonl" | "ndjson" => 'J',
-            "geojson" | "gpkg" => 'G',
-            _ => '▣',
-        }
-    }
-}
-
-// ── formato de items del panel Fuentes ─────────────────────────────────
-// Cada item es un string plano con marcas que el render colorea:
-//   sección:   "\u{1}LABEL"          (marcador interno, no visible)
-//   entry:     [● ][✗ ]<★|▣|D|M|P|N|⊙|C|T|J|G ><texto>
-//                     ● = conectada, ✗ = con problemas (sin marca = bien),
-//                     ★ = favorito, ▣ = sqlite, D = duckdb, M = mysql,
-//                     P = postgres, N = mongodb, ⊙ = endpoint genérico,
-//                     C = csv, T = tsv, J = json(jsonl), G = geojson/gpkg
-// Los favoritos van al inicio de la lista sin sección propia (la ★ basta).
-// Los favoritos usan "name => path"; el resto muestra el path directo.
-
-/// Marcador interno de sección (SOH): nunca se renderiza tal cual.
-pub const SOURCE_SECTION_MARK: char = '\u{1}';
-
-fn source_section(label: &str) -> String {
-    format!("{SOURCE_SECTION_MARK}{label}")
-}
-
-fn is_source_section(item: &str) -> bool {
-    item.starts_with(SOURCE_SECTION_MARK)
-}
-
-/// Quita las credenciales (`user:pass@`) de una URL y devuelve el user.
-/// Útil para el prompt de contraseña: no mostrar la password de nuevo y
-/// sugerir el user que la URL ya traía. Acepta `mysql://`, `postgres://` y
-/// `postgresql://` (el parámetro `scheme` cubre la variante canónica).
-#[cfg(any(feature = "mysql", feature = "postgres"))]
-fn strip_url_credentials(url: &str) -> (String, Option<String>) {
-    // Encuentra `scheme://` o `scheme+algo://` (p.ej. postgresql://)
-    let Some(at) = url.find("://") else {
-        return (url.to_string(), None);
-    };
-    let (scheme_part, rest) = url.split_at(at + 3);
-    let Some(at_mark) = rest.rfind('@') else {
-        return (url.to_string(), None);
-    };
-    let creds = &rest[..at_mark];
-    let host = &rest[at_mark + 1..];
-    let user = creds.split_once(':').map_or(Some(creds), |(u, _)| Some(u)).map(ToString::to_string);
-    (format!("{scheme_part}{host}"), user)
-}
-
-/// ¿La URL `mysql://`, `postgres://` o `mongodb://` incluye una base de datos
-/// explícita (`.../bd`)? Las URLs de `scan_local_servers` llegan sin BD: son
-/// servidores. Solo el flujo de servidores remotos (mysql/postgres/mongo) la usa.
-#[cfg(any(feature = "mysql", feature = "postgres", feature = "mongodb"))]
-fn server_url_has_database(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("mysql://")
-        .or_else(|| url.strip_prefix("postgres://"))
-        .or_else(|| url.strip_prefix("postgresql://"))
-        .or_else(|| url.strip_prefix("mongodb://"))
-        .unwrap_or_default();
-    // `host`, `host:puerto`, `user:pass@host:puerto` → sin `/` = sin BD.
-    // Con `/bd` → hay base.
-    rest.contains('/') && !rest.ends_with('/')
-}
-
-/// ¿Es una URL remota (`mysql://`, `postgres://`, `postgresql://`, `mongodb://`)?
-fn is_remote_url(url: &str) -> bool {
-    url.starts_with("mysql://")
-        || url.starts_with("postgres://")
-        || url.starts_with("postgresql://")
-        || url.starts_with("mongodb://")
-}
-
-/// Inserta `user:pass@` tras el scheme de la URL (para reconectar con las
-/// credenciales del keyring). Devuelve la URL con credenciales.
-fn inject_credentials(url: &str, scheme: &str, user: &str, pass: &str) -> String {
-    let prefix = format!("{scheme}://");
-    url.strip_prefix(&prefix)
-        .map_or_else(|| url.to_string(), |rest| format!("{prefix}{user}:{pass}@{rest}"))
-}
-
-/// Quita las marcas decorativas (● ★ ▣ ⊙, combinables: "● ★ x") de un item de
-/// Fuentes y devuelve el dato real (path o "name => path" para favoritos).
-fn strip_source_marks(mut item: &str) -> &str {
-    loop {
-        let mut stripped = false;
-        for mark in ["● ", "★ ", "✗ ", "▣ ", "D ", "M ", "P ", "N ", "⊙ ", "C ", "T ", "J ", "G "]
-        {
-            if let Some(rest) = item.strip_prefix(mark) {
-                item = rest;
-                stripped = true;
-            }
-        }
-        if !stripped {
-            return item;
-        }
-    }
-}
-
-/// Item "resumen" del panel Fuentes cuando NO está enfocado (filosofía lazy,
-/// como lazydocker muestra el contenedor seleccionado). Prioridad:
-/// 1. La DB conectada (item con `● `) — el dato más útil del panel.
-/// 2. La fuente bajo el cursor (si es un entry real).
-/// 3. El primer entry de la lista.
-///
-/// Devuelve como máximo 1 item; vacío si no hay nada que resumir. Nunca
-/// devuelve secciones (`\u{1}...`), placeholders ni acciones fijas.
-pub fn source_summary(items: &[String], selected_idx: usize) -> Vec<&str> {
-    let is_action = |s: &str| s == "Abrir sakila.db" || s == "Buscar archivo .db";
-
-    // 1. DB conectada
-    if let Some(connected) = items.iter().find(|s| s.starts_with("● ")) {
-        return vec![connected];
-    }
-    // 2. Fuente bajo el cursor
-    if let Some(sel) = items.get(selected_idx)
-        && !is_source_section(sel)
-        && *sel != "<sin entradas>"
-        && !is_action(sel)
-    {
-        return vec![sel];
-    }
-    // 3. Primer entry real de la lista
-    for item in items {
-        if !is_source_section(item) && *item != "<sin entradas>" && !is_action(item) {
-            return vec![item];
-        }
-    }
-    Vec::new()
-}
-
-/// Extrae el path real de un item de Fuentes (con o sin marcas).
-fn source_path_of(item: &str) -> &str {
-    let clean = strip_source_marks(item);
-    clean.split_once(" => ").map_or(clean, |(_, path)| path)
-}
-
-/// Filtro de visibilidad de una fuente según el tab activo.
-#[derive(Clone, Copy)]
-enum SourceFilter {
-    All,
-    Local,
-    Online,
-}
-
-impl SourceFilter {
-    fn passes(self, path: &str) -> bool {
-        match self {
-            Self::All => true,
-            // Local = archivos + servicios de localhost (mysql://localhost…)
-            Self::Local => matches!(source_kind(path), SourceKind::File | SourceKind::Localhost),
-            Self::Online => source_kind(path) == SourceKind::Online,
-        }
-    }
-}
-
-/// Construye la lista del panel Fuentes por secciones: FAVORITOS, RECIENTES
-/// y ARCHIVOS (./), con marcas de tipo, de salud y de DB conectada.
-struct SourceList<'a> {
-    state: &'a storage::AppState,
-    connected: Option<&'a str>,
-    health: &'a HashMap<String, bool>,
-    out: Vec<String>,
-    seen: HashSet<String>,
-    sections: HashSet<String>,
-}
-
-impl SourceList<'_> {
-    fn section(&mut self, label: &str) {
-        if self.sections.insert(label.to_string()) {
-            self.out.push(source_section(label));
-        }
-    }
-
-    fn entry(&mut self, path: &str, display: Option<&str>) {
-        // Choke point de normalización: los favoritos/recientes guardados por
-        // versiones antiguas pueden estar en relativo; aquí todos se comparan
-        // y muestran en canónico (absoluto), para que el `seen` deduplique y
-        // la marca ● coincida con `connected`.
-        let path = crate::paths::normalize_path(path);
-        if !self.seen.insert(path.clone()) {
-            return;
-        }
-        let is_fav = self.state.favorites.values().any(|v| v == &path);
-        let prefix = if is_fav { "★ ".to_string() } else { format!("{} ", db_type_mark(&path)) };
-        // Solo se marca el error: sin marca = la fuente está bien (no hay ✓).
-        let health_mark = if self.health.get(&path) == Some(&false) { "✗ " } else { "" };
-        let mark = format!(
-            "{}{}",
-            if self.connected == Some(path.as_str()) { "● " } else { "" },
-            health_mark
-        );
-        match display {
-            Some(name) => self.out.push(format!(
-                "{mark}{prefix}{name} => {}",
-                crate::security::strip_credentials(&path)
-            )),
-            None => self
-                .out
-                .push(format!("{mark}{prefix}{}", crate::security::strip_credentials(&path))),
-        }
-    }
-
-    fn add_favs(&mut self, filter: SourceFilter) {
-        let mut favs: Vec<(String, String)> = self
-            .state
-            .favorites
-            .iter()
-            .filter(|(_, p)| filter.passes(p))
-            .map(|(n, p)| (n.clone(), p.clone()))
-            .collect();
-        favs.sort_by(|a, b| a.0.cmp(&b.0));
-        // Sin sección propia: la ★ ya identifica al favorito; van primero.
-        for (name, path) in &favs {
-            self.entry(path, Some(name));
-        }
-    }
-
-    fn add_recents(&mut self, filter: SourceFilter) {
-        let is_fav = |path: &str| self.state.favorites.values().any(|v| v == path);
-        let recents: Vec<String> =
-            self.state.recents.iter().filter(|p| filter.passes(p) && !is_fav(p)).cloned().collect();
-        if recents.is_empty() {
-            return;
-        }
-        self.section("RECIENTES");
-        for recent in &recents {
-            self.entry(recent, None);
-        }
-    }
-
-    fn add_detected(&mut self, detected_servers: &[String], cwd_databases: &[String]) {
-        // Servidores SQL locales detectados por puerto (escaneo cacheable)
-        if !detected_servers.is_empty() {
-            self.section("SERVIDORES LOCALES");
-            for server in detected_servers {
-                if !self.seen.contains(server) {
-                    self.entry(server, None);
-                }
-            }
-        }
-
-        // DBs SQLite de la carpeta actual (donde se ejecuta lazydb). El
-        // escaneo se cachea en `App::new` (I/O de filesystem bloqueante).
-        let fresh: Vec<String> =
-            cwd_databases.iter().filter(|p| !self.seen.contains(*p)).cloned().collect();
-        if fresh.is_empty() {
-            return;
-        }
-        self.section("ARCHIVOS (./)");
-        for db in &fresh {
-            self.entry(db, None);
-        }
-    }
-
-    fn finish(mut self, source_tab: SourceTab) -> Vec<String> {
-        if self.out.is_empty() {
-            self.out.push("<sin entradas>".to_string());
-        }
-        // Acciones fijas: solo tienen sentido junto a fuentes locales
-        if matches!(source_tab, SourceTab::All | SourceTab::Local) {
-            self.out.push("Buscar archivo .db".to_string());
-            self.out.push("Abrir sakila.db".to_string());
-        }
-        self.out
-    }
-}
-
-/// Escanea el directorio de trabajo actual (donde se ejecuta `cargo run` /
-/// lazydb) buscando archivos de base de datos locales: `*.db`, `*.sqlite`,
-/// `*.sqlite3` (`SQLite`), `*.duckdb`, `*.ddb` (`DuckDB`) y archivos de datos
-/// (`*.csv`, `*.tsv`, `*.parquet`, `*.json`, `*.jsonl`, `*.geojson`,
-/// `*.gpkg`). Devuelve los paths completos ordenados alfabéticamente.
-fn scan_cwd_databases() -> Vec<String> {
-    let Ok(cwd) = std::env::current_dir() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&cwd) else {
-        return Vec::new();
-    };
-    let mut dbs: Vec<String> = entries
-        .flatten()
-        .filter(|e| {
-            let path = e.path();
-            path.is_file()
-                && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-                    matches!(
-                        ext.to_ascii_lowercase().as_str(),
-                        "db" | "sqlite"
-                            | "sqlite3"
-                            | "duckdb"
-                            | "ddb"
-                            | "csv"
-                            | "tsv"
-                            | "parquet"
-                            | "pq"
-                            | "json"
-                            | "jsonl"
-                            | "ndjson"
-                            | "geojson"
-                            | "gpkg"
-                    )
-                })
-        })
-        .filter_map(|e| e.path().to_str().map(str::to_string))
-        .collect();
-    dbs.sort();
-    dbs
-}
-
-// ---------------------------------------------------------------------------
-// App (estado global)
-// ---------------------------------------------------------------------------
-
 /// Contenido del popup de error global (modal rojo encima de todo).
 #[derive(Clone, Debug)]
 pub struct ErrorPopup {
@@ -673,15 +231,6 @@ pub struct ErrorPopup {
 /// Estado del popup de input SQL (`:`): buffer, cursor y navegación del
 /// historial (↑/↓ estilo fish).
 #[derive(Clone, Debug, Default)]
-pub struct QueryInputState {
-    pub buffer: String,
-    /// Posición del cursor dentro de `buffer` (índice de char)
-    pub cursor: usize,
-    /// `Some(i)` = navegando el historial (la entrada i rellena el buffer);
-    /// `None` = escribiendo una query nueva.
-    pub history_idx: Option<usize>,
-}
-
 /// Pick de base de datos de un servidor MySQL/MariaDB detectado: lista de
 /// esquemas (`SHOW DATABASES`) a elegir con ↑/↓ + Enter.
 pub struct DbPickerState {
@@ -779,27 +328,14 @@ pub struct App {
     pub layout: ComputedLayout,
 
     // ── datos de los paneles ──
-    pub sources: Vec<String>,
-    /// Servidores SQL locales detectados por puerto (cacheados en `new`:
-    /// el escaneo es bloqueante y no debe repetirse en cada render). Cada
-    /// entrada es una URL sin credenciales, p. ej. `mysql://127.0.0.1:3306`.
-    pub detected_servers: Vec<String>,
-    /// DBs de archivo del cwd (escaneadas UNA vez en `new`, igual que
-    /// `detected_servers`): `build_sources` corre dentro del frame loop
-    /// (`poll_probe_results`) y un `read_dir` + `stat` por frame hacía el
-    /// panel de Fuentes notablemente lento.
-    pub cwd_databases: Vec<String>,
-    pub source_tab: SourceTab,
+    /// Estado COMPLETO del panel Fuentes (Fase 1b): lista, tab, salud de
+    /// probes y canales viven en `sources.rs`; App solo delega.
+    pub sources_state: super::sources::SourcesState,
     pub tables: Vec<String>,
     pub views: Vec<String>,
     pub advanced: Vec<String>,
-    pub preview_rows: Vec<String>,
-    /// Celdas TIPADAS del Data tab (última página cargada): la fuente de
-    /// verdad para el render 2D. `None` cuando la vista actual no es una
-    /// tabla (mensajes, SQL, schema). El render usa `preview_rows` solo
-    /// como fallback (List de 1 columna / mensajes).
-    pub preview_data: Option<crate::db::TableData>,
-    pub detail_tab: DetailTab,
+    /// Estado del Data view (Fase 3): preview, tabs, paginación y orden.
+    pub data_view: super::data_view::DataViewState,
 
     // ── estado persistente ──
     pub should_quit: bool,
@@ -818,54 +354,10 @@ pub struct App {
     /// (`row` → `doc`) y muestra el toggle JSON del modal.
     pub is_nosql: bool,
     pub status: String,
-    pub current_page: u32,
-    pub rows_per_page: u32,
-    pub total_rows: u32,
-    /// Índice 0-based en el dataset de `preview_rows[1]` (primera fila de datos)
-    pub preview_loaded_offset: u32,
-    pub query_state: query::QueryState,
-    pub query_results: Vec<String>,
+    /// Estado del query runner (Fase 4): canales, generación e input del
+    /// modal `:` viven en query.rs.
+    pub query: query::QueryRunner,
     pub state: storage::AppState,
-
-    // ── probe de salud de fuentes (filosofía culling) ──
-    /// Último estado de salud conocido por fuente (path → accesible). Solo
-    /// se prueban las fuentes que el usuario selecciona (click o flechas),
-    /// nunca toda la lista ni por tiempo.
-    pub health: HashMap<String, bool>,
-    /// Índice de Sources probeado por última vez: el tick detecta cambios de
-    /// selección por CUALQUIER vía (flechas, click, drag, foco) comparando
-    /// este valor, porque la navegación escribe `selected_idx` directo.
-    last_probed_idx: usize,
-    /// Paths con probe en vuelo (evita lanzar dos probes seguidos en paralelo).
-    probing: HashSet<String>,
-    /// Semáforo global de probes: máx `PROBE_MAX_CONCURRENT` en paralelo.
-    /// `probe_source` hace DNS + TCP síncrono (hasta 2s); sin tope, un
-    /// scroll rápido que revela 15 fuentes lanza 15 tareas bloqueantes a la
-    /// vez y satura los workers del runtime.
-    probe_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
-    /// Canal de resultados de probes en segundo plano (tx/rx).
-    probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
-    probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
-
-    // ── query runner (COUNT(*) real, cancelable) ──
-    /// Generación de la última query lanzada: los resultados que llegan con
-    /// una generación vieja se descartan (stale data). Se incrementa al
-    /// lanzar una query nueva, al limpiar o al desconectar: cancela de
-    /// facto cualquier tarea en vuelo.
-    query_gen: u64,
-    /// Objeto (tabla/vista) activo cuando se lanzó la última query: si el
-    /// usuario navega a OTRO objeto mientras la query corre, el resultado
-    /// se descarta aunque la generación coincida (el COUNT de la tabla A no
-    /// debe pisar el status mirando la tabla B).
-    query_target_object: Option<String>,
-    /// `JoinHandle` de la última query/count en vuelo: permite `abort()` real
-    /// al desconectar o limpiar. Sin esto, la tarea seguía viva hasta
-    /// terminar (la "cancelación" por generación solo ignoraba el resultado)
-    /// sujetando una conexión del pool mientras tanto.
-    query_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Canal de resultados del query runner: generación + SQL + resultado.
-    query_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::QueryMsg>>,
-    query_tx: Option<tokio::sync::mpsc::UnboundedSender<query::QueryMsg>>,
 
     // ── conexión async (Ronda 2: la UI nunca se congela en round-trips) ──
     /// Generación de la última conexión lanzada: descarta resultados stale
@@ -874,6 +366,13 @@ pub struct App {
     /// Resultado de la conexión en vuelo (adapter + catálogo + preview).
     connection_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::ConnectionMsg>>,
     connection_tx: Option<tokio::sync::mpsc::UnboundedSender<query::ConnectionMsg>>,
+
+    // ── preview async (navegación de objetos sin congelar la UI) ──
+    /// Generación del último preview lanzado: descarta resultados stale
+    /// (el usuario navegó a otro objeto/tab mientras cargaba).
+    preview_gen: u64,
+    preview_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::PreviewMsg>>,
+    preview_tx: Option<tokio::sync::mpsc::UnboundedSender<query::PreviewMsg>>,
     /// Contador de frames para el spinner del status bar.
     pub frame: usize,
     pub keymap: keys::Keymap,
@@ -893,20 +392,9 @@ pub struct App {
     /// Popup de error global (modal rojo que se cierra con Enter/Esc/q).
     /// Cualquier error de ejecución/IO lo dispara vía `show_error`.
     pub error: Option<ErrorPopup>,
-    /// Popup de input SQL (`:`): `Some` = abierto. El historial persistente
-    /// vive en `state.query_history` (storage).
-    pub query_input: Option<QueryInputState>,
-    /// Pick de base de datos de un servidor detectado (modal ↑/↓ + Enter):
-    /// `Some` = eligiendo esquema al que conectarse.
-    pub db_picker: Option<DbPickerState>,
-    /// Prompt de contraseña de un servidor detectado (modal de entrada).
-    pub password_prompt: Option<PasswordPromptState>,
-    /// Formulario de nueva conexión (panel Detail sin db abierta). `None` =
-    /// el usuario ya está conectado o no se ha abierto el formulario.
-    pub connection_form: Option<ConnectionFormState>,
-    /// El preview muestra el resultado de una query libre del usuario (no el
-    /// objeto seleccionado). Los scrolls infinitos y refreshes lo respetan.
-    pub query_mode: bool,
+    /// Estado de la UI de conexión (Fase 2): formulario, prompt de
+    /// contraseña y picker de bases viven en connection.rs.
+    pub connection: super::connection::ConnectionState,
     /// Doble-click: timestamp del último click (ms) y panel clickeado
     pub last_click_time: u64,
     pub last_click_kind: Option<PanelKind>,
@@ -919,10 +407,6 @@ pub struct App {
     pub input_mode: InputMode,
     pub filter_query: String,
     pub filtered_items: Vec<String>,
-
-    // ── ordenamiento de columnas en Data tab ──
-    pub sort_column: Option<String>,
-    pub sort_asc: bool,
 
     // ── arrastre de barras de scroll (click + drag con mouse) ──
     drag: Option<DragState>,
@@ -944,10 +428,10 @@ impl App {
         let state = storage::AppState::load();
         let keymap = keys::Keymap::load();
         let ui_config = config::Config::load().ui;
-        let source_tab = SourceTab::All;
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
         let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
         let (connection_tx, connection_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Detección de servidores SQL locales: bloqueante (E/S de red), por
         // eso se cachea UNA vez en el arranque. Timeout corto por puerto.
@@ -972,45 +456,38 @@ impl App {
             Panel::new(PanelKind::Detail),
         ];
 
+        let mut sources_state = super::sources::SourcesState::new(
+            detected_servers,
+            cwd_databases,
+            Some(probe_tx),
+            Some(probe_rx),
+        );
+        sources_state.sources = Self::build_sources(
+            &state,
+            sources_state.source_tab,
+            None,
+            &sources_state.health,
+            &sources_state.detected_servers,
+            &sources_state.cwd_databases,
+        );
         let mut app = Self {
             panels,
             active_panel: PanelKind::Sources,
             last_sidebar_focus: PanelKind::Sources,
             layout: ComputedLayout::default(),
-            sources: Self::build_sources(
-                &state,
-                source_tab,
-                None,
-                &HashMap::new(),
-                &detected_servers,
-                &cwd_databases,
-            ),
-            source_tab,
-            detected_servers,
-            cwd_databases,
-            health: HashMap::new(),
-            probing: HashSet::new(),
-            probe_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_MAX_CONCURRENT)),
-            probe_rx: Some(probe_rx),
-            probe_tx: Some(probe_tx),
-            query_gen: 0,
-            query_target_object: None,
-            query_handle: None,
-            query_rx: Some(query_rx),
-            query_tx: Some(query_tx),
+            sources_state,
+            query: query::QueryRunner::new(query_rx, query_tx),
             connection_gen: 0,
             connection_rx: Some(connection_rx),
             connection_tx: Some(connection_tx),
+            preview_gen: 0,
+            preview_rx: Some(preview_rx),
+            preview_tx: Some(preview_tx),
             frame: 0,
-            // usize::MAX: el primer frame detecta la selección inicial (item 0)
-            // y la comprueba al arrancar.
-            last_probed_idx: usize::MAX,
             tables: vec![],
             views: vec![],
             advanced: vec![],
-            preview_rows: Vec::new(), // se rellena abajo (necesita self listo)
-            preview_data: None,
-            detail_tab: DetailTab::Data,
+            data_view: super::data_view::DataViewState::new(),
             should_quit: false,
             is_loading: false,
             refresh_count: 0,
@@ -1019,12 +496,6 @@ impl App {
             db_size_bytes: None,
             is_nosql: false,
             status: "Sin conexion".to_string(),
-            current_page: 0,
-            rows_per_page: ui_config.rows_per_page,
-            total_rows: 0,
-            preview_loaded_offset: 0,
-            query_state: query::QueryState::Idle,
-            query_results: Vec::new(),
             state,
             keymap,
             show_actions_menu: false,
@@ -1037,11 +508,7 @@ impl App {
             show_help: false,
             help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             error: None,
-            query_input: None,
-            db_picker: None,
-            password_prompt: None,
-            connection_form: Some(ConnectionFormState::default()),
-            query_mode: false,
+            connection: super::connection::ConnectionState::new(),
             last_click_time: 0,
             last_click_kind: None,
             last_click_idx: 0,
@@ -1049,10 +516,9 @@ impl App {
             input_mode: InputMode::Normal,
             filter_query: String::new(),
             filtered_items: Vec::new(),
-            sort_column: None,
-            sort_asc: true,
             drag: None,
         };
+        app.data_view.rows_per_page = ui_config.rows_per_page;
         // El panel Detail arranca con el formulario de nueva conexión
         // (sin db abierta): auto-detecta el tipo desde la URL/ruta.
         app.status = "Nueva conexión: escribe la URL o ruta y Enter conecta".to_string();
@@ -1082,6 +548,8 @@ impl App {
         self.poll_query_results();
         // Conexiones async terminadas (adapter + catálogo + preview).
         self.poll_connection_results();
+        // Previews de navegación async terminados (filas/schema/DDL).
+        self.poll_preview_results();
     }
 
     // ── helpers de paneles ────────────────────────────────────────────
@@ -1114,84 +582,10 @@ impl App {
 
     /// Extrae el path probar de una fila del panel de Fuentes. `None` si la
     /// fila no es una fuente (sección, placeholder o acción fija).
-    fn source_probe_path(item: &str) -> Option<String> {
-        if item.starts_with('\u{1}') || item == "<sin entradas>" {
-            return None;
-        }
-        let path = source_path_of(item).to_string();
-        if path == "Abrir sakila.db" || path == "Buscar archivo .db" {
-            return None;
-        }
-        Some(path)
-    }
-
-    /// Paths a probar de una ventana visible de Fuentes: excluye secciones,
-    /// placeholder, acciones fijas y lo ya comprobado (caché) o en vuelo.
-    /// Pura para poder testear el "solo lo visible" sin App.
-    fn visible_probe_targets(
-        items: &[String],
-        window: std::ops::Range<usize>,
-        health: &HashMap<String, bool>,
-        probing: &HashSet<String>,
-    ) -> Vec<String> {
-        items
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| window.contains(i))
-            .filter_map(|(_, item)| Self::source_probe_path(item))
-            .filter(|p| !health.contains_key(p) && !probing.contains(p))
-            .collect()
-    }
-
     /// Lanza el probe de un path en segundo plano. `use_cache = true` (probe
     /// de la ventana visible): solo si nunca se comprobó; `false` (selección
     /// actual): re-verifica siempre, porque el usuario espera ver en vivo si
-    /// la fuente bajo el cursor cambió.
-    fn probe_path(&mut self, path: String, use_cache: bool) {
-        if self.probing.contains(&path) {
-            return;
-        }
-        if use_cache && self.health.contains_key(&path) {
-            return;
-        }
-        let Some(tx) = self.probe_tx.clone() else { return };
-        self.probing.insert(path.clone());
-        tracing::debug!(path = %path, cache = use_cache, "probe lanzado");
-        // Semáforo + spawn_blocking: `probe_source` hace DNS y TCP síncronos
-        // (hasta 2s). Con `tokio::spawn` directo, cada probe ocupaba un
-        // worker async del runtime — un scroll rápido con 15 fuentes agotaba
-        // los workers y frenaba las queries en vuelo. El semáforo limita la
-        // concurrencia a `PROBE_MAX_CONCURRENT`.
-        let semaphore = self.probe_semaphore.clone();
-        tokio::spawn(async move {
-            let _permit = semaphore.acquire_owned().await;
-            let path2 = path.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let ok = probe_source(&path2);
-                let _ = tx.send((path, ok));
-            })
-            .await;
-        });
-    }
-
-    /// Probe de la fuente bajo el cursor. Se re-verifica en cada selección
-    /// (click o flechas): si algo cambió en el exterior, la marca ✗ aparece
-    /// al volver a pasar por la fuente. Nunca bloquea la UI.
-    fn probe_selected(&mut self) {
-        let Some(selected) =
-            self.items_for(PanelKind::Sources).get(self.selected_idx(PanelKind::Sources))
-        else {
-            return;
-        };
-        let Some(path) = Self::source_probe_path(selected) else { return };
-        self.probe_path(path, false);
-    }
-
-    /// Probe de las fuentes SOLO VISIBLES ahora mismo en el panel (ventana
-    /// `scroll_offset..+altura real`): al arrancar se comprueban las pocas
-    /// filas que caben en pantalla, no las 200 de la lista. Cada path se
-    /// verifica a lo sumo una vez por arranque (caché), así no hay bucles de
-    /// re-probe cuando los resultados reordenan la lista.
+    /// Probe de las fuentes SOLO VISIBLES (delega; ventana real del panel).
     fn probe_visible(&mut self) {
         let rect = self
             .layout
@@ -1200,68 +594,23 @@ impl App {
             .find(|(k, _)| *k == PanelKind::Sources)
             .map(|(_, r)| *r)
             .unwrap_or_default();
-        // Interior del panel sin bordes: filas de lista realmente visibles.
-        let inner_h = usize::from(rect.height.saturating_sub(2));
-        if inner_h == 0 {
-            return;
-        }
         let offset = self.panel(PanelKind::Sources).scroll_offset.get();
-        // Sin `to_vec()`: este método corre CADA frame y clonar la lista
-        // completa de fuentes era trabajo real por frame aunque nada
-        // cambiara. `visible_probe_targets` recibe el slice + ventana.
-        let targets = Self::visible_probe_targets(
-            self.items_for(PanelKind::Sources),
-            offset..offset.saturating_add(inner_h),
-            &self.health,
-            &self.probing,
-        );
-        for path in targets {
-            self.probe_path(path, true);
-        }
+        self.sources_state.probe_visible(offset, rect.height);
     }
 
-    /// Aplica los resultados de probes terminados (llamado cada frame en
-    /// `compute_layout`) y dispara los probes pendientes: la fuente recién
-    /// seleccionada y las nuevas filas visibles de Fuentes.
+    /// Aplica resultados de probes terminados y dispara los pendientes.
     fn poll_probe_results(&mut self) {
-        // Drenar el canal primero (evita el doble borrow de `self` entre el
-        // receiver y el rebuild de `sources`).
-        let mut resolved: Vec<(String, bool)> = Vec::new();
-        if let Some(rx) = self.probe_rx.as_mut() {
-            while let Ok(msg) = rx.try_recv() {
-                resolved.push(msg);
-            }
-        }
-        let mut changed = false;
-        for (path, ok) in resolved {
-            // Rebuild solo si el estado cambió (primera verificación o ✗ ↔ ok)
-            if self.health.get(&path) != Some(&ok) {
-                changed = true;
-            }
-            self.health.insert(path.clone(), ok);
-            self.probing.remove(&path);
-            tracing::debug!(path = %path, ok, "probe resuelto");
-        }
-        if changed {
-            // Preservar la selección: el rebuild no debe saltar el cursor
-            // a otra fuente (los probes reordenan marcas, no la lista).
+        // 1) Resultados llegados: si cambió la salud, reconstruir la lista
+        //    (las marcas ✗/ok se repintan; la selección se preserva).
+        if self.sources_state.poll_results() {
             self.rebuild_sources(None);
         }
-
-        // Selección de Sources bajo el cursor: la navegación (flechas, click,
-        // drag) escribe `selected_idx` directo, sin pasar por set_selected_idx;
-        // el tick detecta el cambio y re-verifica la fuente recién seleccionada
-        // (siempre, sin caché). Con `last_probed_idx = usize::MAX` al arrancar,
-        // el primer frame comprueba la selección inicial.
+        // 2) ¿Cambió la selección bajo el cursor? → re-probear (en vivo).
         let idx = self.selected_idx(PanelKind::Sources);
-        if idx != self.last_probed_idx {
-            self.last_probed_idx = idx;
-            self.probe_selected();
+        if self.sources_state.selection_changed(idx) {
+            self.sources_state.probe_selected(idx);
         }
-
-        // Ventana visible: si el scroll o la altura del panel cambió, hay filas
-        // nuevas en pantalla que nunca se comprobaron → probearlas (una sola
-        // vez por path gracias a la caché).
+        // 3) Ventana visible nueva → probear (una vez por path, caché).
         self.probe_visible();
     }
 
@@ -1286,7 +635,7 @@ impl App {
 
         // Si el foco va a un panel de objetos, refrescar preview
         if kind == PanelKind::Tables || kind == PanelKind::Views || kind == PanelKind::Advanced {
-            self.current_page = 0;
+            self.data_view.current_page = 0;
             self.refresh_preview_from_selected_object();
         }
     }
@@ -1340,7 +689,7 @@ impl App {
     fn move_selection(&mut self, step: isize) {
         match self.active_panel {
             PanelKind::Sources => {
-                let len = self.sources.len();
+                let len = self.sources_state.sources.len();
                 Self::shift_index_on_vec_len(
                     &mut self.panel_mut(PanelKind::Sources).selected_idx,
                     len,
@@ -1348,7 +697,7 @@ impl App {
                 );
                 // Las secciones (subtítulos) no son seleccionables: saltarlas
                 let idx = self.panel(PanelKind::Sources).selected_idx;
-                let new = Self::skip_section_idx(&self.sources, idx, step);
+                let new = Self::skip_section_idx(&self.sources_state.sources, idx, step);
                 self.panel_mut(PanelKind::Sources).selected_idx = new;
             }
             PanelKind::Tables | PanelKind::Views | PanelKind::Advanced => {
@@ -1363,11 +712,11 @@ impl App {
                     len,
                     step,
                 );
-                self.current_page = 0;
+                self.data_view.current_page = 0;
                 self.refresh_preview_from_selected_object();
             }
             PanelKind::Detail => {
-                let len = self.preview_rows.len();
+                let len = self.data_view.preview_rows.len();
                 let old_idx = self.selected_idx(PanelKind::Detail);
                 Self::shift_index_on_vec_len(
                     &mut self.panel_mut(PanelKind::Detail).selected_idx,
@@ -1375,18 +724,18 @@ impl App {
                     step,
                 );
                 // En Data tab, no subir al header (row 0) — mínimo row 1
-                if self.detail_tab == DetailTab::Data && len > 1 {
+                if self.data_view.detail_tab == DetailTab::Data && len > 1 {
                     let panel = self.panel_mut(PanelKind::Detail);
                     if panel.selected_idx == 0 {
                         panel.selected_idx = 1;
                     }
                 }
                 // Scroll infinito (append/prepend) para Data tab
-                if self.detail_tab == DetailTab::Data && len > 1 {
+                if self.data_view.detail_tab == DetailTab::Data && len > 1 {
                     if step > 0 && old_idx == len.saturating_sub(1) {
                         // Al bajar del último dato → cargar página siguiente
                         self.scroll_down_infinite();
-                    } else if step < 0 && old_idx == 1 && self.preview_loaded_offset > 0 {
+                    } else if step < 0 && old_idx == 1 && self.data_view.preview_loaded_offset > 0 {
                         // Al subir del primer dato → cargar página anterior
                         self.scroll_up_infinite();
                     }
@@ -1402,7 +751,7 @@ impl App {
     /// los bordes, el scroll infinito carga más contenido SIN saltar la
     /// selección (append la deja quieta, prepend la desplaza +n).
     fn move_selection_by_page(&mut self, down: bool) {
-        let len = self.preview_rows.len();
+        let len = self.data_view.preview_rows.len();
         if len <= 1 {
             return;
         }
@@ -1427,7 +776,7 @@ impl App {
         // Bordes del buffer: cargar más contenido (la selección no salta)
         if down && target == last {
             self.scroll_down_infinite();
-        } else if !down && target == 1 && self.preview_loaded_offset > 0 {
+        } else if !down && target == 1 && self.data_view.preview_loaded_offset > 0 {
             self.scroll_up_infinite();
         }
     }
@@ -1474,11 +823,11 @@ impl App {
             return &self.filtered_items;
         }
         match kind {
-            PanelKind::Sources => &self.sources,
+            PanelKind::Sources => &self.sources_state.sources,
             PanelKind::Tables => &self.tables,
             PanelKind::Views => &self.views,
             PanelKind::Advanced => &self.advanced,
-            PanelKind::Detail => &self.preview_rows,
+            PanelKind::Detail => &self.data_view.preview_rows,
         }
     }
 
@@ -1492,7 +841,7 @@ impl App {
         let num = kind.number();
         match kind {
             PanelKind::Sources => {
-                let tabs = match self.source_tab {
+                let tabs = match self.sources_state.source_tab {
                     SourceTab::All => "[Todo] Local Online",
                     SourceTab::Local => "Todo [Local] Online",
                     SourceTab::Online => "Todo Local [Online]",
@@ -1529,11 +878,11 @@ impl App {
                     let text = if tab == DetailTab::Data {
                         // Número de fila actual / total. En NoSQL (mongo)
                         // cada fila es un documento → `doc X/Y`.
-                        if self.total_rows > 0 {
-                            let current_row = self.preview_loaded_offset
+                        if self.data_view.total_rows > 0 {
+                            let current_row = self.data_view.preview_loaded_offset
                                 + self.selected_idx(PanelKind::Detail).saturating_sub(1) as u32
                                 + 1;
-                            let total = self.total_rows;
+                            let total = self.data_view.total_rows;
                             let unit = if self.is_nosql { "doc" } else { "row" };
                             format!("{label} - {unit} {current_row}/{total}")
                         } else {
@@ -1544,7 +893,7 @@ impl App {
                     };
 
                     // Tab activo entre corchetes, con padding
-                    let padded = if tab == self.detail_tab {
+                    let padded = if tab == self.data_view.detail_tab {
                         format!(" [ {text} ] ")
                     } else {
                         format!("  {text}  ")
@@ -1569,33 +918,15 @@ impl App {
         detected_servers: &[String],
         cwd_databases: &[String],
     ) -> Vec<String> {
-        let mut list = SourceList {
+        // Fase 1: la lógica vive en sources.rs (extraída del monolito).
+        super::sources::build_sources(
             state,
+            source_tab,
             connected,
             health,
-            out: Vec::new(),
-            seen: HashSet::new(),
-            sections: HashSet::new(),
-        };
-
-        match source_tab {
-            SourceTab::All => {
-                list.add_favs(SourceFilter::All);
-                list.add_recents(SourceFilter::All);
-                list.add_detected(detected_servers, cwd_databases);
-            }
-            SourceTab::Local => {
-                list.add_favs(SourceFilter::Local);
-                list.add_recents(SourceFilter::Local);
-                list.add_detected(detected_servers, cwd_databases);
-            }
-            SourceTab::Online => {
-                list.add_favs(SourceFilter::Online);
-                list.add_recents(SourceFilter::Online);
-            }
-        }
-
-        list.finish(source_tab)
+            detected_servers,
+            cwd_databases,
+        )
     }
 
     /// Reconstruye `sources` preservando la selección POR PATH (no por
@@ -1608,43 +939,21 @@ impl App {
         let current = self
             .items_for(PanelKind::Sources)
             .get(self.selected_idx(PanelKind::Sources))
-            .and_then(|item| Self::source_probe_path(item));
-
-        self.sources = Self::build_sources(
+            .and_then(|item| super::sources::SourcesState::source_probe_path(item));
+        // Fase 1b: la lógica (build + re-ubicación por path) vive en
+        // SourcesState; App solo aplica el índice resultante al panel.
+        if let Some(idx) = self.sources_state.rebuild(
             &self.state,
-            self.source_tab,
             self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-            &self.cwd_databases,
-        );
-
-        // Path objetivo: el preferido o el que estaba seleccionado.
-        let target = prefer.or(current.as_deref());
-        let Some(target) = target else { return };
-        // Comparación canónica: la lista guarda paths normalizados y SIN
-        // credenciales (display), así que el target se normaliza igual.
-        let norm = crate::paths::normalize_path(target);
-        let norm_clean = crate::security::strip_credentials(&norm);
-        if let Some(idx) = self.sources.iter().position(|item| {
-            Self::source_probe_path(item).is_some_and(|p| {
-                crate::security::strip_credentials(&crate::paths::normalize_path(&p)) == norm_clean
-            })
-        }) {
+            current.as_deref(),
+            prefer,
+        ) {
             self.set_selected_idx(PanelKind::Sources, idx);
         }
     }
 
     fn set_source_tab(&mut self, tab: SourceTab) {
-        self.source_tab = tab;
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-            &self.cwd_databases,
-        );
+        self.sources_state.set_tab(tab, &self.state, self.db_path.as_deref());
         self.set_selected_idx(PanelKind::Sources, 0);
     }
 
@@ -1693,7 +1002,7 @@ impl App {
 
     #[allow(dead_code)]
     pub const fn source_tab_label(&self) -> &'static str {
-        self.source_tab.label()
+        self.sources_state.source_tab.label()
     }
 
     #[allow(dead_code)]
@@ -1713,7 +1022,7 @@ impl App {
 
     #[allow(dead_code)]
     pub const fn detail_tab_label(&self) -> &'static str {
-        self.detail_tab.label()
+        self.data_view.detail_tab.label()
     }
 
     pub const fn actions_menu_items() -> &'static [&'static str] {
@@ -1792,7 +1101,8 @@ impl App {
                     crate::security::strip_credentials(url),
                     dbs.len()
                 );
-                self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
+                self.connection.db_picker =
+                    Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
                 // Sin acceso (auth o red): pedir contraseña. URL limpia (sin
@@ -1800,7 +1110,7 @@ impl App {
                 tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "servidor sin acceso, pidiendo contraseña");
                 self.status = String::new();
                 let (clean_url, user) = strip_url_credentials(url);
-                self.password_prompt = Some(PasswordPromptState {
+                self.connection.password_prompt = Some(PasswordPromptState {
                     server_url: clean_url,
                     user: user.unwrap_or_else(|| "root".to_string()),
                     buffer: String::new(),
@@ -1839,7 +1149,7 @@ impl App {
                     crate::security::strip_credentials(&server_url),
                     dbs.len()
                 );
-                self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
+                self.connection.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
             }
             Err(err) => {
                 tracing::warn!(url = %crate::security::strip_credentials(&server_url), error = ?err, "credenciales rechazadas");
@@ -1890,7 +1200,7 @@ impl App {
                     crate::security::strip_credentials(url),
                     dbs.len()
                 );
-                self.db_picker =
+                self.connection.db_picker =
                     Some(DbPickerState { server_url: scheme_normalized.clone(), dbs, idx: 0 });
             }
             Err(err) => {
@@ -1899,7 +1209,7 @@ impl App {
                 // Prompt con URL SIN credenciales (no repetir la password en
                 // pantalla) y el user de la URL si lo traía.
                 let (clean_url, user) = strip_url_credentials(&scheme_normalized);
-                self.password_prompt = Some(PasswordPromptState {
+                self.connection.password_prompt = Some(PasswordPromptState {
                     server_url: clean_url,
                     user: user.unwrap_or_else(|| "postgres".to_string()),
                     buffer: String::new(),
@@ -1937,7 +1247,7 @@ impl App {
                     crate::security::strip_credentials(&server_url),
                     dbs.len()
                 );
-                self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
+                self.connection.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
             }
             Err(err) => {
                 tracing::warn!(url = %crate::security::strip_credentials(&server_url), error = ?err, "credenciales postgres rechazadas");
@@ -1970,7 +1280,8 @@ impl App {
                     crate::security::strip_credentials(url),
                     dbs.len()
                 );
-                self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
+                self.connection.db_picker =
+                    Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
                 tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "mongo sin acceso");
@@ -2069,7 +1380,7 @@ impl App {
         // `is_loading` se apaga cuando el resultado se aplica (o en el error
         // inmediato del resolver); los callers que esperaban sincronía ahora
         // ven el estado "conectando" hasta el próximo frame.
-        let rows_per_page = self.rows_per_page;
+        let rows_per_page = self.data_view.rows_per_page;
         let tx2 = tx.clone();
         let path2 = path.clone();
         tokio::task::spawn_blocking(move || {
@@ -2172,21 +1483,21 @@ impl App {
                     self.set_selected_idx(PanelKind::Views, 0);
                     self.set_selected_idx(PanelKind::Advanced, 0);
                     self.set_selected_idx(PanelKind::Detail, 0);
-                    self.current_page = 0;
-                    self.preview_loaded_offset = 0;
-                    self.detail_tab = DetailTab::Data;
+                    self.data_view.current_page = 0;
+                    self.data_view.preview_loaded_offset = 0;
+                    self.data_view.detail_tab = DetailTab::Data;
 
                     // Preview ya cargado en background (count + primera
                     // página): aplicarlo directo, sin re-consultar.
                     if let Some((data, total)) = first_preview {
-                        self.preview_data = Some(data.clone());
-                        self.preview_rows = data.to_lines();
-                        self.total_rows = total;
+                        self.data_view.preview_data = Some(data.clone());
+                        self.data_view.preview_rows = data.to_lines();
+                        self.data_view.total_rows = total;
                         self.set_selected_idx(PanelKind::Detail, 1);
                     } else {
-                        self.preview_data = None;
-                        self.preview_rows = vec!["<sin tablas>".to_string()];
-                        self.total_rows = 0;
+                        self.data_view.preview_data = None;
+                        self.data_view.preview_rows = vec!["<sin tablas>".to_string()];
+                        self.data_view.total_rows = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                     }
 
@@ -2237,7 +1548,7 @@ impl App {
         // Restar bordes del bloque (2) + overhead fijo
         // En Data tab: spacer(1) + header(1) + separator(1) = 3
         // En otros tabs: solo borde (0 overhead extra)
-        let overhead: u16 = if self.detail_tab == DetailTab::Data { 5 } else { 2 };
+        let overhead: u16 = if self.data_view.detail_tab == DetailTab::Data { 5 } else { 2 };
         let available = u32::from(detail_h.saturating_sub(overhead));
 
         // Redondear a múltiplo de 10 hacia abajo, mínimo 10
@@ -2248,198 +1559,226 @@ impl App {
     // ── preview ───────────────────────────────────────────────────────
 
     #[allow(clippy::too_many_lines)]
+    /// Refresca el preview del objeto seleccionado (Data/Schema/Sql/Advanced).
+    ///
+    /// AHORA ES ASYNC: el adapter corre en `spawn_blocking` y el resultado
+    /// llega por `preview_rx` → `poll_preview_results` (mismo patrón que la
+    /// conexión). El spinner del status bar gira DE VERDAD mientras la UI
+    /// sigue viva — antes esto bloqueaba el hilo del event loop en
+    /// round-trips de red al navegar entre tablas (hallazgo A1).
+    ///
+    /// `DetailTab::Meta` es local (sin red): se resuelve al instante.
     fn refresh_preview_from_selected_object(&mut self) {
-        // El resultado de una query libre ya no aplica: navegar a un objeto
-        // devuelve el preview a la tabla seleccionada.
-        self.query_mode = false;
-        // Ajustar rows_per_page dinámicamente según espacio disponible
-        self.rows_per_page = self.optimal_rows_per_page();
-        // Reset scroll_offset del viewport al recargar completamente los datos
+        self.data_view.query_mode = false;
+        self.data_view.rows_per_page = self.optimal_rows_per_page();
         self.panel_mut(PanelKind::Detail).scroll_offset.set(0);
-        // Reset scroll horizontal: el nuevo objeto puede tener otras columnas
         self.panel_mut(PanelKind::Detail).h_scroll.set(0);
 
         self.is_loading = true;
-        self.status = format!("Cargando {}...", self.detail_tab.label().trim());
+        self.status = format!("Cargando {}...", self.data_view.detail_tab.label().trim());
 
         let object_name = self.selected_object_name();
         if object_name.is_empty() || object_name == "-" {
-            self.preview_rows = vec!["Sin objeto seleccionado".to_string()];
-            self.preview_data = None;
-            self.total_rows = 0;
-            self.preview_loaded_offset = 0;
+            self.data_view.preview_rows = vec!["Sin objeto seleccionado".to_string()];
+            self.data_view.preview_data = None;
+            self.data_view.total_rows = 0;
+            self.data_view.preview_loaded_offset = 0;
             self.is_loading = false;
             self.set_selected_idx(PanelKind::Detail, 0);
             return;
         }
 
-        // Backend resuelto por extensión: todas las lecturas del preview
-        // (filas, schema, DDL, count) pasan por el adapter.
+        // Meta: información local (path, tamaño, offsets) — sin red.
+        if self.data_view.detail_tab == DetailTab::Meta {
+            self.data_view.preview_data = None;
+            self.data_view.preview_rows = vec![
+                format!("db_path: {}", self.db_path_safe()),
+                format!("db_size: {}", self.db_size_display()),
+                format!("source_tab: {}", self.sources_state.source_tab.label()),
+                format!("object_section: {}", self.object_section.label()),
+                format!("detail_tab: {}", self.data_view.detail_tab.label()),
+                format!("object: {}", object_name),
+                format!("rows_per_page: {}", self.data_view.rows_per_page),
+                format!("loaded_offset: {}", self.data_view.preview_loaded_offset),
+                format!("estimated_rows: {}", self.data_view.total_rows),
+            ];
+            self.data_view.preview_loaded_offset = 0;
+            self.set_selected_idx(PanelKind::Detail, 0);
+            self.is_loading = false;
+            return;
+        }
+
         let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
         };
+        self.spawn_preview(adapter, object_name);
+    }
 
-        // Siempre refrescar total_rows para tablas/vistas (no Advanced)
-        if self.object_section != ObjectSection::Advanced {
-            if let Ok(count) = adapter.table_row_count(&object_name) {
-                self.total_rows = count;
-            }
-        }
+    /// Lanza el preview del objeto en background (`spawn_blocking` + canal).
+    /// La generación se incrementa: cualquier preview anterior en vuelo
+    /// queda marcado stale y se descarta al llegar.
+    #[allow(clippy::too_many_lines)] // la carga por tab (Data/Schema/Sql) es legible en un solo bloque
+    fn spawn_preview(
+        &mut self,
+        adapter: std::sync::Arc<dyn crate::db::adapter::DbAdapter>,
+        object_name: String,
+    ) {
+        self.preview_gen += 1;
+        let generation = self.preview_gen;
+        let Some(tx) = self.preview_tx.clone() else { return };
+        let object_section = self.object_section;
+        let detail_tab = self.data_view.detail_tab;
+        let rows_per_page = self.data_view.rows_per_page;
+        let offset = self.data_view.current_page.saturating_mul(self.data_view.rows_per_page);
+        // Clonar el orden: el closure del spawn_blocking no puede prestar self.
+        let order_col: Option<(String, bool)> =
+            self.data_view.sort_column.as_ref().map(|col| (col.clone(), self.data_view.sort_asc));
 
-        match self.detail_tab {
-            DetailTab::Data => {
-                if self.object_section == ObjectSection::Advanced {
-                    // Para índices/triggers: mostrar el SQL DDL
-                    match adapter.object_sql(&object_name) {
-                        Ok(sql) => {
-                            self.preview_rows =
-                                sql.lines().map(ToString::to_string).collect::<Vec<_>>();
-                            if self.preview_rows.is_empty() {
-                                self.preview_rows = vec!["-- SQL vacio --".to_string()];
+        tokio::task::spawn_blocking(move || {
+            let (preview_rows, preview_data, total_rows) = match detail_tab {
+                DetailTab::Data => {
+                    // Advanced (índices/triggers): muestran su DDL
+                    if object_section == ObjectSection::Advanced {
+                        match adapter.object_sql(&object_name) {
+                            Ok(sql) => {
+                                let lines: Vec<String> =
+                                    sql.lines().map(ToString::to_string).collect();
+                                (
+                                    if lines.is_empty() {
+                                        vec!["-- SQL vacio --".to_string()]
+                                    } else {
+                                        lines
+                                    },
+                                    None,
+                                    0,
+                                )
                             }
+                            Err(err) => (vec![format!("Error SQL: {err}")], None, 0),
                         }
-                        Err(err) => {
-                            self.preview_rows = vec![format!("Error SQL: {err}")];
-                            self.show_error("Error SQL", &err.to_string());
-                        }
-                    }
-                    self.preview_data = None;
-                    self.total_rows = 0;
-                    self.preview_loaded_offset = 0;
-                    self.is_loading = false;
-                    self.set_selected_idx(PanelKind::Detail, 0);
-                    return;
-                }
-
-                match adapter.table_row_count(&object_name) {
-                    Ok(_) => {} // total_rows ya fue actualizado arriba
-                    Err(err) => {
-                        self.preview_rows = vec![format!("Error contando filas: {err}")];
-                        self.show_error("Error contando filas", &err.to_string());
-                        self.preview_data = None;
-                        self.total_rows = 0;
-                        self.preview_loaded_offset = 0;
-                        self.is_loading = false;
-                        self.set_selected_idx(PanelKind::Detail, 0);
-                        return;
-                    }
-                }
-
-                let offset = self.current_page.saturating_mul(self.rows_per_page);
-                let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-                match adapter.table_rows_sorted(&object_name, self.rows_per_page, offset, order_col)
-                {
-                    Ok(data) => {
-                        // Celdas tipadas para el render 2D (TableState +
-                        // highlight_symbol); preview_rows queda como fallback
-                        // (List de 1 columna / mensajes).
-                        self.preview_rows = if data.rows.is_empty() {
-                            vec!["<sin datos>".to_string()]
-                        } else {
-                            data.to_lines()
-                        };
-                        self.preview_data = Some(data);
-                        self.preview_loaded_offset = offset;
-                        self.set_selected_idx(
-                            PanelKind::Detail,
-                            usize::from(self.preview_rows.len() > 1),
-                        );
-                    }
-                    Err(err) => {
-                        self.preview_rows = vec![format!("Error obteniendo filas: {err}")];
-                        self.show_error("Error obteniendo filas", &err.to_string());
-                        self.preview_data = None;
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
-                    }
-                }
-            }
-            DetailTab::Schema => {
-                if self.object_section == ObjectSection::Advanced {
-                    // Schema de índice/trigger = su SQL DDL
-                    match adapter.object_sql(&object_name) {
-                        Ok(sql) => {
-                            self.preview_rows =
-                                sql.lines().map(ToString::to_string).collect::<Vec<_>>();
-                            if self.preview_rows.is_empty() {
-                                self.preview_rows = vec!["-- SQL vacio --".to_string()];
+                    } else {
+                        let count = adapter.table_row_count(&object_name).unwrap_or(0);
+                        let order_ref: Option<(&str, bool)> =
+                            order_col.as_ref().map(|(c, a)| (c.as_str(), *a));
+                        match adapter.table_rows_sorted(
+                            &object_name,
+                            rows_per_page,
+                            offset,
+                            order_ref,
+                        ) {
+                            Ok(data) => {
+                                let lines = if data.rows.is_empty() {
+                                    vec!["<sin datos>".to_string()]
+                                } else {
+                                    data.to_lines()
+                                };
+                                (lines, Some(data), count)
                             }
-                        }
-                        Err(err) => {
-                            self.preview_rows = vec![format!("Error SQL: {err}")];
-                            self.show_error("Error SQL", &err.to_string());
+                            Err(err) => (vec![format!("Error obteniendo filas: {err}")], None, 0),
                         }
                     }
-                    self.preview_data = None;
-                    self.total_rows = 0;
-                    self.preview_loaded_offset = 0;
-                    self.is_loading = false;
-                    self.set_selected_idx(PanelKind::Detail, 0);
-                    return;
                 }
-
-                match adapter.table_columns(&object_name) {
-                    Ok(columns) => {
-                        self.preview_data = None;
-                        // ColumnInfo → líneas de presentación del Schema tab
-                        self.preview_rows = if columns.is_empty() {
-                            vec!["Sin columnas visibles".to_string()]
-                        } else {
-                            let mut lines = vec!["cid | name | type | nullability".to_string()];
-                            lines.extend(columns.iter().map(crate::db::ColumnInfo::to_line));
-                            lines
-                        };
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
-                    }
-                    Err(err) => {
-                        self.preview_rows = vec![format!("Error schema: {err}")];
-                        self.show_error("Error schema", &err.to_string());
-                        self.preview_data = None;
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
+                DetailTab::Schema => {
+                    if object_section == ObjectSection::Advanced {
+                        match adapter.object_sql(&object_name) {
+                            Ok(sql) => {
+                                let lines: Vec<String> =
+                                    sql.lines().map(ToString::to_string).collect();
+                                (
+                                    if lines.is_empty() {
+                                        vec!["-- SQL vacio --".to_string()]
+                                    } else {
+                                        lines
+                                    },
+                                    None,
+                                    0,
+                                )
+                            }
+                            Err(err) => (vec![format!("Error SQL: {err}")], None, 0),
+                        }
+                    } else {
+                        match adapter.table_columns(&object_name) {
+                            Ok(columns) => {
+                                let lines = if columns.is_empty() {
+                                    vec!["Sin columnas visibles".to_string()]
+                                } else {
+                                    let mut l = vec!["cid | name | type | nullability".to_string()];
+                                    l.extend(columns.iter().map(crate::db::ColumnInfo::to_line));
+                                    l
+                                };
+                                (lines, None, 0)
+                            }
+                            Err(err) => (vec![format!("Error schema: {err}")], None, 0),
+                        }
                     }
                 }
-            }
-            DetailTab::Sql => {
-                self.preview_data = None;
-                match adapter.object_sql(&object_name) {
+                DetailTab::Sql => match adapter.object_sql(&object_name) {
                     Ok(sql) => {
-                        self.preview_rows =
-                            sql.lines().map(ToString::to_string).collect::<Vec<_>>();
-                        if self.preview_rows.is_empty() {
-                            self.preview_rows = vec!["-- SQL vacio --".to_string()];
-                        }
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
+                        let lines: Vec<String> = sql.lines().map(ToString::to_string).collect();
+                        (
+                            if lines.is_empty() {
+                                vec!["-- SQL vacio --".to_string()]
+                            } else {
+                                lines
+                            },
+                            None,
+                            0,
+                        )
                     }
-                    Err(err) => {
-                        self.preview_rows = vec![format!("Error SQL: {err}")];
-                        self.show_error("Error SQL", &err.to_string());
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
+                    Err(err) => (vec![format!("Error SQL: {err}")], None, 0),
+                },
+                DetailTab::Meta => unreachable!("Meta se resuelve síncrono en el caller"),
+            };
+            let _ = tx.send(query::PreviewMsg::Ok {
+                generation,
+                object: object_name,
+                detail_tab,
+                preview_rows,
+                preview_data,
+                total_rows,
+            });
+        });
+    }
+
+    /// Aplica los previews terminados (cada frame en `compute_layout`).
+    /// Descarta resultados stale (generación vieja = el usuario navegó).
+    fn poll_preview_results(&mut self) {
+        let drained: Vec<query::PreviewMsg> = {
+            let Some(rx) = self.preview_rx.as_mut() else { return };
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        };
+        for msg in drained {
+            match msg {
+                query::PreviewMsg::Ok {
+                    generation,
+                    object,
+                    detail_tab,
+                    preview_rows,
+                    preview_data,
+                    total_rows,
+                } => {
+                    if generation != self.preview_gen {
+                        continue; // stale: el usuario navegó mientras cargaba
                     }
+                    // ¿El usuario ya cambió de tab/objeto? Descarta igual.
+                    if self.data_view.detail_tab != detail_tab
+                        || self.selected_object_name() != object
+                    {
+                        continue;
+                    }
+                    self.data_view.preview_rows = preview_rows;
+                    self.data_view.preview_data = preview_data;
+                    self.data_view.total_rows = total_rows;
+                    self.data_view.preview_loaded_offset =
+                        self.data_view.current_page.saturating_mul(self.data_view.rows_per_page);
+                    self.set_selected_idx(
+                        PanelKind::Detail,
+                        usize::from(self.data_view.preview_rows.len() > 1),
+                    );
+                    self.is_loading = false;
                 }
             }
-            DetailTab::Meta => {
-                self.preview_data = None;
-                self.preview_rows = vec![
-                    format!("db_path: {}", self.db_path_safe()),
-                    format!("db_size: {}", self.db_size_display()),
-                    format!("source_tab: {}", self.source_tab.label()),
-                    format!("object_section: {}", self.object_section.label()),
-                    format!("detail_tab: {}", self.detail_tab.label()),
-                    format!("object: {}", object_name),
-                    format!("rows_per_page: {}", self.rows_per_page),
-                    format!("loaded_offset: {}", self.preview_loaded_offset),
-                    format!("estimated_rows: {}", self.total_rows),
-                ];
-                self.preview_loaded_offset = 0;
-                self.set_selected_idx(PanelKind::Detail, 0);
-            }
         }
-        self.is_loading = false;
     }
 
     // ── scroll infinito (append/prepend) ─────────────────────────────
@@ -2452,12 +1791,12 @@ impl App {
     /// ellas de forma natural. Antes la selección saltaba a la primera fila
     /// nueva ("cambio de página" fantasma con la rueda).
     fn scroll_down_infinite(&mut self) {
-        if self.query_mode {
+        if self.data_view.query_mode {
             return; // resultado de query libre: sin scroll infinito
         }
-        let data_len = self.preview_rows.len().saturating_sub(1);
-        let next_offset = self.preview_loaded_offset as usize + data_len;
-        if next_offset >= self.total_rows as usize {
+        let data_len = self.data_view.preview_rows.len().saturating_sub(1);
+        let next_offset = self.data_view.preview_loaded_offset as usize + data_len;
+        if next_offset >= self.data_view.total_rows as usize {
             return; // ya estamos al final del dataset
         }
 
@@ -2467,7 +1806,10 @@ impl App {
         }
 
         #[allow(clippy::cast_possible_truncation)]
-        let limit = self.rows_per_page.min(self.total_rows.saturating_sub(next_offset as u32));
+        let limit = self
+            .data_view
+            .rows_per_page
+            .min(self.data_view.total_rows.saturating_sub(next_offset as u32));
 
         if limit == 0 {
             return;
@@ -2476,7 +1818,8 @@ impl App {
         self.is_loading = true;
         self.status = format!("Cargando más filas (offset {next_offset})...");
 
-        let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
+        let order_col =
+            self.data_view.sort_column.as_deref().map(|col| (col, self.data_view.sort_asc));
         let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
@@ -2489,15 +1832,16 @@ impl App {
                 self.is_loading = false;
                 return;
             }
-            self.preview_rows.extend(data.rows.iter().map(|row| row.to_line(" | ")));
+            self.data_view.preview_rows.extend(data.rows.iter().map(|row| row.to_line(" | ")));
             // Sincronizar las celdas tipadas del render 2D: el viewport usa
             // `preview_data.rows.len()` como tope (`rows_hint`) — sin esto el
             // scroll se congela en la primera página mientras el label de
             // `row X/Y` sigue avanzando (bug "la vista no baja").
-            if let Some(existing) = self.preview_data.take() {
+            if let Some(existing) = self.data_view.preview_data.take() {
                 let mut rows = existing.rows;
                 rows.extend(data.rows);
-                self.preview_data = Some(crate::db::TableData { columns: existing.columns, rows });
+                self.data_view.preview_data =
+                    Some(crate::db::TableData { columns: existing.columns, rows });
             }
         }
         self.is_loading = false;
@@ -2509,10 +1853,10 @@ impl App {
     /// quedan ARRIBA) para mantener la MISMA fila global visible — sin salto
     /// visual ("página atrás" fantasma).
     fn scroll_up_infinite(&mut self) {
-        if self.query_mode {
+        if self.data_view.query_mode {
             return; // resultado de query libre: sin scroll infinito
         }
-        if self.preview_loaded_offset == 0 {
+        if self.data_view.preview_loaded_offset == 0 {
             return; // ya estamos al inicio del dataset
         }
 
@@ -2521,8 +1865,8 @@ impl App {
             return;
         }
 
-        let limit = self.rows_per_page.min(self.preview_loaded_offset);
-        let offset = self.preview_loaded_offset.saturating_sub(limit);
+        let limit = self.data_view.rows_per_page.min(self.data_view.preview_loaded_offset);
+        let offset = self.data_view.preview_loaded_offset.saturating_sub(limit);
         if limit == 0 {
             return;
         }
@@ -2530,7 +1874,8 @@ impl App {
         self.is_loading = true;
         self.status = format!("Cargando filas anteriores (offset {offset})...");
 
-        let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
+        let order_col =
+            self.data_view.sort_column.as_deref().map(|col| (col, self.data_view.sort_asc));
         let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
@@ -2544,23 +1889,24 @@ impl App {
             }
 
             // Anteponer las filas nuevas (preservando el header en index 0)
-            let header = self.preview_rows[0].clone();
+            let header = self.data_view.preview_rows[0].clone();
             let mut expanded = vec![header];
             expanded.extend(data.rows.iter().map(|row| row.to_line(" | ")));
-            expanded.extend(self.preview_rows.iter().skip(1).cloned());
-            self.preview_rows = expanded;
+            expanded.extend(self.data_view.preview_rows.iter().skip(1).cloned());
+            self.data_view.preview_rows = expanded;
 
             // Mantener sincronizadas las celdas tipadas del render 2D
-            if let Some(existing) = self.preview_data.take() {
+            if let Some(existing) = self.data_view.preview_data.take() {
                 let mut rows = data.rows;
                 rows.extend(existing.rows);
-                self.preview_data = Some(crate::db::TableData { columns: existing.columns, rows });
+                self.data_view.preview_data =
+                    Some(crate::db::TableData { columns: existing.columns, rows });
             }
 
             // Actualizar offset
             #[allow(clippy::cast_possible_truncation)]
             {
-                self.preview_loaded_offset -= n as u32;
+                self.data_view.preview_loaded_offset -= n as u32;
             }
 
             // La selección se desplaza +n para mantener la misma fila global
@@ -2591,7 +1937,7 @@ impl App {
             available.iter().find(|t| t.label() > tab.label()).copied().unwrap_or(available[0])
         };
 
-        self.detail_tab = effective;
+        self.data_view.detail_tab = effective;
         self.set_selected_idx(PanelKind::Detail, 0);
         self.refresh_preview_from_selected_object();
     }
@@ -2616,21 +1962,21 @@ impl App {
         }
 
         let sql = format!("SELECT COUNT(*) FROM \"{}\";", object.replace('"', "\"\""));
-        tracing::debug!(object = %object, "COUNT(*) lanzado (generación {})", self.query_gen + 1);
+        tracing::debug!(object = %object, "COUNT(*) lanzado (generación {})", self.query.query_gen + 1);
 
         // Generación nueva: cualquier resultado en vuelo de queries anteriores
         // queda marcado como stale y se descarta al llegar.
-        self.query_gen += 1;
-        self.query_target_object = Some(object);
-        let generation = self.query_gen;
-        let Some(tx) = self.query_tx.clone() else { return };
+        self.query.query_gen += 1;
+        self.query.query_target_object = Some(object);
+        let generation = self.query.query_gen;
+        let Some(tx) = self.query.query_tx.clone() else { return };
 
-        self.query_state = query::QueryState::Running;
+        self.query.query_state = query::QueryState::Running;
         self.status = "Contando filas...".to_string();
 
         // Provider: reusar la conexión activa (evita re-handshake en remoto)
         let adapter = self.adapter_arc();
-        self.query_handle = Some(tokio::spawn(async move {
+        self.query.query_handle = Some(tokio::spawn(async move {
             let res = query::count_query_results(adapter, &path, &sql).await;
             let _ = tx.send(query::QueryMsg::Count(generation, sql, res));
         }));
@@ -2669,9 +2015,9 @@ impl App {
     fn query_es_stale_por_navegacion(&mut self) -> bool {
         let objeto_actual = self.selected_object_name();
         let cambio =
-            self.query_target_object.as_deref().is_some_and(|target| target != objeto_actual);
+            self.query.query_target_object.as_deref().is_some_and(|target| target != objeto_actual);
         if cambio {
-            self.query_target_object = None;
+            self.query.query_target_object = None;
         }
         cambio
     }
@@ -2680,7 +2026,7 @@ impl App {
         // Drenar el canal en un scope corto: los borrows del loop no pueden
         // convivir con las mutaciones de self que hace el procesamiento.
         let drained: Vec<query::QueryMsg> = {
-            let Some(rx) = self.query_rx.as_mut() else { return };
+            let Some(rx) = self.query.query_rx.as_mut() else { return };
             std::iter::from_fn(|| rx.try_recv().ok()).collect()
         };
         for msg in drained {
@@ -2690,42 +2036,42 @@ impl App {
             match msg {
                 query::QueryMsg::Count(generation, sql, res) => {
                     let Some((state, status)) =
-                        Self::apply_count_result(self.query_gen, generation, &sql, res)
+                        Self::apply_count_result(self.query.query_gen, generation, &sql, res)
                     else {
                         continue; // stale: descartar
                     };
-                    self.query_results = if let query::QueryState::Done(rows) = &state {
+                    self.query.query_results = if let query::QueryState::Done(rows) = &state {
                         rows.clone()
                     } else {
                         Vec::new()
                     };
-                    self.query_state = state;
+                    self.query.query_state = state;
                     self.status = status;
                 }
                 query::QueryMsg::Free(generation, _sql, res) => {
-                    if generation != self.query_gen {
+                    if generation != self.query.query_gen {
                         continue; // stale: una query más nueva ya se lanzó
                     }
                     self.is_loading = false;
                     let (state, rows) = Self::apply_user_query_result(&res);
                     if matches!(state, query::QueryState::Done(_)) {
-                        self.query_mode = true;
-                        self.query_state = state;
-                        self.query_results = rows;
-                        self.detail_tab = DetailTab::Data;
+                        self.data_view.query_mode = true;
+                        self.query.query_state = state;
+                        self.query.query_results = rows;
+                        self.data_view.detail_tab = DetailTab::Data;
                         // Vista de datos 2D: fila 0 es el header, el
                         // resto son datos (el render ya hace el split).
-                        self.preview_rows = self.query_results.clone();
-                        self.preview_data = None;
-                        self.preview_loaded_offset = 0;
+                        self.data_view.preview_rows = self.query.query_results.clone();
+                        self.data_view.preview_data = None;
+                        self.data_view.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                         self.status = format!(
                             "{} filas · query OK (limit {})",
-                            self.query_results.len(),
+                            self.query.query_results.len(),
                             query::QUERY_RESULT_LIMIT
                         );
                     } else if let query::QueryState::Error(e) = state {
-                        self.query_state = query::QueryState::Error(e.clone());
+                        self.query.query_state = query::QueryState::Error(e.clone());
                         self.status = format!("Error SQL: {e}");
                         self.show_error("Error SQL", &e);
                     }
@@ -2739,31 +2085,31 @@ impl App {
     /// antes, la "cancelación" por generación dejaba correr la query entera
     /// sujetando la conexión (pool de 5 agotado por tareas huérfanas).
     fn abort_query_in_flight(&mut self) {
-        if let Some(handle) = self.query_handle.take() {
+        if let Some(handle) = self.query.query_handle.take() {
             handle.abort();
         }
     }
 
     fn clear_query_state(&mut self) {
         // Invalidar cualquier count en vuelo antes de limpiar
-        self.query_gen += 1;
+        self.query.query_gen += 1;
         self.abort_query_in_flight();
-        self.query_state = query::QueryState::Idle;
-        self.query_results.clear();
+        self.query.query_state = query::QueryState::Idle;
+        self.query.query_results.clear();
         self.status = "Query limpia".to_string();
     }
 
     // ── input SQL (`:` popup + historial persistente estilo fish) ──────
 
     fn handle_query_input_key(&mut self, key: KeyEvent) {
-        let Some(state) = self.query_input.as_mut() else { return };
+        let Some(state) = self.query.query_input.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
-                self.query_input = None;
+                self.query.query_input = None;
             }
             KeyCode::Enter => {
                 let sql = state.buffer.trim().to_string();
-                self.query_input = None;
+                self.query.query_input = None;
                 if sql.is_empty() {
                     return;
                 }
@@ -2818,136 +2164,39 @@ impl App {
 
     /// Reconstruye la URL canónica desde los campos individuales
     /// (host/puerto/user/pass/db). Se llama al editar un campo.
-    fn conn_rebuild_url_from_fields(&mut self) {
-        let Some(form) = self.connection_form.as_mut() else { return };
-        let kind = form.kind_override.unwrap_or(form.kind);
-        let scheme = match kind {
-            crate::db::connection::ConnectionType::Mysql => "mysql",
-            crate::db::connection::ConnectionType::Postgres => "postgres",
-            crate::db::connection::ConnectionType::Mongo => "mongodb",
-            crate::db::connection::ConnectionType::Sqlite => "sqlite",
-            crate::db::connection::ConnectionType::Duckdb => "duckdb",
-            crate::db::connection::ConnectionType::File
-            | crate::db::connection::ConnectionType::Unknown => {
-                return; // archivos y desconocido: la URL es libre (ruta)
-            }
-        };
-        let mut url = format!("{scheme}://");
-        if !form.user.is_empty() || !form.pass.is_empty() {
-            url.push_str(&form.user);
-            if !form.pass.is_empty() {
-                url.push(':');
-                url.push_str(&form.pass);
-            }
-            url.push('@');
-        }
-        url.push_str(&form.host);
-        if !form.port.is_empty() {
-            url.push(':');
-            url.push_str(&form.port);
-        }
-        if !form.db.is_empty() {
-            url.push('/');
-            url.push_str(&form.db);
-        }
-        form.url = url;
-    }
-
-    /// Reparsea la URL actual y rellena los campos (si está completa).
-    /// Devuelve `true` si el parseo fue exitoso (la URL define el tipo).
-    fn conn_parse_url_into_fields(&mut self) -> bool {
-        let Some(form) = self.connection_form.as_mut() else { return false };
-        // Purga de la URL: quitar saltos de línea y espacios externos antes
-        // de analizar (las URLs de CleverCloud pueden llegar partidas).
-        form.url = form.url.trim().replace(['\n', '\r'], "");
-        let spec = crate::db::connection::analyze_connection(&form.url);
-        let complete = spec.kind != crate::db::connection::ConnectionType::Unknown;
-
-        if complete {
-            form.kind = spec.kind;
-            // Solo sobreescribir campos si el usuario no los forzó
-            if form.kind_override.is_none() {
-                form.host = spec.host.clone().unwrap_or_default();
-                form.port = spec.port.map_or_else(String::new, |p| p.to_string());
-                form.user = spec.user.clone().unwrap_or_default();
-                form.pass = spec.pass.clone().unwrap_or_default();
-                form.db = spec.db_name.clone().unwrap_or_default();
-            }
-            form.detected_note = format!("✓ Detectado: {}", spec.display());
-        } else if form.url.is_empty() {
-            form.detected_note.clear();
-        } else {
-            form.detected_note = "⏳ escribe la URL o ruta…".to_string();
-        }
-        complete
-    }
-
-    /// Procesa el debounce de la URL (1s desde la última tecla): si está
-    /// completa, rellena los campos. Se llama una vez por frame.
+    /// Debounce del formulario de conexión (reparseo de la URL 1s).
     pub fn tick_connection_form(&mut self) {
-        let debounce_due = {
-            let Some(form) = self.connection_form.as_ref() else { return };
-            if !form.url_debounce_scheduled {
-                return;
-            }
-            form.url_last_edit
-                .is_some_and(|last| last.elapsed() >= std::time::Duration::from_secs(1))
-        };
-        if debounce_due {
-            if let Some(form) = self.connection_form.as_mut() {
-                form.url_debounce_scheduled = false;
-                form.url_last_edit = None;
-            }
-            self.conn_parse_url_into_fields();
-        }
+        self.connection.tick();
+    }
+
+    fn conn_rebuild_url_from_fields(&mut self) {
+        self.connection.conn_rebuild_url_from_fields();
+    }
+
+    /// Reparsea la URL del formulario y rellena los campos.
+    fn conn_parse_url_into_fields(&mut self) -> bool {
+        self.connection.conn_parse_url_into_fields()
     }
 
     /// Conecta con lo que haya en el formulario (URL canónica).
     fn conn_submit(&mut self) {
-        // Si el foco está en un campo individual, reconstruir primero
-        let rebuild = self.connection_form.as_ref().is_some_and(|form| {
-            matches!(
-                form.active,
-                ConnField::Host
-                    | ConnField::Port
-                    | ConnField::User
-                    | ConnField::Pass
-                    | ConnField::Db
-            )
-        });
-        if rebuild {
-            self.conn_rebuild_url_from_fields();
-        }
-        let url = self.connection_form.as_ref().map(|f| f.url.clone()).unwrap_or_default();
-        // Purga final antes de conectar (defensa en profundidad contra \n)
-        let url = url.trim().replace(['\n', '\r'], "");
-        if url.trim().is_empty() {
+        let Some(url) = self.connection.conn_submit() else {
             self.status = "Escribe una URL o ruta para conectar".to_string();
             return;
-        }
-        tracing::debug!(url = %crate::security::strip_credentials(&url), rebuild, "conn_submit: url a conectar");
-        // Conexión real (sync por ahora; el spinner se limpia después)
-        self.connection_form.as_mut().unwrap().connecting = true;
+        };
         self.connect_sqlite(&url);
-        // REGLA DE ORO: el formulario persiste en el estado; el render lo
-        // oculta mientras haya db (`db_path.is_some()`). Al desconectar,
-        // reaparece automáticamente.
-        if let Some(form) = self.connection_form.as_mut() {
-            form.connecting = false;
-            form.url_debounce_scheduled = false;
-        }
+        // REGLA DE ORO: el formulario persiste; el render lo oculta mientras
+        // haya db. Al desconectar, reaparece.
+        self.connection.finish_connecting();
         if self.db_path.is_none() {
             self.status =
                 format!("No se pudo conectar a {}", crate::security::strip_credentials(&url));
         }
     }
 
-    /// Maneja las teclas del formulario de conexión.
-    // `drop(form)` termina el borrow de `self.connection_form` (NLL) antes de
-    // llamar a `self.conn_*`; es un no-op para clippy pero necesario aquí.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)] // dispatch de teclas del formulario (estructura plana)
     fn handle_connection_form_key(&mut self, key: KeyEvent) {
-        let Some(form) = self.connection_form.as_mut() else { return };
+        let Some(form) = self.connection.connection_form.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
                 // REGLA DE ORO: el formulario nunca se cierra sin db. Esc solo
@@ -3116,14 +2365,15 @@ impl App {
     /// Teclas del prompt de contraseña (servidor detectado): Esc cancela,
     /// Enter autentica, el resto alimenta el buffer enmascarado.
     fn handle_password_prompt_key(&mut self, key: KeyEvent) {
-        let Some(state) = self.password_prompt.as_mut() else { return };
+        let Some(state) = self.connection.password_prompt.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
-                self.password_prompt = None;
+                self.connection.password_prompt = None;
                 self.status = "Conexión al servidor cancelada".to_string();
             }
             KeyCode::Enter => {
-                let prompt = std::mem::take(&mut self.password_prompt).expect("estado presente");
+                let prompt =
+                    std::mem::take(&mut self.connection.password_prompt).expect("estado presente");
                 // URL postgres:// → autenticar en postgres; el resto (mysql://)
                 // cae al bloque mysql. Con un solo backend compilado, la rama
                 // inexistente desaparece y el `else` muestra el mensaje genérico.
@@ -3136,7 +2386,7 @@ impl App {
                     #[cfg(not(feature = "mysql"))]
                     {
                         let _ = prompt;
-                        self.password_prompt = None;
+                        self.connection.password_prompt = None;
                         self.status = "Servidor remoto no soportado en este build".to_string();
                     }
                 }
@@ -3147,7 +2397,7 @@ impl App {
                     #[cfg(not(any(feature = "mysql", feature = "postgres")))]
                     {
                         let _ = prompt;
-                        self.password_prompt = None;
+                        self.connection.password_prompt = None;
                         self.status = "Servidor remoto no soportado en este build".to_string();
                     }
                 }
@@ -3165,22 +2415,22 @@ impl App {
     fn handle_db_picker_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.db_picker = None;
+                self.connection.db_picker = None;
                 self.status = "Selección de base cancelada".to_string();
             }
             KeyCode::Up => {
-                if let Some(p) = self.db_picker.as_mut() {
+                if let Some(p) = self.connection.db_picker.as_mut() {
                     p.idx = p.idx.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
-                if let Some(p) = self.db_picker.as_mut() {
+                if let Some(p) = self.connection.db_picker.as_mut() {
                     let last = p.dbs.len().saturating_sub(1);
                     p.idx = (p.idx + 1).min(last);
                 }
             }
             KeyCode::Enter => {
-                let Some(picker) = self.db_picker.take() else { return };
+                let Some(picker) = self.connection.db_picker.take() else { return };
                 let Some(db) = picker.dbs.get(picker.idx).cloned() else {
                     self.status = "No hay bases para elegir".to_string();
                     return;
@@ -3199,7 +2449,7 @@ impl App {
     /// ↑/↓ sobre el historial (estilo fish): rellena el buffer con la query
     /// seleccionada; en `step = 0` (↓) vuelve hacia la query nueva.
     fn query_history_select(&mut self, step: usize) {
-        let Some(state) = self.query_input.as_mut() else { return };
+        let Some(state) = self.query.query_input.as_mut() else { return };
         let len = self.state.query_history.len();
         if len == 0 {
             self.status = "Historial vacío".to_string();
@@ -3244,19 +2494,19 @@ impl App {
         let _ = self.state.save();
         self.rebuild_sources(None);
 
-        tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query_gen + 1);
-        self.query_gen += 1;
-        self.query_target_object = Some(self.selected_object_name());
-        let generation = self.query_gen;
-        let Some(tx) = self.query_tx.clone() else { return };
+        tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query.query_gen + 1);
+        self.query.query_gen += 1;
+        self.query.query_target_object = Some(self.selected_object_name());
+        let generation = self.query.query_gen;
+        let Some(tx) = self.query.query_tx.clone() else { return };
 
-        self.query_state = query::QueryState::Running;
+        self.query.query_state = query::QueryState::Running;
         self.status = "Ejecutando query...".to_string();
         self.is_loading = true;
 
         // Provider: reusar la conexión activa (evita re-handshake en remoto)
         let adapter = self.adapter_arc();
-        self.query_handle = Some(tokio::spawn(async move {
+        self.query.query_handle = Some(tokio::spawn(async move {
             let res = query::execute_query(adapter, &path, &sql, query::QUERY_RESULT_LIMIT).await;
             let _ = tx.send(query::QueryMsg::Free(generation, sql, res));
         }));
@@ -3377,26 +2627,26 @@ impl App {
         self.tables.clear();
         self.views.clear();
         self.advanced.clear();
-        self.preview_rows.clear();
-        self.preview_data = None;
-        self.connection_form = Some(ConnectionFormState::default());
-        self.total_rows = 0;
-        self.preview_loaded_offset = 0;
-        self.current_page = 0;
-        self.detail_tab = DetailTab::Data;
+        self.data_view.preview_rows.clear();
+        self.data_view.preview_data = None;
+        self.connection.connection_form = Some(ConnectionFormState::default());
+        self.data_view.total_rows = 0;
+        self.data_view.preview_loaded_offset = 0;
+        self.data_view.current_page = 0;
+        self.data_view.detail_tab = DetailTab::Data;
         // Invalidar cualquier query en vuelo: su resultado ya no aplica y la
         // conexión del pool se libera YA (abort real, no solo generación)
-        self.query_gen += 1;
+        self.query.query_gen += 1;
         self.abort_query_in_flight();
-        self.query_state = query::QueryState::Idle;
-        self.query_results.clear();
-        self.sources = Self::build_sources(
+        self.query.query_state = query::QueryState::Idle;
+        self.query.query_results.clear();
+        self.sources_state.sources = Self::build_sources(
             &self.state,
-            self.source_tab,
+            self.sources_state.source_tab,
             None,
-            &self.health,
-            &self.detected_servers,
-            &self.cwd_databases,
+            &self.sources_state.health,
+            &self.sources_state.detected_servers,
+            &self.sources_state.cwd_databases,
         );
         self.set_focus(PanelKind::Sources);
         self.set_selected_idx(PanelKind::Sources, 0);
@@ -3409,16 +2659,20 @@ impl App {
     // ── exportar CSV ─────────────────────────────────────────────────
 
     #[allow(clippy::cast_precision_loss)]
+    /// Exporta la tabla/vista seleccionada a CSV usando el ADAPTER activo
+    /// (no el binario `sqlite3` externo: eso solo funcionaba en `SQLite` —
+    /// bug R4 de la auditoría). Async: el spinner gira mientras exporta y
+    /// el status se actualiza cuando termina.
     fn export_csv(&mut self) {
-        let Some(path) = self.db_path.clone() else {
-            self.status = "No hay DB conectada".to_string();
-            return;
-        };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             self.status = "Selecciona una tabla o vista primero".to_string();
             return;
         }
+        let Some(adapter) = self.adapter_arc() else {
+            self.status = "Sin conexión activa".to_string();
+            return;
+        };
 
         self.is_loading = true;
         let safe_name = object.replace([' ', '"', '/', '\\'], "_");
@@ -3426,45 +2680,40 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let filename = format!("{safe_name}_{timestamp}.csv");
-        let sql = format!("SELECT * FROM \"{}\";", object.replace('"', "\"\""));
+        // Escapar comillas dobles del identificador (SQL estándar).
+        let sql = format!("SELECT * FROM \"{}\"", object.replace('"', "\"\""));
 
         self.status = format!("Exportando a {filename}...");
 
-        match std::process::Command::new("sqlite3")
-            .args(["-header", "-csv", &path, &sql])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-        {
-            Ok(output) => {
-                if !output.status.success() {
-                    let err = String::from_utf8_lossy(&output.stderr);
-                    self.show_error("Error exportando", &err);
-                    self.is_loading = false;
-                    return;
-                }
-                match std::fs::write(&filename, &output.stdout) {
-                    Ok(()) => {
-                        let size = output.stdout.len();
-                        let size_str = if size >= 1024 * 1024 {
-                            format!("{:.1} MiB", size as f64 / (1024.0 * 1024.0))
-                        } else if size >= 1024 {
-                            format!("{:.1} KiB", size as f64 / 1024.0)
-                        } else {
-                            format!("{size} B")
-                        };
-                        self.status = format!("Exportado: {filename} ({size_str})");
-                    }
-                    Err(e) => {
-                        self.show_error("Error escribiendo", &format!("{filename}: {e}"));
-                    }
-                }
+        // Export async: la query (culling 500) + escritura del CSV corren en
+        // background; el resultado se reporta por el preview channel (reusa
+        // el poll existente) y el status bar muestra el mensaje final.
+        let tx = self.preview_tx.clone();
+        let filename2 = filename.clone();
+        tokio::spawn(async move {
+            let handle = tokio::task::spawn_blocking(move || {
+                let csv = match adapter.query(&sql, 500) {
+                    Ok(rows) => rows.join("\n"),
+                    Err(e) => return Err(e.to_string()),
+                };
+                std::fs::write(&filename2, csv).map_err(|e| e.to_string())
+            });
+            let msg = match handle.await {
+                Ok(Ok(())) => format!("Exportado: {filename}"),
+                Ok(Err(e)) => format!("Error exportando: {e}"),
+                Err(e) => format!("Error exportando: {e}"),
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(query::PreviewMsg::Ok {
+                    generation: u64::MAX,
+                    object: String::new(),
+                    detail_tab: crate::app::controller::DetailTab::Data,
+                    preview_rows: vec![msg],
+                    preview_data: None,
+                    total_rows: 0,
+                });
             }
-            Err(e) => {
-                self.show_error("Error ejecutando sqlite3", &e.to_string());
-            }
-        }
-        self.is_loading = false;
+        });
     }
 
     // ── row inspector ─────────────────────────────────────────────────
@@ -3489,7 +2738,7 @@ impl App {
 
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1); // skip header
         #[allow(clippy::cast_possible_truncation)]
-        let offset = self.preview_loaded_offset + row_idx as u32;
+        let offset = self.data_view.preview_loaded_offset + row_idx as u32;
 
         // NoSQL (mongo): el backend entrega directo los pares clave→valor SOLO
         // de los campos presentes en este documento. Cada fila puede tener
@@ -3507,6 +2756,7 @@ impl App {
         // en `preview_data` (TableData del Data tab): reutilizarlas evita una
         // consulta `column_names()` aparte por cada apertura del modal.
         let columns: Vec<crate::db::Column> = self
+            .data_view
             .preview_data
             .as_ref()
             .map(|data| data.columns.clone())
@@ -3683,11 +2933,11 @@ impl App {
     /// Items originales del panel activo (sin filtro).
     fn original_items_for(&self, kind: PanelKind) -> &[String] {
         match kind {
-            PanelKind::Sources => &self.sources,
+            PanelKind::Sources => &self.sources_state.sources,
             PanelKind::Tables => &self.tables,
             PanelKind::Views => &self.views,
             PanelKind::Advanced => &self.advanced,
-            PanelKind::Detail => &self.preview_rows,
+            PanelKind::Detail => &self.data_view.preview_rows,
         }
     }
 
@@ -3708,19 +2958,24 @@ impl App {
         self.rebuild_sources(None);
 
         let ui_config = config::Config::load().ui;
-        self.rows_per_page = ui_config.rows_per_page;
+        self.data_view.rows_per_page = ui_config.rows_per_page;
 
         // Ajustar índices si las listas se achicaron
-        if self.selected_idx(PanelKind::Sources) >= self.sources.len() {
-            self.set_selected_idx(PanelKind::Sources, self.sources.len().saturating_sub(1));
+        if self.selected_idx(PanelKind::Sources) >= self.sources_state.sources.len() {
+            self.set_selected_idx(
+                PanelKind::Sources,
+                self.sources_state.sources.len().saturating_sub(1),
+            );
         }
 
         if self.db_path.is_some() {
             self.refresh_preview_from_selected_object();
         }
 
-        self.status =
-            format!("Config recargada: keys + estado + ui (rows_per_page={})", self.rows_per_page);
+        self.status = format!(
+            "Config recargada: keys + estado + ui (rows_per_page={})",
+            self.data_view.rows_per_page
+        );
     }
 
     // ── menú de acciones ──────────────────────────────────────────────
@@ -3728,7 +2983,7 @@ impl App {
         if self.active_panel == PanelKind::Detail {
             // Enter sobre una fila de datos: FK Jump si la fila referencia
             // otra tabla; si no, el inspector de fila (comportamiento previo).
-            if self.detail_tab == DetailTab::Data
+            if self.data_view.detail_tab == DetailTab::Data
                 && self.selected_idx(PanelKind::Detail) > 0
                 && self.fk_jump()
             {
@@ -3742,7 +2997,7 @@ impl App {
         match self.active_panel {
             PanelKind::Sources => self.connect_selected_source(),
             PanelKind::Tables | PanelKind::Views | PanelKind::Advanced => {
-                self.current_page = 0;
+                self.data_view.current_page = 0;
                 self.refresh_preview_from_selected_object();
             }
             PanelKind::Detail => {}
@@ -3762,7 +3017,7 @@ impl App {
         if object.is_empty() || object == "-" {
             return false;
         }
-        let Some(data) = self.preview_data.as_ref() else { return false };
+        let Some(data) = self.data_view.preview_data.as_ref() else { return false };
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1);
         let Some(row) = data.rows.get(row_idx) else { return false };
 
@@ -3833,14 +3088,14 @@ impl App {
 
         // Cargar la página que contiene la fila referenciada
         #[allow(clippy::cast_possible_truncation)]
-        let page = (idx.saturating_sub(1)) / self.rows_per_page;
-        self.current_page = page;
-        self.detail_tab = DetailTab::Data;
+        let page = (idx.saturating_sub(1)) / self.data_view.rows_per_page;
+        self.data_view.current_page = page;
+        self.data_view.detail_tab = DetailTab::Data;
         self.refresh_preview_from_selected_object();
 
         // Seleccionar la fila exacta dentro de la página
         #[allow(clippy::cast_possible_truncation)]
-        let local = idx.saturating_sub(page.saturating_mul(self.rows_per_page));
+        let local = idx.saturating_sub(page.saturating_mul(self.data_view.rows_per_page));
         #[allow(clippy::cast_possible_truncation)]
         {
             self.set_selected_idx(PanelKind::Detail, local as usize);
@@ -3938,11 +3193,11 @@ impl App {
             self.show_actions_menu = false;
             self.actions_menu_idx = 0;
             self.status = String::new();
-        } else if self.password_prompt.is_some() {
-            self.password_prompt = None;
+        } else if self.connection.password_prompt.is_some() {
+            self.connection.password_prompt = None;
             self.status = String::new();
-        } else if self.db_picker.is_some() {
-            self.db_picker = None;
+        } else if self.connection.db_picker.is_some() {
+            self.connection.db_picker = None;
             self.status = String::new();
         } else {
             self.should_quit = true;
@@ -3959,8 +3214,8 @@ impl App {
         }
 
         // Formulario de conexión: pegar en el campo URL (o el campo activo)
-        if self.connection_form.is_some() && self.db_path.is_none() {
-            if let Some(form) = self.connection_form.as_mut() {
+        if self.connection.connection_form.is_some() && self.db_path.is_none() {
+            if let Some(form) = self.connection.connection_form.as_mut() {
                 let target = match form.active {
                     ConnField::Url => &mut form.url,
                     ConnField::Host => &mut form.host,
@@ -3977,7 +3232,7 @@ impl App {
                 }
             }
             // Reconstruir la URL si se pegó en un campo individual
-            if let Some(form) = self.connection_form.as_ref() {
+            if let Some(form) = self.connection.connection_form.as_ref() {
                 if matches!(
                     form.active,
                     ConnField::Host
@@ -3993,16 +3248,16 @@ impl App {
         }
 
         // Input de query (`:`)
-        if self.query_input.is_some() {
-            if let Some(state) = self.query_input.as_mut() {
+        if self.query.query_input.is_some() {
+            if let Some(state) = self.query.query_input.as_mut() {
                 state.buffer.push_str(&clean);
             }
             return;
         }
 
         // Prompt de contraseña
-        if self.password_prompt.is_some() {
-            if let Some(state) = self.password_prompt.as_mut() {
+        if self.connection.password_prompt.is_some() {
+            if let Some(state) = self.connection.password_prompt.as_mut() {
                 state.buffer.push_str(&clean);
             }
             return;
@@ -4034,11 +3289,11 @@ impl App {
         // ── modales superpuestos: el prompt de contraseña y el picker de
         // bases capturan SIEMPRE primero (se abren sobre el formulario de
         // conexión cuando conectas a un servidor remoto). ──
-        if self.password_prompt.is_some() {
+        if self.connection.password_prompt.is_some() {
             self.handle_password_prompt_key(key);
             return;
         }
-        if self.db_picker.is_some() {
+        if self.connection.db_picker.is_some() {
             self.handle_db_picker_key(key);
             return;
         }
@@ -4054,13 +3309,13 @@ impl App {
 
         // ── input SQL (modal `:` — captura TODO mientras está abierto,
         // incluidos chars no mapeados a ninguna acción) ──
-        if self.query_input.is_some() {
+        if self.query.query_input.is_some() {
             self.handle_query_input_key(key);
             return;
         }
 
         // ── pick de base de datos (modal de servidor detectado) ──
-        if self.db_picker.is_some() {
+        if self.connection.db_picker.is_some() {
             self.handle_db_picker_key(key);
             return;
         }
@@ -4178,7 +3433,7 @@ impl App {
             keys::AppAction::ClearQueryState => self.clear_query_state(),
             keys::AppAction::ReloadRuntimeConfig => self.reload_runtime_config(),
             keys::AppAction::OpenQueryInput => {
-                self.query_input = Some(QueryInputState::default());
+                self.query.query_input = Some(query::QueryInputState::default());
                 self.status = "SQL: escribe una query, ↑/↓ historial, enter ejecuta".to_string();
             }
             keys::AppAction::ToggleActionsMenu => {
@@ -4238,12 +3493,16 @@ impl App {
             keys::AppAction::MoveUp => self.move_selection(-1),
             keys::AppAction::MoveDown => self.move_selection(1),
             keys::AppAction::PrevPage => {
-                if self.active_panel == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                if self.active_panel == PanelKind::Detail
+                    && self.data_view.detail_tab == DetailTab::Data
+                {
                     self.move_selection_by_page(false);
                 }
             }
             keys::AppAction::NextPage => {
-                if self.active_panel == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                if self.active_panel == PanelKind::Detail
+                    && self.data_view.detail_tab == DetailTab::Data
+                {
                     self.move_selection_by_page(true);
                 }
             }
@@ -4251,10 +3510,14 @@ impl App {
             keys::AppAction::Enter => self.handle_enter(), // legacy, sin binding por defecto
             keys::AppAction::SourceTabRecents => self.set_source_tab(SourceTab::All),
             keys::AppAction::SourceTabFavorites => self.set_source_tab(SourceTab::Local),
-            keys::AppAction::SourceTabNext => self.set_source_tab(self.source_tab.next()),
-            keys::AppAction::SourceTabPrev => self.set_source_tab(self.source_tab.prev()),
-            keys::AppAction::DetailTabPrev => self.set_detail_tab(self.detail_tab.prev()),
-            keys::AppAction::DetailTabNext => self.set_detail_tab(self.detail_tab.next()),
+            keys::AppAction::SourceTabNext => {
+                self.set_source_tab(self.sources_state.source_tab.next());
+            }
+            keys::AppAction::SourceTabPrev => {
+                self.set_source_tab(self.sources_state.source_tab.prev());
+            }
+            keys::AppAction::DetailTabPrev => self.set_detail_tab(self.data_view.detail_tab.prev()),
+            keys::AppAction::DetailTabNext => self.set_detail_tab(self.data_view.detail_tab.next()),
             keys::AppAction::DetailTabData => self.set_detail_tab(DetailTab::Data),
             keys::AppAction::DetailTabSchema => self.set_detail_tab(DetailTab::Schema),
             keys::AppAction::DetailTabSql => self.set_detail_tab(DetailTab::Sql),
@@ -4333,7 +3596,10 @@ impl App {
             } // ── drop `p` ──
 
             // Header bypass para Data tab no enfocado
-            if target == PanelKind::Detail && self.detail_tab == DetailTab::Data && items_len > 1 {
+            if target == PanelKind::Detail
+                && self.data_view.detail_tab == DetailTab::Data
+                && items_len > 1
+            {
                 let p = self.panel_mut(target);
                 if p.selected_idx == 0 {
                     p.selected_idx = 1;
@@ -4341,10 +3607,13 @@ impl App {
             }
 
             // Scroll infinito en Data tab no enfocado
-            if target == PanelKind::Detail && self.detail_tab == DetailTab::Data && items_len > 1 {
+            if target == PanelKind::Detail
+                && self.data_view.detail_tab == DetailTab::Data
+                && items_len > 1
+            {
                 if !up && old_idx == items_len.saturating_sub(1) {
                     self.scroll_down_infinite();
-                } else if up && old_idx == 1 && self.preview_loaded_offset > 0 {
+                } else if up && old_idx == 1 && self.data_view.preview_loaded_offset > 0 {
                     self.scroll_up_infinite();
                 }
             }
@@ -4379,7 +3648,7 @@ impl App {
     /// del título (que empieza en rect.x + 1, después de la esquina ┌).
     fn detect_source_tab_click(&self, cursor_x: u16, rect: Rect) -> Option<SourceTab> {
         let num = PanelKind::Sources.number();
-        let tabs = match self.source_tab {
+        let tabs = match self.sources_state.source_tab {
             SourceTab::All => "[Todo] Local Online",
             SourceTab::Local => "Todo [Local] Online",
             SourceTab::Online => "Todo Local [Online]",
@@ -4406,17 +3675,20 @@ impl App {
     #[allow(clippy::cast_possible_truncation)]
     fn detail_tab_display_width(&self, tab: DetailTab) -> u16 {
         let label = tab.label();
-        let inner = if tab == DetailTab::Data && self.total_rows > 0 {
-            let current_row = self.preview_loaded_offset
+        let inner = if tab == DetailTab::Data && self.data_view.total_rows > 0 {
+            let current_row = self.data_view.preview_loaded_offset
                 + self.selected_idx(PanelKind::Detail).saturating_sub(1) as u32
                 + 1;
-            let total = self.total_rows;
+            let total = self.data_view.total_rows;
             format!("{label} - row {current_row}/{total}")
         } else {
             label.to_string()
         };
-        let padded =
-            if tab == self.detail_tab { format!(" [ {inner} ] ") } else { format!("  {inner}  ") };
+        let padded = if tab == self.data_view.detail_tab {
+            format!(" [ {inner} ] ")
+        } else {
+            format!("  {inner}  ")
+        };
         #[allow(clippy::cast_possible_truncation)]
         {
             padded.len() as u16
@@ -4429,8 +3701,11 @@ impl App {
         let detail = self.panel(PanelKind::Detail);
         let current = detail.h_scroll.get();
         let max_cols = {
-            let headers: Vec<&str> =
-                self.preview_rows.first().map_or_else(Vec::new, |r| r.split(" | ").collect());
+            let headers: Vec<&str> = self
+                .data_view
+                .preview_rows
+                .first()
+                .map_or_else(Vec::new, |r| r.split(" | ").collect());
             headers.len()
         };
         let inner_w = self
@@ -4457,10 +3732,10 @@ impl App {
     /// Dado un click en el área del panel Detail (Data tab), calcula a qué columna
     /// corresponde según la posición X y las columnas parseadas del header.
     fn column_at_x(&self, x: u16, rect: Rect) -> Option<String> {
-        if self.preview_rows.is_empty() {
+        if self.data_view.preview_rows.is_empty() {
             return None;
         }
-        let headers: Vec<&str> = self.preview_rows[0].split(" | ").collect();
+        let headers: Vec<&str> = self.data_view.preview_rows[0].split(" | ").collect();
         let col_count = headers.len();
         if col_count <= 1 {
             return None;
@@ -4519,21 +3794,21 @@ impl App {
         if !self.filtered_items.is_empty() || self.input_mode == InputMode::Filtering {
             self.cancel_filter();
         }
-        if self.sort_column.as_deref() == Some(col.as_str()) {
-            if self.sort_asc {
-                self.sort_asc = false;
+        if self.data_view.sort_column.as_deref() == Some(col.as_str()) {
+            if self.data_view.sort_asc {
+                self.data_view.sort_asc = false;
             } else {
                 // 3er click: desactivar ordenamiento
-                self.sort_column = None;
-                self.sort_asc = true;
+                self.data_view.sort_column = None;
+                self.data_view.sort_asc = true;
             }
         } else {
-            self.sort_column = Some(col);
-            self.sort_asc = true;
+            self.data_view.sort_column = Some(col);
+            self.data_view.sort_asc = true;
         }
         // Recargar datos desde la página actual con el nuevo orden
-        self.current_page = 0;
-        self.preview_loaded_offset = 0;
+        self.data_view.current_page = 0;
+        self.data_view.preview_loaded_offset = 0;
         self.refresh_preview_from_selected_object();
     }
 
@@ -4571,6 +3846,7 @@ impl App {
                     self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
                 {
                     let headers: Vec<&str> = self
+                        .data_view
                         .preview_rows
                         .first()
                         .map_or_else(Vec::new, |r| r.split(" | ").collect());
@@ -4614,7 +3890,7 @@ impl App {
         if self.show_row_inspector || self.show_actions_menu {
             return false;
         }
-        if self.detail_tab != DetailTab::Data {
+        if self.data_view.detail_tab != DetailTab::Data {
             return false;
         }
         let Some(&(_, rect)) = self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
@@ -4626,7 +3902,7 @@ impl App {
             return false;
         }
         let headers: Vec<&str> =
-            self.preview_rows.first().map_or_else(Vec::new, |r| r.split(" | ").collect());
+            self.data_view.preview_rows.first().map_or_else(Vec::new, |r| r.split(" | ").collect());
         let col_count = headers.len();
         if col_count <= 1 {
             return false;
@@ -4731,7 +4007,7 @@ impl App {
                 continue;
             }
             // Detail + Data tab no tiene scrollbar vertical (usa el horizontal)
-            if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+            if kind == PanelKind::Detail && self.data_view.detail_tab == DetailTab::Data {
                 continue;
             }
             let items_len = self.items_len_for(kind);
@@ -4778,7 +4054,7 @@ impl App {
         // Formulario de nueva conexión (sin db): click en el botón
         // "[Conectar]" conecta; click en cualquier otra zona del Detail
         // enfoca el panel para que el teclado alimente los campos.
-        if self.db_path.is_none() && self.connection_form.is_some() {
+        if self.db_path.is_none() && self.connection.connection_form.is_some() {
             if let Some(&(_, rect)) =
                 self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
             {
@@ -4857,7 +4133,10 @@ impl App {
             self.set_focus(kind);
 
             // Click en header de Data tab → ordenar por columna
-            if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data && rel_y == 2 {
+            if kind == PanelKind::Detail
+                && self.data_view.detail_tab == DetailTab::Data
+                && rel_y == 2
+            {
                 if let Some(col_name) = self.column_at_x(x, rect) {
                     self.toggle_sort(col_name);
                 }
@@ -4867,9 +4146,13 @@ impl App {
             // Click en un ítem de la lista
             // Para Data tab, las filas de datos empiezan en rel_y=4 (spacer+header+separator)
             let top_reserved =
-                if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data { 3 } else { 0 };
+                if kind == PanelKind::Detail && self.data_view.detail_tab == DetailTab::Data {
+                    3
+                } else {
+                    0
+                };
             if let Some(mut index) = list_index_from_click(rel_y, rect.height, top_reserved) {
-                if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                if kind == PanelKind::Detail && self.data_view.detail_tab == DetailTab::Data {
                     // +1 porque selected_idx=0 salta el header (primera fila de datos es idx=1)
                     index = index.saturating_add(1);
                 }
@@ -4905,7 +4188,7 @@ impl App {
                     || kind == PanelKind::Views
                     || kind == PanelKind::Advanced
                 {
-                    self.current_page = 0;
+                    self.data_view.current_page = 0;
                     self.refresh_preview_from_selected_object();
                 }
                 // Detail: doble-click ya manejado arriba, click simple no hace nada extra
@@ -4923,7 +4206,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Helpers del panel Fuentes movidos a sources.rs (Fase 1): los tests
+    // de build_sources/marcas/probes los referencian por nombre corto.
+    use crate::app::sources::{
+        SourceKind, SourcesState, db_type_mark, is_source_section, probe_source, source_host_port,
+        source_kind, source_section, strip_source_marks, url_host,
+    };
     use crossterm::event::KeyModifiers;
+    use std::collections::HashSet;
 
     fn state_de_prueba() -> storage::AppState {
         let mut state = storage::AppState::new();
@@ -5304,14 +4594,14 @@ mod tests {
 
     #[test]
     fn source_probe_path_ignora_secciones_placeholder_y_acciones() {
-        assert_eq!(App::source_probe_path("\u{1}RECIENTES"), None, "sección");
-        assert_eq!(App::source_probe_path("<sin entradas>"), None, "placeholder");
-        assert_eq!(App::source_probe_path("Abrir sakila.db"), None, "acción fija");
-        assert_eq!(App::source_probe_path("Buscar archivo .db"), None, "acción fija 2");
+        assert_eq!(SourcesState::source_probe_path("\u{1}RECIENTES"), None, "sección");
+        assert_eq!(SourcesState::source_probe_path("<sin entradas>"), None, "placeholder");
+        assert_eq!(SourcesState::source_probe_path("Abrir sakila.db"), None, "acción fija");
+        assert_eq!(SourcesState::source_probe_path("Buscar archivo .db"), None, "acción fija 2");
         // Fuentes reales → path limpio (marcas y prefijos fuera)
-        assert_eq!(App::source_probe_path("▣ /tmp/a.db"), Some("/tmp/a.db".to_string()));
+        assert_eq!(SourcesState::source_probe_path("▣ /tmp/a.db"), Some("/tmp/a.db".to_string()));
         assert_eq!(
-            App::source_probe_path("M mysql://db.azure.com/prod"),
+            SourcesState::source_probe_path("M mysql://db.azure.com/prod"),
             Some("mysql://db.azure.com/prod".to_string())
         );
     }
@@ -5333,20 +4623,20 @@ mod tests {
         probing.insert("/tmp/two.db".to_string());
 
         // Ventana completa: solo queda three.db
-        let targets = App::visible_probe_targets(&items, 0..6, &health, &probing);
+        let targets = SourcesState::visible_probe_targets(&items, 0..6, &health, &probing);
         assert_eq!(targets, vec!["/tmp/three.db".to_string()]);
 
         // Ventana parcial (filas 0..2 = sección + one.db): nada nuevo
-        let targets = App::visible_probe_targets(&items, 0..2, &health, &probing);
+        let targets = SourcesState::visible_probe_targets(&items, 0..2, &health, &probing);
         assert!(targets.is_empty());
 
         // Ventana 0..3: sección + one.db + two.db → los tres filtrados
-        let targets = App::visible_probe_targets(&items, 0..3, &health, &probing);
+        let targets = SourcesState::visible_probe_targets(&items, 0..3, &health, &probing);
         assert!(targets.is_empty());
 
         // Ventana desplazada (2..6): two.db (en vuelo), three.db, placeholder,
         // acción → solo three.db
-        let targets = App::visible_probe_targets(&items, 2..6, &health, &probing);
+        let targets = SourcesState::visible_probe_targets(&items, 2..6, &health, &probing);
         assert_eq!(targets, vec!["/tmp/three.db".to_string()]);
     }
 
@@ -5483,13 +4773,13 @@ mod tests {
     #[tokio::test]
     async fn pagina_mueve_k_filas_con_clamp_al_contenido() {
         let mut app = App::new();
-        app.detail_tab = DetailTab::Data;
+        app.data_view.detail_tab = DetailTab::Data;
         // Buffer: header + 40 filas cargadas (de 250 totales)
-        app.preview_rows = std::iter::once("col".to_string())
+        app.data_view.preview_rows = std::iter::once("col".to_string())
             .chain((1..=40).map(|i| format!("fila {i}")))
             .collect();
-        app.total_rows = 250;
-        app.preview_loaded_offset = 100;
+        app.data_view.total_rows = 250;
+        app.data_view.preview_loaded_offset = 100;
         app.compute_layout(120, 40);
         let k = {
             let rect = app
@@ -5506,7 +4796,7 @@ mod tests {
         app.set_selected_idx(PanelKind::Detail, 1);
         app.move_selection_by_page(true);
         assert_eq!(app.selected_idx(PanelKind::Detail), 1 + k);
-        assert_eq!(app.preview_loaded_offset, 100, "no debe recargar el preview");
+        assert_eq!(app.data_view.preview_loaded_offset, 100, "no debe recargar el preview");
 
         // avPag: sobrepasa el final del buffer → clamp a la última fila
         app.move_selection_by_page(true);
@@ -5526,7 +4816,7 @@ mod tests {
 
     fn app_con_query_input(history: &[&str]) -> App {
         let mut app = App::new();
-        app.query_input = Some(QueryInputState::default());
+        app.query.query_input = Some(query::QueryInputState::default());
         // Más reciente al inicio: coincide con add_query_history (insert(0, ...))
         app.state.query_history = history.iter().map(|s| (*s).to_string()).collect();
         // Para consistencia visual en los tests: invertimos si lo declaran
@@ -5541,7 +4831,7 @@ mod tests {
         let mut app = App::new();
         // `:` está bindeado a OpenQueryInput; la acción abre el popup
         app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
-        assert!(app.query_input.is_some(), "`:` debe abrir el input SQL");
+        assert!(app.query.query_input.is_some(), "`:` debe abrir el input SQL");
     }
 
     #[test]
@@ -5550,7 +4840,7 @@ mod tests {
         for c in ['S', 'E', 'L'] {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         assert_eq!(s.buffer, "SEL");
         assert_eq!(s.cursor, 3);
     }
@@ -5562,7 +4852,7 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         assert_eq!(s.buffer, "SE");
         assert_eq!(s.cursor, 2);
     }
@@ -5572,7 +4862,7 @@ mod tests {
         let mut app = app_con_query_input(&["SELECT 2", "SELECT 1"]);
         // buffer vacío + ↑ → la query más reciente (idx 0 = "SELECT 2")
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         assert_eq!(s.buffer, "SELECT 2");
         assert_eq!(s.history_idx, Some(0));
         assert_eq!(s.cursor, s.buffer.chars().count());
@@ -5583,7 +4873,7 @@ mod tests {
         let mut app = app_con_query_input(&["SELECT 2", "SELECT 1"]);
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         // Llegamos a la entrada más vieja: "SELECT 1"
         assert_eq!(s.buffer, "SELECT 1");
         assert_eq!(s.history_idx, Some(1));
@@ -5595,7 +4885,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         // ↑ rellenó "SELECT 2" (idx 0); ↓ baja hacia la siguiente → "SELECT 1"
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         // ↓ desde idx=1 debería bajar a idx=0 (más reciente)
         assert_eq!(s.buffer, "SELECT 2", "↓ desde posición alta vuelve a la más reciente");
     }
@@ -5604,7 +4894,7 @@ mod tests {
     fn enter_con_buffer_vacio_cierra_sin_ejecutar_ni_historial() {
         let mut app = app_con_query_input(&[]);
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.query_input.is_none());
+        assert!(app.query.query_input.is_none());
         assert!(app.state.query_history.is_empty(), "buffer vacío no registra historial");
     }
 
@@ -5615,7 +4905,7 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.query_input.is_none(), "Enter cierra el popup");
+        assert!(app.query.query_input.is_none(), "Enter cierra el popup");
         // Conexión async: el error del resolver llega por canal → poll.
         // El spawn_blocking corre en paralelo; esperamos a que termine.
         for _ in 0..20 {
@@ -5696,25 +4986,25 @@ mod tests {
 
         // Camino A: el primer intento sin credenciales abre el picker (no hay
         // auth). Camino B: abre el prompt de password → autenticar con root/root.
-        if app.password_prompt.is_some() {
-            let p = app.password_prompt.take().unwrap();
+        if app.connection.password_prompt.is_some() {
+            let p = app.connection.password_prompt.take().unwrap();
             app.connect_mysql_server_with_password(PasswordPromptState {
                 server_url: p.server_url,
                 user: "root".into(),
                 buffer: "root".into(),
             });
         }
-        let Some(picker) = &app.db_picker else {
+        let Some(picker) = &app.connection.db_picker else {
             panic!(
                 "debe abrirse el picker (prompt: {:?}, picker: {:?})",
-                app.password_prompt.is_some(),
-                app.db_picker.is_some()
+                app.connection.password_prompt.is_some(),
+                app.connection.db_picker.is_some()
             );
         };
         assert!(picker.dbs.contains(&"lazydb_demo".to_string()), "bases: {:?}", picker.dbs);
         // Elegir la BD por índice → connect_sqlite carga el catálogo
         let idx = picker.dbs.iter().position(|d| d == "lazydb_demo").unwrap();
-        let picker = app.db_picker.take().unwrap();
+        let picker = app.connection.db_picker.take().unwrap();
         let db = picker.dbs[idx].clone();
         let mut url = picker.server_url;
         url.push('/');
@@ -5738,13 +5028,13 @@ mod tests {
         let mut app = App::new();
         // Mismo path que la UI al presionar Enter sobre el servidor detectado
         app.connect_sqlite(&server_url);
-        let Some(picker) = &app.db_picker else {
+        let Some(picker) = &app.connection.db_picker else {
             panic!("debe abrirse el picker (status: {})", app.status);
         };
         assert!(picker.dbs.iter().any(|d| d == "lazydb_probe"), "bases: {:?}", picker.dbs);
         // Elegir la base por índice → connect_sqlite conecta el catálogo
         let idx = picker.dbs.iter().position(|d| d == "lazydb_probe").unwrap();
-        let picker = app.db_picker.take().unwrap();
+        let picker = app.connection.db_picker.take().unwrap();
         let db = picker.dbs[idx].clone();
         let mut url = picker.server_url;
         url.push('/');
@@ -5764,7 +5054,7 @@ mod tests {
         };
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
         // Escribir la URL con base y Enter → debe conectar directo
         let mut url = server_url;
         url.push('/');
@@ -5790,11 +5080,11 @@ mod tests {
         // Al arrancar (sin db): el Detail debe ofrecer el formulario de
         // conexión con el foco en la URL (nada del placeholder viejo).
         let app = App::new();
-        let Some(form) = app.connection_form.as_ref() else {
+        let Some(form) = app.connection.connection_form.as_ref() else {
             panic!("debe existir el formulario de conexión al arrancar");
         };
         assert_eq!(form.active, ConnField::Url, "foco inicial en la URL");
-        assert!(app.preview_rows.is_empty(), "sin items de lista");
+        assert!(app.data_view.preview_rows.is_empty(), "sin items de lista");
     }
 
     #[test]
@@ -5804,12 +5094,18 @@ mod tests {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.connection_form.is_some(), "Esc no debe cerrar el formulario sin db abierta");
+        assert!(
+            app.connection.connection_form.is_some(),
+            "Esc no debe cerrar el formulario sin db abierta"
+        );
         assert_eq!(app.active_panel, PanelKind::Sources, "Esc mueve el foco a Fuentes");
 
         // Navegar a otros paneles no elimina el formulario tampoco
         app.active_panel = PanelKind::Tables;
-        assert!(app.connection_form.is_some(), "el formulario persiste en cualquier panel");
+        assert!(
+            app.connection.connection_form.is_some(),
+            "el formulario persiste en cualquier panel"
+        );
     }
 
     #[test]
@@ -5819,15 +5115,15 @@ mod tests {
         // no "mover el foco" (que dejaba el modal colgado).
         let mut app = App::new();
         app.active_panel = PanelKind::Detail; // el formulario está activo
-        app.connection_form = Some(ConnectionFormState::default());
-        app.password_prompt = Some(PasswordPromptState {
+        app.connection.connection_form = Some(ConnectionFormState::default());
+        app.connection.password_prompt = Some(PasswordPromptState {
             server_url: "mysql://127.0.0.1:3306".to_string(),
             user: "root".to_string(),
             buffer: "x".to_string(),
         });
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            app.password_prompt.is_none(),
+            app.connection.password_prompt.is_none(),
             "Esc debe cerrar el prompt de contraseña (no lo intercepta el formulario)"
         );
         assert_eq!(app.active_panel, PanelKind::Detail, "el foco no debe moverse");
@@ -5839,17 +5135,17 @@ mod tests {
         // formulario cuando `db_path.is_none()`, sea cual sea el panel.
         let app = App::new();
         assert!(app.db_path.is_none());
-        assert!(app.connection_form.is_some(), "sin db → formulario presente");
+        assert!(app.connection.connection_form.is_some(), "sin db → formulario presente");
     }
 
     #[test]
     fn conn_parse_url_rellena_los_campos() {
         let mut app = App::new();
-        app.connection_form = Some(ConnectionFormState::default());
-        app.connection_form.as_mut().unwrap().url =
+        app.connection.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form.as_mut().unwrap().url =
             "mysql://user:pass@localhost:3306/lazy".to_string();
         assert!(app.conn_parse_url_into_fields());
-        let form = app.connection_form.as_ref().unwrap();
+        let form = app.connection.connection_form.as_ref().unwrap();
         assert_eq!(form.kind, crate::db::connection::ConnectionType::Mysql);
         assert_eq!(form.host, "localhost");
         assert_eq!(form.port, "3306");
@@ -5862,15 +5158,15 @@ mod tests {
     #[test]
     fn conn_parse_url_uri_clevercloud_rellena_credenciales() {
         let mut app = App::new();
-        app.connection_form = Some(ConnectionFormState::default());
-        app.connection_form.as_mut().unwrap().url = concat!(
+        app.connection.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form.as_mut().unwrap().url = concat!(
             "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@",
             "bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/",
             "bh4bhaewrpd8qqcreso5"
         )
         .to_string();
         assert!(app.conn_parse_url_into_fields());
-        let form = app.connection_form.as_ref().unwrap();
+        let form = app.connection.connection_form.as_ref().unwrap();
         assert_eq!(form.user, "uo8h6cfqdm4u5xv6lfqq");
         assert_eq!(form.pass, "dsJBQr44561wnu9YizPLTeP1GFh0eO");
         assert_eq!(form.port, "5432");
@@ -5881,25 +5177,25 @@ mod tests {
     fn ctrl_u_limpia_el_campo_activo_y_ctrl_l_limpia_todo() {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail; // el formulario captura con foco en Detail
-        app.connection_form = Some(ConnectionFormState::default());
-        app.connection_form.as_mut().unwrap().url =
+        app.connection.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form.as_mut().unwrap().url =
             "mysql://user:pass@localhost:3306/lazy".to_string();
-        app.connection_form.as_mut().unwrap().host = "localhost".to_string();
-        app.connection_form.as_mut().unwrap().active = ConnField::Url;
+        app.connection.connection_form.as_mut().unwrap().host = "localhost".to_string();
+        app.connection.connection_form.as_mut().unwrap().active = ConnField::Url;
 
         // Ctrl+U limpia el campo URL activo
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(app.connection_form.as_ref().unwrap().url, "");
+        assert_eq!(app.connection.connection_form.as_ref().unwrap().url, "");
         assert_eq!(
-            app.connection_form.as_ref().unwrap().host,
+            app.connection.connection_form.as_ref().unwrap().host,
             "localhost",
             "otros campos intactos con Ctrl+U"
         );
 
         // Ctrl+L limpia todo el formulario
-        app.connection_form.as_mut().unwrap().host = "localhost".to_string();
+        app.connection.connection_form.as_mut().unwrap().host = "localhost".to_string();
         app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
-        let form = app.connection_form.as_ref().unwrap();
+        let form = app.connection.connection_form.as_ref().unwrap();
         assert!(form.host.is_empty(), "Ctrl+L limpia todo");
         assert!(form.url.is_empty());
         assert_eq!(form.active, ConnField::Url, "el foco vuelve a la URL");
@@ -5908,23 +5204,23 @@ mod tests {
     #[test]
     fn conn_parse_url_incompleta_no_toca_campos() {
         let mut app = App::new();
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
         {
-            let form = app.connection_form.as_mut().unwrap();
+            let form = app.connection.connection_form.as_mut().unwrap();
             form.url = "mysql:/".to_string(); // incompleta: sin `//host`
             form.host = "ya-editado".to_string();
         }
         assert!(!app.conn_parse_url_into_fields());
-        let form = app.connection_form.as_ref().unwrap();
+        let form = app.connection.connection_form.as_ref().unwrap();
         assert_eq!(form.host, "ya-editado", "no debe sobreescribir campos manuales");
     }
 
     #[test]
     fn conn_rebuild_url_desde_campos() {
         let mut app = App::new();
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
         {
-            let form = app.connection_form.as_mut().unwrap();
+            let form = app.connection.connection_form.as_mut().unwrap();
             form.kind = crate::db::connection::ConnectionType::Mysql;
             form.host = "db.azure.com".to_string();
             form.port = "3306".to_string();
@@ -5934,7 +5230,7 @@ mod tests {
         }
         app.conn_rebuild_url_from_fields();
         assert_eq!(
-            app.connection_form.as_ref().unwrap().url,
+            app.connection.connection_form.as_ref().unwrap().url,
             "mysql://admin:secreto@db.azure.com:3306/prod"
         );
     }
@@ -5948,17 +5244,17 @@ mod tests {
     async fn uri_clevercloud_con_base_no_abre_prompt_de_contrasena() {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
         let uri = concat!(
             "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@",
             "bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/",
             "bh4bhaewrpd8qqcreso5"
         );
-        app.connection_form.as_mut().unwrap().url = uri.to_string();
+        app.connection.connection_form.as_mut().unwrap().url = uri.to_string();
         // Enter en el campo URL → parsea + conecta
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            app.password_prompt.is_none(),
+            app.connection.password_prompt.is_none(),
             "la URI con /db y credenciales NO debe pedir contraseña (status: {})",
             app.status
         );
@@ -5971,7 +5267,7 @@ mod tests {
     async fn on_paste_sanitiza_nueva_linea_y_conn_parse_purga_la_url() {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
 
         // Simula el pegado de la URL partida (con \n entre el puerto y la db)
         let pegada = concat!(
@@ -5979,7 +5275,7 @@ mod tests {
             "bh4bhaewrpd8qqcreso5"
         );
         app.on_paste(pegada);
-        let url_limpia = app.connection_form.as_ref().unwrap().url.clone();
+        let url_limpia = app.connection.connection_form.as_ref().unwrap().url.clone();
         assert!(!url_limpia.contains('\n'), "el paste debe quitar el \\n: {url_limpia:?}");
         assert!(
             url_limpia.ends_with("bh4bhaewrpd8qqcreso5"),
@@ -5989,7 +5285,7 @@ mod tests {
         // Enter → parsea (con purga) y no debe ir al flujo de servidor
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            app.password_prompt.is_none(),
+            app.connection.password_prompt.is_none(),
             "URL purgada no debe pedir contraseña (status: {})",
             app.status
         );
@@ -6072,12 +5368,12 @@ mod tests {
         let mut app = App::new();
         app.active_adapter = Some(std::sync::Arc::new(FakeScrollAdapter { total }));
         app.active_panel = PanelKind::Detail;
-        app.detail_tab = DetailTab::Data;
+        app.data_view.detail_tab = DetailTab::Data;
         app.tables = vec!["t".to_string()];
         app.object_section = ObjectSection::Tables;
         app.set_selected_idx(PanelKind::Tables, 0);
-        app.rows_per_page = page;
-        app.total_rows = total;
+        app.data_view.rows_per_page = page;
+        app.data_view.total_rows = total;
         app
     }
 
@@ -6085,13 +5381,13 @@ mod tests {
     /// con `n` filas — el estado exacto tras cargar una página.
     fn cargar_pagina(app: &mut App, n: u32) {
         let rows: Vec<db::Row> = (0..n).map(|i| db::Row { cells: vec![format!("v{i}")] }).collect();
-        app.preview_data = Some(db::TableData {
+        app.data_view.preview_data = Some(db::TableData {
             columns: vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }],
             rows: rows.clone(),
         });
         let mut lines = vec!["id".to_string()];
         lines.extend(rows.iter().map(|r| r.to_line(" | ")));
-        app.preview_rows = lines;
+        app.data_view.preview_rows = lines;
     }
 
     /// REGRESIÓN: el scroll hacia abajo se congelaba porque
@@ -6106,10 +5402,10 @@ mod tests {
 
         app.scroll_down_infinite(); // carga la página 2
 
-        let data_len = app.preview_data.as_ref().expect("preview_data").rows.len();
+        let data_len = app.data_view.preview_data.as_ref().expect("preview_data").rows.len();
         assert_eq!(data_len, 50, "preview_data debe crecer con cada página");
         assert_eq!(
-            app.preview_rows.len(),
+            app.data_view.preview_rows.len(),
             data_len + 1,
             "preview_rows (con header) debe seguir a preview_data"
         );
@@ -6126,14 +5422,14 @@ mod tests {
         // Simula haber bajado 4 páginas: buffer con 25 filas, offset global 100
         let rows: Vec<db::Row> =
             (0..25).map(|i| db::Row { cells: vec![format!("v{}", i + 100)] }).collect();
-        app.preview_data = Some(db::TableData {
+        app.data_view.preview_data = Some(db::TableData {
             columns: vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }],
             rows: rows.clone(),
         });
         let mut lines = vec!["id".to_string()];
         lines.extend(rows.iter().map(|r| r.to_line(" | ")));
-        app.preview_rows = lines;
-        app.preview_loaded_offset = 100;
+        app.data_view.preview_rows = lines;
+        app.data_view.preview_loaded_offset = 100;
         // El usuario está en la PRIMERA fila del buffer (borde superior)
         app.set_selected_idx(PanelKind::Detail, 1);
         app.panel_mut(PanelKind::Detail).scroll_offset.set(0);
@@ -6143,11 +5439,11 @@ mod tests {
         // El viewport debe desplazarse +25 igual que la selección
         assert_eq!(app.panel(PanelKind::Detail).scroll_offset.get(), 25);
         assert_eq!(app.selected_idx(PanelKind::Detail), 26, "selección +25");
-        assert_eq!(app.preview_loaded_offset, 75, "offset global retrocede 25");
+        assert_eq!(app.data_view.preview_loaded_offset, 75, "offset global retrocede 25");
         // Invariante de fila global: misma fila visible que antes del prepend
         // (100 global antes == 75 + (26 - 1) después)
         let fila_global =
-            app.preview_loaded_offset as usize + app.selected_idx(PanelKind::Detail) - 1;
+            app.data_view.preview_loaded_offset as usize + app.selected_idx(PanelKind::Detail) - 1;
         assert_eq!(fila_global, 100);
     }
 
@@ -6167,19 +5463,20 @@ mod tests {
 
         let mut app = App::new();
         app.state = state;
-        app.source_tab = SourceTab::All;
-        app.detected_servers = Vec::new();
-        app.cwd_databases = Vec::new();
+        app.sources_state.source_tab = SourceTab::All;
+        app.sources_state.detected_servers = Vec::new();
+        app.sources_state.cwd_databases = Vec::new();
         // El usuario posiciona el cursor sobre la 3ª fuente
-        app.sources = App::build_sources(
+        app.sources_state.sources = App::build_sources(
             &app.state,
             SourceTab::All,
             None,
-            &app.health,
-            &app.detected_servers,
-            &app.cwd_databases,
+            &app.sources_state.health,
+            &app.sources_state.detected_servers,
+            &app.sources_state.cwd_databases,
         );
         let idx_three = app
+            .sources_state
             .sources
             .iter()
             .position(|s| s.contains("/c/three.db"))
@@ -6193,7 +5490,7 @@ mod tests {
         // La selección debe seguir a three.db (ahora en el frente), NO
         // quedarse en el índice viejo apuntando a otra fuente.
         let new_idx = app.selected_idx(PanelKind::Sources);
-        let selected = &app.sources[new_idx];
+        let selected = &app.sources_state.sources[new_idx];
         assert!(
             selected.contains("/c/three.db"),
             "la selección debe apuntar a la fuente conectada, quedó en: {selected}"
@@ -6215,19 +5512,20 @@ mod tests {
 
         let mut app = App::new();
         app.state = state;
-        app.source_tab = SourceTab::All;
-        app.detected_servers = Vec::new();
-        app.cwd_databases = Vec::new();
-        app.sources = App::build_sources(
+        app.sources_state.source_tab = SourceTab::All;
+        app.sources_state.detected_servers = Vec::new();
+        app.sources_state.cwd_databases = Vec::new();
+        app.sources_state.sources = App::build_sources(
             &app.state,
             SourceTab::All,
             None,
-            &app.health,
-            &app.detected_servers,
-            &app.cwd_databases,
+            &app.sources_state.health,
+            &app.sources_state.detected_servers,
+            &app.sources_state.cwd_databases,
         );
         // Seleccionar la 2ª fuente
         let idx_two = app
+            .sources_state
             .sources
             .iter()
             .position(|s| s.contains("/b/two.db"))
@@ -6238,7 +5536,7 @@ mod tests {
         app.rebuild_sources(None);
 
         let new_idx = app.selected_idx(PanelKind::Sources);
-        let selected = &app.sources[new_idx];
+        let selected = &app.sources_state.sources[new_idx];
         assert!(
             selected.contains("/b/two.db"),
             "el rebuild no debe saltar la selección: {selected}"
@@ -6255,7 +5553,7 @@ mod tests {
         app.set_selected_idx(PanelKind::Tables, 0); // tabla "t" seleccionada
 
         // Lanzar COUNT sobre la tabla actual
-        app.query_target_object = Some("t".to_string());
+        app.query.query_target_object = Some("t".to_string());
 
         // Navegar a otra tabla ANTES de que llegue el resultado
         app.set_selected_idx(PanelKind::Tables, 1); // ahora "otra"
@@ -6274,7 +5572,7 @@ mod tests {
         let mut app = app_con_scroll_fake(100, 25);
         app.tables = vec!["t".to_string()];
         app.set_selected_idx(PanelKind::Tables, 0);
-        app.query_target_object = Some("t".to_string());
+        app.query.query_target_object = Some("t".to_string());
 
         assert!(!app.query_es_stale_por_navegacion(), "mismo objeto → el resultado aplica");
     }
