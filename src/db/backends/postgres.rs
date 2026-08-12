@@ -111,6 +111,65 @@ async fn list_indexes_async(pool: &Pool, db_name: &str) -> Result<Vec<String>, D
 // Nota: `PostgreSQL` no tiene triggers listables de forma trivial para la UI
 // plana (`pg_trigger` existe pero requiere cast de `oid`). El adapter devuelve
 // vacío para "trigger".
+
+/// Catálogo completo en UNA consulta, contra `pg_class`/`pg_namespace`
+/// (tablas físicas del catálogo) y NO contra `pg_tables`/`pg_views`/
+/// `pg_indexes`: esas vistas llaman a `pg_get_viewdef()`/`pg_get_indexdef()`
+/// por fila (reconstruyen el DDL completo como texto aunque solo se pida el
+/// nombre) — con miles de objetos es un costo real y evitable.
+async fn list_objects_async(
+    pool: &Pool,
+    db_name: &str,
+) -> Result<Vec<crate::db::DbObjectHeader>, DbError> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            r"SELECT n.nspname AS schema, c.relname AS nombre,
+                      CASE c.relkind
+                        WHEN 'r' THEN 'table'
+                        WHEN 'v' THEN 'view'
+                        WHEN 'm' THEN 'materialized_view'
+                        WHEN 'i' THEN 'index'
+                        WHEN 'S' THEN 'sequence'
+                        WHEN 'f' THEN 'foreign_table'
+                        WHEN 'p' THEN 'partitioned_table'
+                      END AS tipo
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+                 AND c.relkind IN ('r','v','m','i','S','f','p')
+               UNION ALL
+               SELECT n.nspname, t.tgname, 'trigger'
+               FROM pg_trigger t
+               JOIN pg_class c ON c.oid = t.tgrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE NOT t.tgisinternal
+               ORDER BY schema, tipo, nombre",
+            &[],
+        )
+        .await?;
+    drop(client);
+    let _ = db_name;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let tipo: String = r.get(2);
+            crate::db::DbObjectHeader {
+                schema: Some(r.get::<_, String>(0)),
+                nombre: r.get::<_, String>(1),
+                tipo: match tipo.as_str() {
+                    "view" => crate::db::DbObjectKind::View,
+                    "materialized_view" => crate::db::DbObjectKind::MaterializedView,
+                    "index" => crate::db::DbObjectKind::Index,
+                    "sequence" => crate::db::DbObjectKind::Sequence,
+                    "foreign_table" => crate::db::DbObjectKind::ForeignTable,
+                    "trigger" => crate::db::DbObjectKind::Trigger,
+                    _ => crate::db::DbObjectKind::Table,
+                },
+            }
+        })
+        .collect())
+}
 // ─── Metadata de columnas ─────────────────────────────────────────────
 
 async fn column_info_async(
@@ -410,6 +469,12 @@ pub fn list_views(pool: &Pool, db_name: &str) -> Result<Vec<String>, DbError> {
 
 pub fn list_all_indexes(pool: &Pool, db_name: &str) -> Result<Vec<String>, DbError> {
     block_on(list_indexes_async(pool, db_name))
+}
+
+/// Catálogo completo en una sola ida al servidor (`pg_class`, sin DDL).
+#[allow(dead_code)] // lo consumirá el lazy catalog (controller) en la Ronda 2
+pub fn list_objects(pool: &Pool, db_name: &str) -> Result<Vec<crate::db::DbObjectHeader>, DbError> {
+    block_on(list_objects_async(pool, db_name))
 }
 
 pub fn column_info(

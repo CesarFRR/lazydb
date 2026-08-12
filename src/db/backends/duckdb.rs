@@ -1,6 +1,45 @@
 use duckdb::{Connection, OptionalExt, types::ValueRef};
 
-use crate::db::{Column, ColumnInfo, DbError, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, DbObjectKind, Row, TableData};
+
+/// Catálogo completo en UNA pasada: `information_schema.tables` (tablas) +
+/// `duckdb_views()` (vistas, filtrando internas) + `duckdb_indexes()`.
+/// `DuckDB` no tiene triggers desde 1.5.x.
+#[allow(dead_code)] // lo consumirá el lazy catalog (controller) en la Ronda 2
+pub fn list_objects(path: &str) -> Result<Vec<DbObjectHeader>, DbError> {
+    let conn = open_read_only(path)?;
+    let sql = "SELECT 'table' AS tipo, table_name AS nombre FROM information_schema.tables
+                 WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
+               UNION ALL
+               SELECT 'view', view_name FROM duckdb_views()
+                 WHERE schema_name = 'main' AND NOT internal
+               UNION ALL
+               SELECT 'index', index_name FROM duckdb_indexes()
+                 WHERE schema_name = 'main'
+               ORDER BY tipo, nombre";
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        let kind: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        Ok((kind, name))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (kind, name) = row?;
+        out.push(DbObjectHeader {
+            schema: None,
+            nombre: name,
+            tipo: match kind.as_str() {
+                "view" => DbObjectKind::View,
+                "index" => DbObjectKind::Index,
+                _ => DbObjectKind::Table,
+            },
+        });
+    }
+    Ok(out)
+}
 
 /// Lista objetos por tipo ('table', 'view', 'index', 'trigger').
 /// `DuckDB` expone el catálogo vía `information_schema` (tablas) y

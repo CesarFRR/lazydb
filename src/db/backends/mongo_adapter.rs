@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use crate::db::adapter::DbAdapter;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, TableData};
 
 use mongodb::Client;
 
@@ -48,6 +48,10 @@ impl DbAdapter for MongoAdapter {
             // Mongo no tiene vistas SQL ni triggers ni índices separados
             _ => Ok(Vec::new()),
         })
+    }
+
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError> {
+        self.with_client(crate::db::backends::mongo::list_objects)
     }
 
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError> {

@@ -1,5 +1,5 @@
 use crate::db::adapter::DbAdapter;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, TableData};
 
 /// Adapter ligero que delega en las funciones existentes de `db::backends::sqlite`.
 #[allow(dead_code)]
@@ -17,6 +17,10 @@ impl SqliteAdapter {
 impl DbAdapter for SqliteAdapter {
     fn list_objects_by_type(&self, object_type: &str) -> Result<Vec<String>, DbError> {
         crate::db::backends::sqlite::list_objects_by_type(&self.path, object_type)
+    }
+
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError> {
+        crate::db::backends::sqlite::list_objects(&self.path)
     }
 
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError> {

@@ -5901,6 +5901,9 @@ mod tests {
         fn list_objects_by_type(&self, _object_type: &str) -> Result<Vec<String>, db::DbError> {
             Ok(vec![])
         }
+        fn list_objects(&self) -> Result<Vec<db::DbObjectHeader>, db::DbError> {
+            Ok(vec![])
+        }
         fn list_advanced_objects(&self) -> Result<Vec<String>, db::DbError> {
             Ok(vec![])
         }

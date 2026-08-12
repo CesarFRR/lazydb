@@ -59,6 +59,34 @@ pub fn list_collections(client: &Client, db_name: &str) -> Result<Vec<String>, D
     Ok(names)
 }
 
+/// Catálogo completo en UNA llamada: `list_collections` devuelve colecciones,
+/// vistas y timeseries con su tipo. Mongo NO tiene triggers nativos
+/// (solo Atlas App Services) ni un listado global de índices en el driver —
+/// los índices se consultan on-demand por colección si la UI los necesita.
+#[allow(dead_code)] // lo consumirá el lazy catalog (controller) en la Ronda 2
+pub fn list_objects(
+    client: &Client,
+    db_name: &str,
+) -> Result<Vec<crate::db::DbObjectHeader>, DbError> {
+    use futures_util::stream::TryStreamExt;
+
+    let db = db(client, db_name);
+    let out = block_on(async {
+        let mut cursor = db.list_collections().await?;
+        let mut out: Vec<crate::db::DbObjectHeader> = Vec::new();
+        while let Some(spec) = cursor.try_next().await? {
+            let tipo = match spec.collection_type {
+                mongodb::results::CollectionType::View => crate::db::DbObjectKind::View,
+                _ => crate::db::DbObjectKind::Collection,
+            };
+            out.push(crate::db::DbObjectHeader { schema: None, nombre: spec.name, tipo });
+        }
+        Ok::<_, mongodb::error::Error>(out)
+    })
+    .map_err(|e| DbError::Open(format!("{db_name}.listCollections: {e}")))?;
+    Ok(out)
+}
+
 // ─── Metadata de "columnas" (claves observadas en una página) ──────────
 //
 // Mongo no tiene esquema fijo. La estrategia (vi-mongo): leer la primera

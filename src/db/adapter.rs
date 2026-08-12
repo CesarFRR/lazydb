@@ -2,11 +2,19 @@
 // No tiene dependencias de UI; es el contrato de acceso a datos.
 // Habla en modelos tipados (Row/Column/TableData), nunca en strings
 // formateados: ese es el consenso que todos los backends deben respetar.
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, TableData};
 
 pub trait DbAdapter: Send + Sync {
     fn list_objects_by_type(&self, object_type: &str) -> Result<Vec<String>, DbError>;
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError>;
+    /// Catálogo completo de objetos en UNA consulta por motor (o el mínimo
+    /// de llamadas que el motor permita): tablas/vistas/índices/triggers/
+    /// colecciones con su tipo. Es la fuente para el árbol lateral SIN
+    /// quedarse pegado (una sola ida al servidor, en vez de 3-4 queries
+    /// separadas que además reconstruyen DDL innecesariamente, p.ej.
+    /// `pg_indexes` llama a `pg_get_indexdef` por fila).
+    #[allow(dead_code)] // lo consumirá el lazy catalog (controller) en la Ronda 2
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError>;
     fn object_sql(&self, object_name: &str) -> Result<String, DbError>;
     fn table_columns(&self, table_name: &str) -> Result<Vec<ColumnInfo>, DbError>;
     fn table_row_count(&self, table_name: &str) -> Result<u32, DbError>;

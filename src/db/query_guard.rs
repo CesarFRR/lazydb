@@ -19,10 +19,7 @@
 ///   la app son read-only por diseño).
 // Solo lo consumen los backends remotos (mysql/postgres); sin esas features
 // la función es dead code por diseño.
-#[cfg_attr(
-    not(any(feature = "mysql", feature = "postgres")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(feature = "mysql", feature = "postgres")), allow(dead_code))]
 pub fn bounded_select_sql(sql: &str, limit: u32) -> String {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();

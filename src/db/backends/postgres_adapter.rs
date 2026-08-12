@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use crate::db::adapter::DbAdapter;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, TableData};
 
 use deadpool_postgres::Pool;
 
@@ -44,6 +44,10 @@ impl DbAdapter for PostgresAdapter {
             "index" => crate::db::backends::postgres::list_all_indexes(pool, db),
             _ => Ok(Vec::new()),
         })
+    }
+
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError> {
+        self.with_pool(crate::db::backends::postgres::list_objects)
     }
 
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError> {

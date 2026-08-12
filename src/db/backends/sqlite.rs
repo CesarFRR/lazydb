@@ -1,6 +1,42 @@
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use crate::db::{Column, ColumnInfo, DbError, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, DbObjectKind, Row, TableData};
+
+/// Catálogo completo en UN solo scan de `sqlite_master` (es una sola tabla
+/// física: no hace falta UNION ni N queries). Devuelve tablas, vistas,
+/// índices y triggers con su tipo; el árbol lateral se construye de un tiro.
+#[allow(dead_code)] // lo consumirá el lazy catalog (controller) en la Ronda 2
+pub fn list_objects(path: &str) -> Result<Vec<DbObjectHeader>, DbError> {
+    let conn = open_read_only(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT type, name FROM sqlite_master
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type, name",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let kind: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        Ok((kind, name))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (kind, name) = row?;
+        out.push(DbObjectHeader {
+            schema: None,
+            nombre: name,
+            tipo: match kind.as_str() {
+                "view" => DbObjectKind::View,
+                "index" => DbObjectKind::Index,
+                "trigger" => DbObjectKind::Trigger,
+                _ => DbObjectKind::Table,
+            },
+        });
+    }
+
+    Ok(out)
+}
 
 pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>, DbError> {
     let conn = open_read_only(path)?;
@@ -55,26 +91,6 @@ pub fn object_sql(path: &str, object_name: &str) -> Result<String, DbError> {
     let ddl: Option<String> = stmt.query_row([], |row| row.get(0)).optional()?;
 
     Ok(ddl.unwrap_or_else(|| "-- SQL no disponible para este objeto".to_string()))
-}
-
-#[allow(dead_code)]
-pub fn list_objects(path: &str) -> Result<Vec<String>, DbError> {
-    let conn = open_read_only(path)?;
-    let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_master
-         WHERE type IN ('table','view')
-         AND name NOT LIKE 'sqlite_%'
-         ORDER BY name",
-    )?;
-
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-
-    Ok(out)
 }
 
 /// Columnas (nombre + tipo declarado) de una tabla. Para inspector de fila.
@@ -467,6 +483,33 @@ mod tests {
         drop(conn);
         let off = row_offset_of(path.to_str().unwrap(), "vacia", "id", "1").expect("sin error");
         assert_eq!(off, None);
+        cleanup();
+    }
+
+    /// REGRESIÓN (spec Claude): `list_objects` devuelve el catálogo completo
+    /// en un solo scan de `sqlite_master`, con tipo correcto por objeto.
+    #[test]
+    fn list_objects_catalogo_completo_con_tipos() {
+        let (path, cleanup) = temp_db("catalogo");
+        let conn = Connection::open(&path).expect("abrir");
+        conn.execute_batch(
+            "CREATE VIEW v1 AS SELECT 1;
+             CREATE INDEX idx_t ON t(id);
+             CREATE TRIGGER trg_t AFTER INSERT ON t BEGIN SELECT 1; END;",
+        )
+        .expect("objetos extra");
+        drop(conn);
+
+        let objs = list_objects(path.to_str().unwrap()).expect("catálogo");
+        let names: std::collections::HashMap<&str, DbObjectKind> =
+            objs.iter().map(|o| (o.nombre.as_str(), o.tipo)).collect();
+
+        assert_eq!(names["t"], DbObjectKind::Table);
+        assert_eq!(names["v1"], DbObjectKind::View);
+        assert_eq!(names["idx_t"], DbObjectKind::Index);
+        assert_eq!(names["trg_t"], DbObjectKind::Trigger);
+        // Los objetos internos de sqlite no aparecen
+        assert!(!objs.iter().any(|o| o.nombre.starts_with("sqlite_")));
         cleanup();
     }
 }

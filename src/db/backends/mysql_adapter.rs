@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use crate::db::adapter::DbAdapter;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, TableData};
 
 use mysql_async::Pool;
 
@@ -45,6 +45,10 @@ impl DbAdapter for MysqlAdapter {
             "trigger" => crate::db::backends::mysql::list_triggers(pool, db),
             _ => Ok(Vec::new()),
         })
+    }
+
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError> {
+        self.with_pool(crate::db::backends::mysql::list_objects)
     }
 
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError> {

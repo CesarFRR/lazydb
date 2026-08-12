@@ -13,4 +13,5 @@ pub mod rt;
 pub mod servers;
 
 pub use error::DbError;
-pub use model::{Column, ColumnInfo, ForeignKey, Row, TableData};
+#[allow(unused_imports)] // DbObjectKind solo lo consumen backends gated por feature
+pub use model::{Column, ColumnInfo, DbObjectHeader, DbObjectKind, ForeignKey, Row, TableData};
