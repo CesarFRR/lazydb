@@ -433,14 +433,9 @@ pub struct App {
     /// Popup de input SQL (`:`): `Some` = abierto. El historial persistente
     /// vive en `state.query_history` (storage).
     pub query_input: Option<QueryInputState>,
-    /// Pick de base de datos de un servidor detectado (modal ↑/↓ + Enter):
-    /// `Some` = eligiendo esquema al que conectarse.
-    pub db_picker: Option<DbPickerState>,
-    /// Prompt de contraseña de un servidor detectado (modal de entrada).
-    pub password_prompt: Option<PasswordPromptState>,
-    /// Formulario de nueva conexión (panel Detail sin db abierta). `None` =
-    /// el usuario ya está conectado o no se ha abierto el formulario.
-    pub connection_form: Option<ConnectionFormState>,
+    /// Estado de la UI de conexión (Fase 2): formulario, prompt de
+    /// contraseña y picker de bases viven en connection.rs.
+    pub connection: super::connection::ConnectionState,
     /// El preview muestra el resultado de una query libre del usuario (no el
     /// objeto seleccionado). Los scrolls infinitos y refreshes lo respetan.
     pub query_mode: bool,
@@ -574,9 +569,7 @@ impl App {
             help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             error: None,
             query_input: None,
-            db_picker: None,
-            password_prompt: None,
-            connection_form: Some(ConnectionFormState::default()),
+            connection: super::connection::ConnectionState::new(),
             query_mode: false,
             last_click_time: 0,
             last_click_kind: None,
@@ -1171,7 +1164,8 @@ impl App {
                     crate::security::strip_credentials(url),
                     dbs.len()
                 );
-                self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
+                self.connection.db_picker =
+                    Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
                 // Sin acceso (auth o red): pedir contraseña. URL limpia (sin
@@ -1179,7 +1173,7 @@ impl App {
                 tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "servidor sin acceso, pidiendo contraseña");
                 self.status = String::new();
                 let (clean_url, user) = strip_url_credentials(url);
-                self.password_prompt = Some(PasswordPromptState {
+                self.connection.password_prompt = Some(PasswordPromptState {
                     server_url: clean_url,
                     user: user.unwrap_or_else(|| "root".to_string()),
                     buffer: String::new(),
@@ -1218,7 +1212,7 @@ impl App {
                     crate::security::strip_credentials(&server_url),
                     dbs.len()
                 );
-                self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
+                self.connection.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
             }
             Err(err) => {
                 tracing::warn!(url = %crate::security::strip_credentials(&server_url), error = ?err, "credenciales rechazadas");
@@ -1269,7 +1263,7 @@ impl App {
                     crate::security::strip_credentials(url),
                     dbs.len()
                 );
-                self.db_picker =
+                self.connection.db_picker =
                     Some(DbPickerState { server_url: scheme_normalized.clone(), dbs, idx: 0 });
             }
             Err(err) => {
@@ -1278,7 +1272,7 @@ impl App {
                 // Prompt con URL SIN credenciales (no repetir la password en
                 // pantalla) y el user de la URL si lo traía.
                 let (clean_url, user) = strip_url_credentials(&scheme_normalized);
-                self.password_prompt = Some(PasswordPromptState {
+                self.connection.password_prompt = Some(PasswordPromptState {
                     server_url: clean_url,
                     user: user.unwrap_or_else(|| "postgres".to_string()),
                     buffer: String::new(),
@@ -1316,7 +1310,7 @@ impl App {
                     crate::security::strip_credentials(&server_url),
                     dbs.len()
                 );
-                self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
+                self.connection.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
             }
             Err(err) => {
                 tracing::warn!(url = %crate::security::strip_credentials(&server_url), error = ?err, "credenciales postgres rechazadas");
@@ -1349,7 +1343,8 @@ impl App {
                     crate::security::strip_credentials(url),
                     dbs.len()
                 );
-                self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
+                self.connection.db_picker =
+                    Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
                 tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "mongo sin acceso");
@@ -2223,136 +2218,39 @@ impl App {
 
     /// Reconstruye la URL canónica desde los campos individuales
     /// (host/puerto/user/pass/db). Se llama al editar un campo.
-    fn conn_rebuild_url_from_fields(&mut self) {
-        let Some(form) = self.connection_form.as_mut() else { return };
-        let kind = form.kind_override.unwrap_or(form.kind);
-        let scheme = match kind {
-            crate::db::connection::ConnectionType::Mysql => "mysql",
-            crate::db::connection::ConnectionType::Postgres => "postgres",
-            crate::db::connection::ConnectionType::Mongo => "mongodb",
-            crate::db::connection::ConnectionType::Sqlite => "sqlite",
-            crate::db::connection::ConnectionType::Duckdb => "duckdb",
-            crate::db::connection::ConnectionType::File
-            | crate::db::connection::ConnectionType::Unknown => {
-                return; // archivos y desconocido: la URL es libre (ruta)
-            }
-        };
-        let mut url = format!("{scheme}://");
-        if !form.user.is_empty() || !form.pass.is_empty() {
-            url.push_str(&form.user);
-            if !form.pass.is_empty() {
-                url.push(':');
-                url.push_str(&form.pass);
-            }
-            url.push('@');
-        }
-        url.push_str(&form.host);
-        if !form.port.is_empty() {
-            url.push(':');
-            url.push_str(&form.port);
-        }
-        if !form.db.is_empty() {
-            url.push('/');
-            url.push_str(&form.db);
-        }
-        form.url = url;
-    }
-
-    /// Reparsea la URL actual y rellena los campos (si está completa).
-    /// Devuelve `true` si el parseo fue exitoso (la URL define el tipo).
-    fn conn_parse_url_into_fields(&mut self) -> bool {
-        let Some(form) = self.connection_form.as_mut() else { return false };
-        // Purga de la URL: quitar saltos de línea y espacios externos antes
-        // de analizar (las URLs de CleverCloud pueden llegar partidas).
-        form.url = form.url.trim().replace(['\n', '\r'], "");
-        let spec = crate::db::connection::analyze_connection(&form.url);
-        let complete = spec.kind != crate::db::connection::ConnectionType::Unknown;
-
-        if complete {
-            form.kind = spec.kind;
-            // Solo sobreescribir campos si el usuario no los forzó
-            if form.kind_override.is_none() {
-                form.host = spec.host.clone().unwrap_or_default();
-                form.port = spec.port.map_or_else(String::new, |p| p.to_string());
-                form.user = spec.user.clone().unwrap_or_default();
-                form.pass = spec.pass.clone().unwrap_or_default();
-                form.db = spec.db_name.clone().unwrap_or_default();
-            }
-            form.detected_note = format!("✓ Detectado: {}", spec.display());
-        } else if form.url.is_empty() {
-            form.detected_note.clear();
-        } else {
-            form.detected_note = "⏳ escribe la URL o ruta…".to_string();
-        }
-        complete
-    }
-
-    /// Procesa el debounce de la URL (1s desde la última tecla): si está
-    /// completa, rellena los campos. Se llama una vez por frame.
+    /// Debounce del formulario de conexión (reparseo de la URL 1s).
     pub fn tick_connection_form(&mut self) {
-        let debounce_due = {
-            let Some(form) = self.connection_form.as_ref() else { return };
-            if !form.url_debounce_scheduled {
-                return;
-            }
-            form.url_last_edit
-                .is_some_and(|last| last.elapsed() >= std::time::Duration::from_secs(1))
-        };
-        if debounce_due {
-            if let Some(form) = self.connection_form.as_mut() {
-                form.url_debounce_scheduled = false;
-                form.url_last_edit = None;
-            }
-            self.conn_parse_url_into_fields();
-        }
+        self.connection.tick();
+    }
+
+    fn conn_rebuild_url_from_fields(&mut self) {
+        self.connection.conn_rebuild_url_from_fields();
+    }
+
+    /// Reparsea la URL del formulario y rellena los campos.
+    fn conn_parse_url_into_fields(&mut self) -> bool {
+        self.connection.conn_parse_url_into_fields()
     }
 
     /// Conecta con lo que haya en el formulario (URL canónica).
     fn conn_submit(&mut self) {
-        // Si el foco está en un campo individual, reconstruir primero
-        let rebuild = self.connection_form.as_ref().is_some_and(|form| {
-            matches!(
-                form.active,
-                ConnField::Host
-                    | ConnField::Port
-                    | ConnField::User
-                    | ConnField::Pass
-                    | ConnField::Db
-            )
-        });
-        if rebuild {
-            self.conn_rebuild_url_from_fields();
-        }
-        let url = self.connection_form.as_ref().map(|f| f.url.clone()).unwrap_or_default();
-        // Purga final antes de conectar (defensa en profundidad contra \n)
-        let url = url.trim().replace(['\n', '\r'], "");
-        if url.trim().is_empty() {
+        let Some(url) = self.connection.conn_submit() else {
             self.status = "Escribe una URL o ruta para conectar".to_string();
             return;
-        }
-        tracing::debug!(url = %crate::security::strip_credentials(&url), rebuild, "conn_submit: url a conectar");
-        // Conexión real (sync por ahora; el spinner se limpia después)
-        self.connection_form.as_mut().unwrap().connecting = true;
+        };
         self.connect_sqlite(&url);
-        // REGLA DE ORO: el formulario persiste en el estado; el render lo
-        // oculta mientras haya db (`db_path.is_some()`). Al desconectar,
-        // reaparece automáticamente.
-        if let Some(form) = self.connection_form.as_mut() {
-            form.connecting = false;
-            form.url_debounce_scheduled = false;
-        }
+        // REGLA DE ORO: el formulario persiste; el render lo oculta mientras
+        // haya db. Al desconectar, reaparece.
+        self.connection.finish_connecting();
         if self.db_path.is_none() {
             self.status =
                 format!("No se pudo conectar a {}", crate::security::strip_credentials(&url));
         }
     }
 
-    /// Maneja las teclas del formulario de conexión.
-    // `drop(form)` termina el borrow de `self.connection_form` (NLL) antes de
-    // llamar a `self.conn_*`; es un no-op para clippy pero necesario aquí.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)] // dispatch de teclas del formulario (estructura plana)
     fn handle_connection_form_key(&mut self, key: KeyEvent) {
-        let Some(form) = self.connection_form.as_mut() else { return };
+        let Some(form) = self.connection.connection_form.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
                 // REGLA DE ORO: el formulario nunca se cierra sin db. Esc solo
@@ -2521,14 +2419,15 @@ impl App {
     /// Teclas del prompt de contraseña (servidor detectado): Esc cancela,
     /// Enter autentica, el resto alimenta el buffer enmascarado.
     fn handle_password_prompt_key(&mut self, key: KeyEvent) {
-        let Some(state) = self.password_prompt.as_mut() else { return };
+        let Some(state) = self.connection.password_prompt.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
-                self.password_prompt = None;
+                self.connection.password_prompt = None;
                 self.status = "Conexión al servidor cancelada".to_string();
             }
             KeyCode::Enter => {
-                let prompt = std::mem::take(&mut self.password_prompt).expect("estado presente");
+                let prompt =
+                    std::mem::take(&mut self.connection.password_prompt).expect("estado presente");
                 // URL postgres:// → autenticar en postgres; el resto (mysql://)
                 // cae al bloque mysql. Con un solo backend compilado, la rama
                 // inexistente desaparece y el `else` muestra el mensaje genérico.
@@ -2541,7 +2440,7 @@ impl App {
                     #[cfg(not(feature = "mysql"))]
                     {
                         let _ = prompt;
-                        self.password_prompt = None;
+                        self.connection.password_prompt = None;
                         self.status = "Servidor remoto no soportado en este build".to_string();
                     }
                 }
@@ -2552,7 +2451,7 @@ impl App {
                     #[cfg(not(any(feature = "mysql", feature = "postgres")))]
                     {
                         let _ = prompt;
-                        self.password_prompt = None;
+                        self.connection.password_prompt = None;
                         self.status = "Servidor remoto no soportado en este build".to_string();
                     }
                 }
@@ -2570,22 +2469,22 @@ impl App {
     fn handle_db_picker_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.db_picker = None;
+                self.connection.db_picker = None;
                 self.status = "Selección de base cancelada".to_string();
             }
             KeyCode::Up => {
-                if let Some(p) = self.db_picker.as_mut() {
+                if let Some(p) = self.connection.db_picker.as_mut() {
                     p.idx = p.idx.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
-                if let Some(p) = self.db_picker.as_mut() {
+                if let Some(p) = self.connection.db_picker.as_mut() {
                     let last = p.dbs.len().saturating_sub(1);
                     p.idx = (p.idx + 1).min(last);
                 }
             }
             KeyCode::Enter => {
-                let Some(picker) = self.db_picker.take() else { return };
+                let Some(picker) = self.connection.db_picker.take() else { return };
                 let Some(db) = picker.dbs.get(picker.idx).cloned() else {
                     self.status = "No hay bases para elegir".to_string();
                     return;
@@ -2784,7 +2683,7 @@ impl App {
         self.advanced.clear();
         self.preview_rows.clear();
         self.preview_data = None;
-        self.connection_form = Some(ConnectionFormState::default());
+        self.connection.connection_form = Some(ConnectionFormState::default());
         self.total_rows = 0;
         self.preview_loaded_offset = 0;
         self.current_page = 0;
@@ -3345,11 +3244,11 @@ impl App {
             self.show_actions_menu = false;
             self.actions_menu_idx = 0;
             self.status = String::new();
-        } else if self.password_prompt.is_some() {
-            self.password_prompt = None;
+        } else if self.connection.password_prompt.is_some() {
+            self.connection.password_prompt = None;
             self.status = String::new();
-        } else if self.db_picker.is_some() {
-            self.db_picker = None;
+        } else if self.connection.db_picker.is_some() {
+            self.connection.db_picker = None;
             self.status = String::new();
         } else {
             self.should_quit = true;
@@ -3366,8 +3265,8 @@ impl App {
         }
 
         // Formulario de conexión: pegar en el campo URL (o el campo activo)
-        if self.connection_form.is_some() && self.db_path.is_none() {
-            if let Some(form) = self.connection_form.as_mut() {
+        if self.connection.connection_form.is_some() && self.db_path.is_none() {
+            if let Some(form) = self.connection.connection_form.as_mut() {
                 let target = match form.active {
                     ConnField::Url => &mut form.url,
                     ConnField::Host => &mut form.host,
@@ -3384,7 +3283,7 @@ impl App {
                 }
             }
             // Reconstruir la URL si se pegó en un campo individual
-            if let Some(form) = self.connection_form.as_ref() {
+            if let Some(form) = self.connection.connection_form.as_ref() {
                 if matches!(
                     form.active,
                     ConnField::Host
@@ -3408,8 +3307,8 @@ impl App {
         }
 
         // Prompt de contraseña
-        if self.password_prompt.is_some() {
-            if let Some(state) = self.password_prompt.as_mut() {
+        if self.connection.password_prompt.is_some() {
+            if let Some(state) = self.connection.password_prompt.as_mut() {
                 state.buffer.push_str(&clean);
             }
             return;
@@ -3441,11 +3340,11 @@ impl App {
         // ── modales superpuestos: el prompt de contraseña y el picker de
         // bases capturan SIEMPRE primero (se abren sobre el formulario de
         // conexión cuando conectas a un servidor remoto). ──
-        if self.password_prompt.is_some() {
+        if self.connection.password_prompt.is_some() {
             self.handle_password_prompt_key(key);
             return;
         }
-        if self.db_picker.is_some() {
+        if self.connection.db_picker.is_some() {
             self.handle_db_picker_key(key);
             return;
         }
@@ -3467,7 +3366,7 @@ impl App {
         }
 
         // ── pick de base de datos (modal de servidor detectado) ──
-        if self.db_picker.is_some() {
+        if self.connection.db_picker.is_some() {
             self.handle_db_picker_key(key);
             return;
         }
@@ -4189,7 +4088,7 @@ impl App {
         // Formulario de nueva conexión (sin db): click en el botón
         // "[Conectar]" conecta; click en cualquier otra zona del Detail
         // enfoca el panel para que el teclado alimente los campos.
-        if self.db_path.is_none() && self.connection_form.is_some() {
+        if self.db_path.is_none() && self.connection.connection_form.is_some() {
             if let Some(&(_, rect)) =
                 self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
             {
@@ -5114,25 +5013,25 @@ mod tests {
 
         // Camino A: el primer intento sin credenciales abre el picker (no hay
         // auth). Camino B: abre el prompt de password → autenticar con root/root.
-        if app.password_prompt.is_some() {
-            let p = app.password_prompt.take().unwrap();
+        if app.connection.password_prompt.is_some() {
+            let p = app.connection.password_prompt.take().unwrap();
             app.connect_mysql_server_with_password(PasswordPromptState {
                 server_url: p.server_url,
                 user: "root".into(),
                 buffer: "root".into(),
             });
         }
-        let Some(picker) = &app.db_picker else {
+        let Some(picker) = &app.connection.db_picker else {
             panic!(
                 "debe abrirse el picker (prompt: {:?}, picker: {:?})",
-                app.password_prompt.is_some(),
-                app.db_picker.is_some()
+                app.connection.password_prompt.is_some(),
+                app.connection.db_picker.is_some()
             );
         };
         assert!(picker.dbs.contains(&"lazydb_demo".to_string()), "bases: {:?}", picker.dbs);
         // Elegir la BD por índice → connect_sqlite carga el catálogo
         let idx = picker.dbs.iter().position(|d| d == "lazydb_demo").unwrap();
-        let picker = app.db_picker.take().unwrap();
+        let picker = app.connection.db_picker.take().unwrap();
         let db = picker.dbs[idx].clone();
         let mut url = picker.server_url;
         url.push('/');
@@ -5156,13 +5055,13 @@ mod tests {
         let mut app = App::new();
         // Mismo path que la UI al presionar Enter sobre el servidor detectado
         app.connect_sqlite(&server_url);
-        let Some(picker) = &app.db_picker else {
+        let Some(picker) = &app.connection.db_picker else {
             panic!("debe abrirse el picker (status: {})", app.status);
         };
         assert!(picker.dbs.iter().any(|d| d == "lazydb_probe"), "bases: {:?}", picker.dbs);
         // Elegir la base por índice → connect_sqlite conecta el catálogo
         let idx = picker.dbs.iter().position(|d| d == "lazydb_probe").unwrap();
-        let picker = app.db_picker.take().unwrap();
+        let picker = app.connection.db_picker.take().unwrap();
         let db = picker.dbs[idx].clone();
         let mut url = picker.server_url;
         url.push('/');
@@ -5182,7 +5081,7 @@ mod tests {
         };
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
         // Escribir la URL con base y Enter → debe conectar directo
         let mut url = server_url;
         url.push('/');
@@ -5208,7 +5107,7 @@ mod tests {
         // Al arrancar (sin db): el Detail debe ofrecer el formulario de
         // conexión con el foco en la URL (nada del placeholder viejo).
         let app = App::new();
-        let Some(form) = app.connection_form.as_ref() else {
+        let Some(form) = app.connection.connection_form.as_ref() else {
             panic!("debe existir el formulario de conexión al arrancar");
         };
         assert_eq!(form.active, ConnField::Url, "foco inicial en la URL");
@@ -5222,12 +5121,18 @@ mod tests {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.connection_form.is_some(), "Esc no debe cerrar el formulario sin db abierta");
+        assert!(
+            app.connection.connection_form.is_some(),
+            "Esc no debe cerrar el formulario sin db abierta"
+        );
         assert_eq!(app.active_panel, PanelKind::Sources, "Esc mueve el foco a Fuentes");
 
         // Navegar a otros paneles no elimina el formulario tampoco
         app.active_panel = PanelKind::Tables;
-        assert!(app.connection_form.is_some(), "el formulario persiste en cualquier panel");
+        assert!(
+            app.connection.connection_form.is_some(),
+            "el formulario persiste en cualquier panel"
+        );
     }
 
     #[test]
@@ -5237,15 +5142,15 @@ mod tests {
         // no "mover el foco" (que dejaba el modal colgado).
         let mut app = App::new();
         app.active_panel = PanelKind::Detail; // el formulario está activo
-        app.connection_form = Some(ConnectionFormState::default());
-        app.password_prompt = Some(PasswordPromptState {
+        app.connection.connection_form = Some(ConnectionFormState::default());
+        app.connection.password_prompt = Some(PasswordPromptState {
             server_url: "mysql://127.0.0.1:3306".to_string(),
             user: "root".to_string(),
             buffer: "x".to_string(),
         });
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
-            app.password_prompt.is_none(),
+            app.connection.password_prompt.is_none(),
             "Esc debe cerrar el prompt de contraseña (no lo intercepta el formulario)"
         );
         assert_eq!(app.active_panel, PanelKind::Detail, "el foco no debe moverse");
@@ -5257,17 +5162,17 @@ mod tests {
         // formulario cuando `db_path.is_none()`, sea cual sea el panel.
         let app = App::new();
         assert!(app.db_path.is_none());
-        assert!(app.connection_form.is_some(), "sin db → formulario presente");
+        assert!(app.connection.connection_form.is_some(), "sin db → formulario presente");
     }
 
     #[test]
     fn conn_parse_url_rellena_los_campos() {
         let mut app = App::new();
-        app.connection_form = Some(ConnectionFormState::default());
-        app.connection_form.as_mut().unwrap().url =
+        app.connection.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form.as_mut().unwrap().url =
             "mysql://user:pass@localhost:3306/lazy".to_string();
         assert!(app.conn_parse_url_into_fields());
-        let form = app.connection_form.as_ref().unwrap();
+        let form = app.connection.connection_form.as_ref().unwrap();
         assert_eq!(form.kind, crate::db::connection::ConnectionType::Mysql);
         assert_eq!(form.host, "localhost");
         assert_eq!(form.port, "3306");
@@ -5280,15 +5185,15 @@ mod tests {
     #[test]
     fn conn_parse_url_uri_clevercloud_rellena_credenciales() {
         let mut app = App::new();
-        app.connection_form = Some(ConnectionFormState::default());
-        app.connection_form.as_mut().unwrap().url = concat!(
+        app.connection.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form.as_mut().unwrap().url = concat!(
             "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@",
             "bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/",
             "bh4bhaewrpd8qqcreso5"
         )
         .to_string();
         assert!(app.conn_parse_url_into_fields());
-        let form = app.connection_form.as_ref().unwrap();
+        let form = app.connection.connection_form.as_ref().unwrap();
         assert_eq!(form.user, "uo8h6cfqdm4u5xv6lfqq");
         assert_eq!(form.pass, "dsJBQr44561wnu9YizPLTeP1GFh0eO");
         assert_eq!(form.port, "5432");
@@ -5299,25 +5204,25 @@ mod tests {
     fn ctrl_u_limpia_el_campo_activo_y_ctrl_l_limpia_todo() {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail; // el formulario captura con foco en Detail
-        app.connection_form = Some(ConnectionFormState::default());
-        app.connection_form.as_mut().unwrap().url =
+        app.connection.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form.as_mut().unwrap().url =
             "mysql://user:pass@localhost:3306/lazy".to_string();
-        app.connection_form.as_mut().unwrap().host = "localhost".to_string();
-        app.connection_form.as_mut().unwrap().active = ConnField::Url;
+        app.connection.connection_form.as_mut().unwrap().host = "localhost".to_string();
+        app.connection.connection_form.as_mut().unwrap().active = ConnField::Url;
 
         // Ctrl+U limpia el campo URL activo
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(app.connection_form.as_ref().unwrap().url, "");
+        assert_eq!(app.connection.connection_form.as_ref().unwrap().url, "");
         assert_eq!(
-            app.connection_form.as_ref().unwrap().host,
+            app.connection.connection_form.as_ref().unwrap().host,
             "localhost",
             "otros campos intactos con Ctrl+U"
         );
 
         // Ctrl+L limpia todo el formulario
-        app.connection_form.as_mut().unwrap().host = "localhost".to_string();
+        app.connection.connection_form.as_mut().unwrap().host = "localhost".to_string();
         app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
-        let form = app.connection_form.as_ref().unwrap();
+        let form = app.connection.connection_form.as_ref().unwrap();
         assert!(form.host.is_empty(), "Ctrl+L limpia todo");
         assert!(form.url.is_empty());
         assert_eq!(form.active, ConnField::Url, "el foco vuelve a la URL");
@@ -5326,23 +5231,23 @@ mod tests {
     #[test]
     fn conn_parse_url_incompleta_no_toca_campos() {
         let mut app = App::new();
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
         {
-            let form = app.connection_form.as_mut().unwrap();
+            let form = app.connection.connection_form.as_mut().unwrap();
             form.url = "mysql:/".to_string(); // incompleta: sin `//host`
             form.host = "ya-editado".to_string();
         }
         assert!(!app.conn_parse_url_into_fields());
-        let form = app.connection_form.as_ref().unwrap();
+        let form = app.connection.connection_form.as_ref().unwrap();
         assert_eq!(form.host, "ya-editado", "no debe sobreescribir campos manuales");
     }
 
     #[test]
     fn conn_rebuild_url_desde_campos() {
         let mut app = App::new();
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
         {
-            let form = app.connection_form.as_mut().unwrap();
+            let form = app.connection.connection_form.as_mut().unwrap();
             form.kind = crate::db::connection::ConnectionType::Mysql;
             form.host = "db.azure.com".to_string();
             form.port = "3306".to_string();
@@ -5352,7 +5257,7 @@ mod tests {
         }
         app.conn_rebuild_url_from_fields();
         assert_eq!(
-            app.connection_form.as_ref().unwrap().url,
+            app.connection.connection_form.as_ref().unwrap().url,
             "mysql://admin:secreto@db.azure.com:3306/prod"
         );
     }
@@ -5366,17 +5271,17 @@ mod tests {
     async fn uri_clevercloud_con_base_no_abre_prompt_de_contrasena() {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
         let uri = concat!(
             "postgresql://uo8h6cfqdm4u5xv6lfqq:dsJBQr44561wnu9YizPLTeP1GFh0eO@",
             "bh4bhaewrpd8qqcreso5-postgresql.services.clever-cloud.com:5432/",
             "bh4bhaewrpd8qqcreso5"
         );
-        app.connection_form.as_mut().unwrap().url = uri.to_string();
+        app.connection.connection_form.as_mut().unwrap().url = uri.to_string();
         // Enter en el campo URL → parsea + conecta
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            app.password_prompt.is_none(),
+            app.connection.password_prompt.is_none(),
             "la URI con /db y credenciales NO debe pedir contraseña (status: {})",
             app.status
         );
@@ -5389,7 +5294,7 @@ mod tests {
     async fn on_paste_sanitiza_nueva_linea_y_conn_parse_purga_la_url() {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
-        app.connection_form = Some(ConnectionFormState::default());
+        app.connection.connection_form = Some(ConnectionFormState::default());
 
         // Simula el pegado de la URL partida (con \n entre el puerto y la db)
         let pegada = concat!(
@@ -5397,7 +5302,7 @@ mod tests {
             "bh4bhaewrpd8qqcreso5"
         );
         app.on_paste(pegada);
-        let url_limpia = app.connection_form.as_ref().unwrap().url.clone();
+        let url_limpia = app.connection.connection_form.as_ref().unwrap().url.clone();
         assert!(!url_limpia.contains('\n'), "el paste debe quitar el \\n: {url_limpia:?}");
         assert!(
             url_limpia.ends_with("bh4bhaewrpd8qqcreso5"),
@@ -5407,7 +5312,7 @@ mod tests {
         // Enter → parsea (con purga) y no debe ir al flujo de servidor
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            app.password_prompt.is_none(),
+            app.connection.password_prompt.is_none(),
             "URL purgada no debe pedir contraseña (status: {})",
             app.status
         );

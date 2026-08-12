@@ -110,12 +110,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // Prompt de contraseña (servidor detectado)
-    if app.password_prompt.is_some() {
+    if app.connection.password_prompt.is_some() {
         render_password_prompt(frame, area, app);
     }
 
     // Pick de base de datos (servidor detectado: SHOW DATABASES)
-    if app.db_picker.is_some() {
+    if app.connection.db_picker.is_some() {
         render_db_picker(frame, area, app);
     }
 
@@ -257,7 +257,7 @@ fn render_password_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-    let Some(state) = &app.password_prompt else { return };
+    let Some(state) = &app.connection.password_prompt else { return };
     let theme = &crate::ui::theme::THEME;
 
     let width = area.width.saturating_mul(70) / 100;
@@ -302,7 +302,7 @@ fn render_password_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_db_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState};
 
-    let Some(state) = &app.db_picker else { return };
+    let Some(state) = &app.connection.db_picker else { return };
     let theme = &crate::ui::theme::THEME;
 
     let width = area.width.min(52);

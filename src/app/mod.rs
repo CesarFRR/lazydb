@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod controller;
 pub mod panel;
 pub mod sources;

@@ -27,7 +27,7 @@ const INPUT_W: u16 = 38;
 
 /// Renderiza el formulario de conexión dentro del área del panel Detail.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let Some(form) = &app.connection_form else { return };
+    let Some(form) = &app.connection.connection_form else { return };
     if area.width < 60 || area.height < 18 {
         return;
     }
