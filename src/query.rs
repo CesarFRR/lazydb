@@ -16,6 +16,23 @@ pub enum QueryMsg {
     Free(u64, String, Result<QueryResult, DbError>),
 }
 
+/// Resultado de un PREVIEW async (navegación de objetos): el preview
+/// (filas/schema/DDL) se carga en background para que el spinner gire y la
+/// UI no se congele con DBs remotas (hallazgo A1 aplicado al Data tab).
+pub enum PreviewMsg {
+    /// Preview listo: (generación, objeto, tab, filas, data tipada, total).
+    /// Los errores viajan DENTRO de `preview_rows` (línea de error), igual
+    /// que el flujo síncrono original.
+    Ok {
+        generation: u64,
+        object: String,
+        detail_tab: crate::app::controller::DetailTab,
+        preview_rows: Vec<String>,
+        preview_data: Option<crate::db::TableData>,
+        total_rows: u32,
+    },
+}
+
 /// Resultado de una conexión ASYNC (ver `App::spawn_connection`): el
 /// adapter resuelto + catálogo + preview de la primera tabla, todo cargado
 /// en background para no congelar el event loop con round-trips de red.

@@ -404,6 +404,13 @@ pub struct App {
     /// Resultado de la conexión en vuelo (adapter + catálogo + preview).
     connection_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::ConnectionMsg>>,
     connection_tx: Option<tokio::sync::mpsc::UnboundedSender<query::ConnectionMsg>>,
+
+    // ── preview async (navegación de objetos sin congelar la UI) ──
+    /// Generación del último preview lanzado: descarta resultados stale
+    /// (el usuario navegó a otro objeto/tab mientras cargaba).
+    preview_gen: u64,
+    preview_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::PreviewMsg>>,
+    preview_tx: Option<tokio::sync::mpsc::UnboundedSender<query::PreviewMsg>>,
     /// Contador de frames para el spinner del status bar.
     pub frame: usize,
     pub keymap: keys::Keymap,
@@ -477,6 +484,7 @@ impl App {
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
         let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
         let (connection_tx, connection_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (preview_tx, preview_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Detección de servidores SQL locales: bloqueante (E/S de red), por
         // eso se cachea UNA vez en el arranque. Timeout corto por puerto.
@@ -529,6 +537,9 @@ impl App {
             connection_gen: 0,
             connection_rx: Some(connection_rx),
             connection_tx: Some(connection_tx),
+            preview_gen: 0,
+            preview_rx: Some(preview_rx),
+            preview_tx: Some(preview_tx),
             frame: 0,
             tables: vec![],
             views: vec![],
@@ -607,6 +618,8 @@ impl App {
         self.poll_query_results();
         // Conexiones async terminadas (adapter + catálogo + preview).
         self.poll_connection_results();
+        // Previews de navegación async terminados (filas/schema/DDL).
+        self.poll_preview_results();
     }
 
     // ── helpers de paneles ────────────────────────────────────────────
@@ -1614,15 +1627,19 @@ impl App {
     // ── preview ───────────────────────────────────────────────────────
 
     #[allow(clippy::too_many_lines)]
+    /// Refresca el preview del objeto seleccionado (Data/Schema/Sql/Advanced).
+    ///
+    /// AHORA ES ASYNC: el adapter corre en `spawn_blocking` y el resultado
+    /// llega por `preview_rx` → `poll_preview_results` (mismo patrón que la
+    /// conexión). El spinner del status bar gira DE VERDAD mientras la UI
+    /// sigue viva — antes esto bloqueaba el hilo del event loop en
+    /// round-trips de red al navegar entre tablas (hallazgo A1).
+    ///
+    /// `DetailTab::Meta` es local (sin red): se resuelve al instante.
     fn refresh_preview_from_selected_object(&mut self) {
-        // El resultado de una query libre ya no aplica: navegar a un objeto
-        // devuelve el preview a la tabla seleccionada.
         self.query_mode = false;
-        // Ajustar rows_per_page dinámicamente según espacio disponible
         self.rows_per_page = self.optimal_rows_per_page();
-        // Reset scroll_offset del viewport al recargar completamente los datos
         self.panel_mut(PanelKind::Detail).scroll_offset.set(0);
-        // Reset scroll horizontal: el nuevo objeto puede tener otras columnas
         self.panel_mut(PanelKind::Detail).h_scroll.set(0);
 
         self.is_loading = true;
@@ -1639,173 +1656,195 @@ impl App {
             return;
         }
 
-        // Backend resuelto por extensión: todas las lecturas del preview
-        // (filas, schema, DDL, count) pasan por el adapter.
+        // Meta: información local (path, tamaño, offsets) — sin red.
+        if self.detail_tab == DetailTab::Meta {
+            self.preview_data = None;
+            self.preview_rows = vec![
+                format!("db_path: {}", self.db_path_safe()),
+                format!("db_size: {}", self.db_size_display()),
+                format!("source_tab: {}", self.sources_state.source_tab.label()),
+                format!("object_section: {}", self.object_section.label()),
+                format!("detail_tab: {}", self.detail_tab.label()),
+                format!("object: {}", object_name),
+                format!("rows_per_page: {}", self.rows_per_page),
+                format!("loaded_offset: {}", self.preview_loaded_offset),
+                format!("estimated_rows: {}", self.total_rows),
+            ];
+            self.preview_loaded_offset = 0;
+            self.set_selected_idx(PanelKind::Detail, 0);
+            self.is_loading = false;
+            return;
+        }
+
         let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
         };
+        self.spawn_preview(adapter, object_name);
+    }
 
-        // Siempre refrescar total_rows para tablas/vistas (no Advanced)
-        if self.object_section != ObjectSection::Advanced {
-            if let Ok(count) = adapter.table_row_count(&object_name) {
-                self.total_rows = count;
-            }
-        }
+    /// Lanza el preview del objeto en background (`spawn_blocking` + canal).
+    /// La generación se incrementa: cualquier preview anterior en vuelo
+    /// queda marcado stale y se descarta al llegar.
+    #[allow(clippy::too_many_lines)] // la carga por tab (Data/Schema/Sql) es legible en un solo bloque
+    fn spawn_preview(
+        &mut self,
+        adapter: std::sync::Arc<dyn crate::db::adapter::DbAdapter>,
+        object_name: String,
+    ) {
+        self.preview_gen += 1;
+        let generation = self.preview_gen;
+        let Some(tx) = self.preview_tx.clone() else { return };
+        let object_section = self.object_section;
+        let detail_tab = self.detail_tab;
+        let rows_per_page = self.rows_per_page;
+        let offset = self.current_page.saturating_mul(self.rows_per_page);
+        // Clonar el orden: el closure del spawn_blocking no puede prestar self.
+        let order_col: Option<(String, bool)> =
+            self.sort_column.as_ref().map(|col| (col.clone(), self.sort_asc));
 
-        match self.detail_tab {
-            DetailTab::Data => {
-                if self.object_section == ObjectSection::Advanced {
-                    // Para índices/triggers: mostrar el SQL DDL
-                    match adapter.object_sql(&object_name) {
-                        Ok(sql) => {
-                            self.preview_rows =
-                                sql.lines().map(ToString::to_string).collect::<Vec<_>>();
-                            if self.preview_rows.is_empty() {
-                                self.preview_rows = vec!["-- SQL vacio --".to_string()];
+        tokio::task::spawn_blocking(move || {
+            let (preview_rows, preview_data, total_rows) = match detail_tab {
+                DetailTab::Data => {
+                    // Advanced (índices/triggers): muestran su DDL
+                    if object_section == ObjectSection::Advanced {
+                        match adapter.object_sql(&object_name) {
+                            Ok(sql) => {
+                                let lines: Vec<String> =
+                                    sql.lines().map(ToString::to_string).collect();
+                                (
+                                    if lines.is_empty() {
+                                        vec!["-- SQL vacio --".to_string()]
+                                    } else {
+                                        lines
+                                    },
+                                    None,
+                                    0,
+                                )
                             }
+                            Err(err) => (vec![format!("Error SQL: {err}")], None, 0),
                         }
-                        Err(err) => {
-                            self.preview_rows = vec![format!("Error SQL: {err}")];
-                            self.show_error("Error SQL", &err.to_string());
-                        }
-                    }
-                    self.preview_data = None;
-                    self.total_rows = 0;
-                    self.preview_loaded_offset = 0;
-                    self.is_loading = false;
-                    self.set_selected_idx(PanelKind::Detail, 0);
-                    return;
-                }
-
-                match adapter.table_row_count(&object_name) {
-                    Ok(_) => {} // total_rows ya fue actualizado arriba
-                    Err(err) => {
-                        self.preview_rows = vec![format!("Error contando filas: {err}")];
-                        self.show_error("Error contando filas", &err.to_string());
-                        self.preview_data = None;
-                        self.total_rows = 0;
-                        self.preview_loaded_offset = 0;
-                        self.is_loading = false;
-                        self.set_selected_idx(PanelKind::Detail, 0);
-                        return;
-                    }
-                }
-
-                let offset = self.current_page.saturating_mul(self.rows_per_page);
-                let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
-                match adapter.table_rows_sorted(&object_name, self.rows_per_page, offset, order_col)
-                {
-                    Ok(data) => {
-                        // Celdas tipadas para el render 2D (TableState +
-                        // highlight_symbol); preview_rows queda como fallback
-                        // (List de 1 columna / mensajes).
-                        self.preview_rows = if data.rows.is_empty() {
-                            vec!["<sin datos>".to_string()]
-                        } else {
-                            data.to_lines()
-                        };
-                        self.preview_data = Some(data);
-                        self.preview_loaded_offset = offset;
-                        self.set_selected_idx(
-                            PanelKind::Detail,
-                            usize::from(self.preview_rows.len() > 1),
-                        );
-                    }
-                    Err(err) => {
-                        self.preview_rows = vec![format!("Error obteniendo filas: {err}")];
-                        self.show_error("Error obteniendo filas", &err.to_string());
-                        self.preview_data = None;
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
-                    }
-                }
-            }
-            DetailTab::Schema => {
-                if self.object_section == ObjectSection::Advanced {
-                    // Schema de índice/trigger = su SQL DDL
-                    match adapter.object_sql(&object_name) {
-                        Ok(sql) => {
-                            self.preview_rows =
-                                sql.lines().map(ToString::to_string).collect::<Vec<_>>();
-                            if self.preview_rows.is_empty() {
-                                self.preview_rows = vec!["-- SQL vacio --".to_string()];
+                    } else {
+                        let count = adapter.table_row_count(&object_name).unwrap_or(0);
+                        let order_ref: Option<(&str, bool)> =
+                            order_col.as_ref().map(|(c, a)| (c.as_str(), *a));
+                        match adapter.table_rows_sorted(
+                            &object_name,
+                            rows_per_page,
+                            offset,
+                            order_ref,
+                        ) {
+                            Ok(data) => {
+                                let lines = if data.rows.is_empty() {
+                                    vec!["<sin datos>".to_string()]
+                                } else {
+                                    data.to_lines()
+                                };
+                                (lines, Some(data), count)
                             }
-                        }
-                        Err(err) => {
-                            self.preview_rows = vec![format!("Error SQL: {err}")];
-                            self.show_error("Error SQL", &err.to_string());
+                            Err(err) => (vec![format!("Error obteniendo filas: {err}")], None, 0),
                         }
                     }
-                    self.preview_data = None;
-                    self.total_rows = 0;
-                    self.preview_loaded_offset = 0;
-                    self.is_loading = false;
-                    self.set_selected_idx(PanelKind::Detail, 0);
-                    return;
                 }
-
-                match adapter.table_columns(&object_name) {
-                    Ok(columns) => {
-                        self.preview_data = None;
-                        // ColumnInfo → líneas de presentación del Schema tab
-                        self.preview_rows = if columns.is_empty() {
-                            vec!["Sin columnas visibles".to_string()]
-                        } else {
-                            let mut lines = vec!["cid | name | type | nullability".to_string()];
-                            lines.extend(columns.iter().map(crate::db::ColumnInfo::to_line));
-                            lines
-                        };
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
-                    }
-                    Err(err) => {
-                        self.preview_rows = vec![format!("Error schema: {err}")];
-                        self.show_error("Error schema", &err.to_string());
-                        self.preview_data = None;
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
+                DetailTab::Schema => {
+                    if object_section == ObjectSection::Advanced {
+                        match adapter.object_sql(&object_name) {
+                            Ok(sql) => {
+                                let lines: Vec<String> =
+                                    sql.lines().map(ToString::to_string).collect();
+                                (
+                                    if lines.is_empty() {
+                                        vec!["-- SQL vacio --".to_string()]
+                                    } else {
+                                        lines
+                                    },
+                                    None,
+                                    0,
+                                )
+                            }
+                            Err(err) => (vec![format!("Error SQL: {err}")], None, 0),
+                        }
+                    } else {
+                        match adapter.table_columns(&object_name) {
+                            Ok(columns) => {
+                                let lines = if columns.is_empty() {
+                                    vec!["Sin columnas visibles".to_string()]
+                                } else {
+                                    let mut l = vec!["cid | name | type | nullability".to_string()];
+                                    l.extend(columns.iter().map(crate::db::ColumnInfo::to_line));
+                                    l
+                                };
+                                (lines, None, 0)
+                            }
+                            Err(err) => (vec![format!("Error schema: {err}")], None, 0),
+                        }
                     }
                 }
-            }
-            DetailTab::Sql => {
-                self.preview_data = None;
-                match adapter.object_sql(&object_name) {
+                DetailTab::Sql => match adapter.object_sql(&object_name) {
                     Ok(sql) => {
-                        self.preview_rows =
-                            sql.lines().map(ToString::to_string).collect::<Vec<_>>();
-                        if self.preview_rows.is_empty() {
-                            self.preview_rows = vec!["-- SQL vacio --".to_string()];
-                        }
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
+                        let lines: Vec<String> = sql.lines().map(ToString::to_string).collect();
+                        (
+                            if lines.is_empty() {
+                                vec!["-- SQL vacio --".to_string()]
+                            } else {
+                                lines
+                            },
+                            None,
+                            0,
+                        )
                     }
-                    Err(err) => {
-                        self.preview_rows = vec![format!("Error SQL: {err}")];
-                        self.show_error("Error SQL", &err.to_string());
-                        self.preview_loaded_offset = 0;
-                        self.set_selected_idx(PanelKind::Detail, 0);
+                    Err(err) => (vec![format!("Error SQL: {err}")], None, 0),
+                },
+                DetailTab::Meta => unreachable!("Meta se resuelve síncrono en el caller"),
+            };
+            let _ = tx.send(query::PreviewMsg::Ok {
+                generation,
+                object: object_name,
+                detail_tab,
+                preview_rows,
+                preview_data,
+                total_rows,
+            });
+        });
+    }
+
+    /// Aplica los previews terminados (cada frame en `compute_layout`).
+    /// Descarta resultados stale (generación vieja = el usuario navegó).
+    fn poll_preview_results(&mut self) {
+        let drained: Vec<query::PreviewMsg> = {
+            let Some(rx) = self.preview_rx.as_mut() else { return };
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        };
+        for msg in drained {
+            match msg {
+                query::PreviewMsg::Ok {
+                    generation,
+                    object,
+                    detail_tab,
+                    preview_rows,
+                    preview_data,
+                    total_rows,
+                } => {
+                    if generation != self.preview_gen {
+                        continue; // stale: el usuario navegó mientras cargaba
                     }
+                    // ¿El usuario ya cambió de tab/objeto? Descarta igual.
+                    if self.detail_tab != detail_tab || self.selected_object_name() != object {
+                        continue;
+                    }
+                    self.preview_rows = preview_rows;
+                    self.preview_data = preview_data;
+                    self.total_rows = total_rows;
+                    self.preview_loaded_offset =
+                        self.current_page.saturating_mul(self.rows_per_page);
+                    self.set_selected_idx(
+                        PanelKind::Detail,
+                        usize::from(self.preview_rows.len() > 1),
+                    );
+                    self.is_loading = false;
                 }
             }
-            DetailTab::Meta => {
-                self.preview_data = None;
-                self.preview_rows = vec![
-                    format!("db_path: {}", self.db_path_safe()),
-                    format!("db_size: {}", self.db_size_display()),
-                    format!("source_tab: {}", self.sources_state.source_tab.label()),
-                    format!("object_section: {}", self.object_section.label()),
-                    format!("detail_tab: {}", self.detail_tab.label()),
-                    format!("object: {}", object_name),
-                    format!("rows_per_page: {}", self.rows_per_page),
-                    format!("loaded_offset: {}", self.preview_loaded_offset),
-                    format!("estimated_rows: {}", self.total_rows),
-                ];
-                self.preview_loaded_offset = 0;
-                self.set_selected_idx(PanelKind::Detail, 0);
-            }
         }
-        self.is_loading = false;
     }
 
     // ── scroll infinito (append/prepend) ─────────────────────────────
@@ -2775,16 +2814,20 @@ impl App {
     // ── exportar CSV ─────────────────────────────────────────────────
 
     #[allow(clippy::cast_precision_loss)]
+    /// Exporta la tabla/vista seleccionada a CSV usando el ADAPTER activo
+    /// (no el binario `sqlite3` externo: eso solo funcionaba en `SQLite` —
+    /// bug R4 de la auditoría). Async: el spinner gira mientras exporta y
+    /// el status se actualiza cuando termina.
     fn export_csv(&mut self) {
-        let Some(path) = self.db_path.clone() else {
-            self.status = "No hay DB conectada".to_string();
-            return;
-        };
         let object = self.selected_object_name();
         if object.is_empty() || object == "-" {
             self.status = "Selecciona una tabla o vista primero".to_string();
             return;
         }
+        let Some(adapter) = self.adapter_arc() else {
+            self.status = "Sin conexión activa".to_string();
+            return;
+        };
 
         self.is_loading = true;
         let safe_name = object.replace([' ', '"', '/', '\\'], "_");
@@ -2792,45 +2835,40 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let filename = format!("{safe_name}_{timestamp}.csv");
-        let sql = format!("SELECT * FROM \"{}\";", object.replace('"', "\"\""));
+        // Escapar comillas dobles del identificador (SQL estándar).
+        let sql = format!("SELECT * FROM \"{}\"", object.replace('"', "\"\""));
 
         self.status = format!("Exportando a {filename}...");
 
-        match std::process::Command::new("sqlite3")
-            .args(["-header", "-csv", &path, &sql])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-        {
-            Ok(output) => {
-                if !output.status.success() {
-                    let err = String::from_utf8_lossy(&output.stderr);
-                    self.show_error("Error exportando", &err);
-                    self.is_loading = false;
-                    return;
-                }
-                match std::fs::write(&filename, &output.stdout) {
-                    Ok(()) => {
-                        let size = output.stdout.len();
-                        let size_str = if size >= 1024 * 1024 {
-                            format!("{:.1} MiB", size as f64 / (1024.0 * 1024.0))
-                        } else if size >= 1024 {
-                            format!("{:.1} KiB", size as f64 / 1024.0)
-                        } else {
-                            format!("{size} B")
-                        };
-                        self.status = format!("Exportado: {filename} ({size_str})");
-                    }
-                    Err(e) => {
-                        self.show_error("Error escribiendo", &format!("{filename}: {e}"));
-                    }
-                }
+        // Export async: la query (culling 500) + escritura del CSV corren en
+        // background; el resultado se reporta por el preview channel (reusa
+        // el poll existente) y el status bar muestra el mensaje final.
+        let tx = self.preview_tx.clone();
+        let filename2 = filename.clone();
+        tokio::spawn(async move {
+            let handle = tokio::task::spawn_blocking(move || {
+                let csv = match adapter.query(&sql, 500) {
+                    Ok(rows) => rows.join("\n"),
+                    Err(e) => return Err(e.to_string()),
+                };
+                std::fs::write(&filename2, csv).map_err(|e| e.to_string())
+            });
+            let msg = match handle.await {
+                Ok(Ok(())) => format!("Exportado: {filename}"),
+                Ok(Err(e)) => format!("Error exportando: {e}"),
+                Err(e) => format!("Error exportando: {e}"),
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(query::PreviewMsg::Ok {
+                    generation: u64::MAX,
+                    object: String::new(),
+                    detail_tab: crate::app::controller::DetailTab::Data,
+                    preview_rows: vec![msg],
+                    preview_data: None,
+                    total_rows: 0,
+                });
             }
-            Err(e) => {
-                self.show_error("Error ejecutando sqlite3", &e.to_string());
-            }
-        }
-        self.is_loading = false;
+        });
     }
 
     // ── row inspector ─────────────────────────────────────────────────
