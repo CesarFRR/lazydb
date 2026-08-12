@@ -491,3 +491,216 @@ pub fn build_sources(
 
     list.finish(source_tab)
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// SourcesState — estado del panel Fuentes (Fase 1b del refactor)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Encapsula TODO lo que el panel Fuentes necesita: la lista construida,
+// el tab activo, la salud (probes), y los canales/semáforo de probes.
+// `App` delega aquí (`self.sources_state.xxx()`); los datos que viven en
+// App (state, db_path, selected_idx, layout) se pasan POR PARÁMETRO —
+// nunca se duplican (regla de oro: duplicar estado = bugs de desync).
+
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+/// Estado completo del panel Fuentes.
+pub struct SourcesState {
+    /// Lista de items construida (marcas + texto, ver `build_sources`).
+    pub sources: Vec<String>,
+    /// Tab activo del panel (Todos/Locales/Online).
+    pub source_tab: SourceTab,
+    /// Salud por path: `true` = ok, `false` = falló el probe. `None` = no
+    /// comprobado todavía. La marca ✗ solo se muestra con `Some(false)`.
+    pub health: std::collections::HashMap<String, bool>,
+    /// Paths con probe en vuelo (evita relanzar el mismo path).
+    pub probing: std::collections::HashSet<String>,
+    /// Canal de resultados de probes (path, ok).
+    probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
+    probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
+    /// Semáforo global: máx `PROBE_MAX_CONCURRENT` probes en paralelo.
+    probe_semaphore: Arc<Semaphore>,
+    /// Índice de la última fuente probeada bajo el cursor (detección de
+    /// cambio de selección en el tick). `usize::MAX` = nunca probeada.
+    last_probed_idx: usize,
+    /// Servidores SQL locales detectados (cache, ver `App::new`).
+    pub detected_servers: Vec<String>,
+    /// DBs de archivo del cwd (cache, ver `App::new`).
+    pub cwd_databases: Vec<String>,
+}
+
+impl SourcesState {
+    pub fn new(
+        detected_servers: Vec<String>,
+        cwd_databases: Vec<String>,
+        probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
+        probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
+    ) -> Self {
+        Self {
+            sources: Vec::new(),
+            source_tab: SourceTab::All,
+            health: std::collections::HashMap::new(),
+            probing: std::collections::HashSet::new(),
+            probe_rx,
+            probe_tx,
+            probe_semaphore: Arc::new(Semaphore::new(PROBE_MAX_CONCURRENT)),
+            last_probed_idx: usize::MAX,
+            detected_servers,
+            cwd_databases,
+        }
+    }
+
+    /// Path real de un item de Fuentes (o `None` si es sección/placeholder/
+    /// acción fija). Es la fuente para probes y re-ubicación de selección.
+    pub fn source_probe_path(item: &str) -> Option<String> {
+        if item.starts_with('\u{1}') || item == "<sin entradas>" {
+            return None;
+        }
+        let path = source_path_of(item).to_string();
+        if path == "Abrir sakila.db" || path == "Buscar archivo .db" {
+            return None;
+        }
+        Some(path)
+    }
+
+    /// Paths a probar de una ventana visible: excluye secciones, placeholder,
+    /// acciones fijas y lo ya comprobado (caché) o en vuelo. Pura.
+    pub fn visible_probe_targets(
+        items: &[String],
+        window: std::ops::Range<usize>,
+        health: &std::collections::HashMap<String, bool>,
+        probing: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| window.contains(i))
+            .filter_map(|(_, item)| Self::source_probe_path(item))
+            .filter(|p| !health.contains_key(p) && !probing.contains(p))
+            .collect()
+    }
+
+    /// Reconstruye `sources` y devuelve el índice donde quedó el path
+    /// objetivo (el preferido o el seleccionado previo), para que `App`
+    /// lo aplique al panel. `None` si no hay path que preservar.
+    pub fn rebuild(
+        &mut self,
+        state: &storage::AppState,
+        connected: Option<&str>,
+        previous_selected: Option<&str>,
+        prefer: Option<&str>,
+    ) -> Option<usize> {
+        self.sources = build_sources(
+            state,
+            self.source_tab,
+            connected,
+            &self.health,
+            &self.detected_servers,
+            &self.cwd_databases,
+        );
+        let target = prefer.or(previous_selected)?;
+        let norm = crate::paths::normalize_path(target);
+        let norm_clean = crate::security::strip_credentials(&norm);
+        self.sources.iter().position(|item| {
+            Self::source_probe_path(item).is_some_and(|p| {
+                crate::security::strip_credentials(&crate::paths::normalize_path(&p)) == norm_clean
+            })
+        })
+    }
+
+    /// Cambia el tab y reconstruye la lista (la selección la resetea App).
+    pub fn set_tab(&mut self, tab: SourceTab, state: &storage::AppState, connected: Option<&str>) {
+        self.source_tab = tab;
+        self.sources = build_sources(
+            state,
+            tab,
+            connected,
+            &self.health,
+            &self.detected_servers,
+            &self.cwd_databases,
+        );
+    }
+
+    /// Lanza el probe de un path en segundo plano (ver doc de `probe_path`).
+    pub fn probe_path(&mut self, path: String, use_cache: bool) {
+        if self.probing.contains(&path) {
+            return;
+        }
+        if use_cache && self.health.contains_key(&path) {
+            return;
+        }
+        let Some(tx) = self.probe_tx.clone() else { return };
+        self.probing.insert(path.clone());
+        tracing::debug!(path = %path, cache = use_cache, "probe lanzado");
+        let semaphore = self.probe_semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await;
+            let path2 = path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let ok = probe_source(&path2);
+                let _ = tx.send((path, ok));
+            })
+            .await;
+        });
+    }
+
+    /// Probe de la fuente bajo el cursor (`selected_idx` del panel Sources).
+    pub fn probe_selected(&mut self, selected_idx: usize) {
+        let Some(selected) = self.sources.get(selected_idx) else { return };
+        let Some(path) = Self::source_probe_path(selected) else { return };
+        self.probe_path(path, false);
+    }
+
+    /// Probe de las fuentes SOLO VISIBLES (ventana scroll..scroll+altura).
+    pub fn probe_visible(&mut self, scroll_offset: usize, panel_height: u16) {
+        let inner_h = usize::from(panel_height.saturating_sub(2));
+        if inner_h == 0 {
+            return;
+        }
+        let targets = Self::visible_probe_targets(
+            &self.sources,
+            scroll_offset..scroll_offset.saturating_add(inner_h),
+            &self.health,
+            &self.probing,
+        );
+        for path in targets {
+            self.probe_path(path, true);
+        }
+    }
+
+    /// Aplica los resultados de probes terminados (cada frame).
+    /// Devuelve `true` si el estado de salud cambió (App decide si
+    /// reconstruir la lista para repintar marcas).
+    pub fn poll_results(&mut self) -> bool {
+        let mut resolved: Vec<(String, bool)> = Vec::new();
+        if let Some(rx) = self.probe_rx.as_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                resolved.push(msg);
+            }
+        }
+        let mut changed = false;
+        for (path, ok) in resolved {
+            if self.health.get(&path) != Some(&ok) {
+                changed = true;
+            }
+            self.health.insert(path.clone(), ok);
+            self.probing.remove(&path);
+            tracing::debug!(path = %path, ok, "probe resuelto");
+        }
+        changed
+    }
+
+    /// ¿El usuario navegó a otra fuente? (detección de cambio de selección
+    /// en el tick: flechas/click escriben `selected_idx` directo). Devuelve
+    /// `true` si hay que re-probear la fuente recién seleccionada.
+    // (clippy sugiere const fn pero el método muta `last_probed_idx`: no puede ser const.)
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn selection_changed(&mut self, selected_idx: usize) -> bool {
+        if selected_idx == self.last_probed_idx {
+            return false;
+        }
+        self.last_probed_idx = selected_idx;
+        true
+    }
+}

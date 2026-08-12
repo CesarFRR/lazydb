@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::Rect;
@@ -13,8 +13,8 @@ use super::sources::server_url_has_database;
 #[cfg(any(feature = "mysql", feature = "postgres"))]
 use super::sources::strip_url_credentials;
 use super::sources::{
-    PROBE_MAX_CONCURRENT, inject_credentials, is_remote_url, is_source_section, probe_source,
-    scan_cwd_databases, source_path_of, strip_source_marks,
+    inject_credentials, is_remote_url, is_source_section, scan_cwd_databases, source_path_of,
+    strip_source_marks,
 };
 // Re-export para la UI (Fase 1: la UI aún importa desde controller).
 pub use super::sources::{SOURCE_SECTION_MARK, source_summary};
@@ -337,17 +337,9 @@ pub struct App {
     pub layout: ComputedLayout,
 
     // ── datos de los paneles ──
-    pub sources: Vec<String>,
-    /// Servidores SQL locales detectados por puerto (cacheados en `new`:
-    /// el escaneo es bloqueante y no debe repetirse en cada render). Cada
-    /// entrada es una URL sin credenciales, p. ej. `mysql://127.0.0.1:3306`.
-    pub detected_servers: Vec<String>,
-    /// DBs de archivo del cwd (escaneadas UNA vez en `new`, igual que
-    /// `detected_servers`): `build_sources` corre dentro del frame loop
-    /// (`poll_probe_results`) y un `read_dir` + `stat` por frame hacía el
-    /// panel de Fuentes notablemente lento.
-    pub cwd_databases: Vec<String>,
-    pub source_tab: SourceTab,
+    /// Estado COMPLETO del panel Fuentes (Fase 1b): lista, tab, salud de
+    /// probes y canales viven en `sources.rs`; App solo delega.
+    pub sources_state: super::sources::SourcesState,
     pub tables: Vec<String>,
     pub views: Vec<String>,
     pub advanced: Vec<String>,
@@ -384,26 +376,6 @@ pub struct App {
     pub query_state: query::QueryState,
     pub query_results: Vec<String>,
     pub state: storage::AppState,
-
-    // ── probe de salud de fuentes (filosofía culling) ──
-    /// Último estado de salud conocido por fuente (path → accesible). Solo
-    /// se prueban las fuentes que el usuario selecciona (click o flechas),
-    /// nunca toda la lista ni por tiempo.
-    pub health: HashMap<String, bool>,
-    /// Índice de Sources probeado por última vez: el tick detecta cambios de
-    /// selección por CUALQUIER vía (flechas, click, drag, foco) comparando
-    /// este valor, porque la navegación escribe `selected_idx` directo.
-    last_probed_idx: usize,
-    /// Paths con probe en vuelo (evita lanzar dos probes seguidos en paralelo).
-    probing: HashSet<String>,
-    /// Semáforo global de probes: máx `PROBE_MAX_CONCURRENT` en paralelo.
-    /// `probe_source` hace DNS + TCP síncrono (hasta 2s); sin tope, un
-    /// scroll rápido que revela 15 fuentes lanza 15 tareas bloqueantes a la
-    /// vez y satura los workers del runtime.
-    probe_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
-    /// Canal de resultados de probes en segundo plano (tx/rx).
-    probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
-    probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
 
     // ── query runner (COUNT(*) real, cancelable) ──
     /// Generación de la última query lanzada: los resultados que llegan con
@@ -502,7 +474,6 @@ impl App {
         let state = storage::AppState::load();
         let keymap = keys::Keymap::load();
         let ui_config = config::Config::load().ui;
-        let source_tab = SourceTab::All;
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
         let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
         let (connection_tx, connection_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -530,27 +501,26 @@ impl App {
             Panel::new(PanelKind::Detail),
         ];
 
+        let mut sources_state = super::sources::SourcesState::new(
+            detected_servers,
+            cwd_databases,
+            Some(probe_tx),
+            Some(probe_rx),
+        );
+        sources_state.sources = Self::build_sources(
+            &state,
+            sources_state.source_tab,
+            None,
+            &sources_state.health,
+            &sources_state.detected_servers,
+            &sources_state.cwd_databases,
+        );
         let mut app = Self {
             panels,
             active_panel: PanelKind::Sources,
             last_sidebar_focus: PanelKind::Sources,
             layout: ComputedLayout::default(),
-            sources: Self::build_sources(
-                &state,
-                source_tab,
-                None,
-                &HashMap::new(),
-                &detected_servers,
-                &cwd_databases,
-            ),
-            source_tab,
-            detected_servers,
-            cwd_databases,
-            health: HashMap::new(),
-            probing: HashSet::new(),
-            probe_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_MAX_CONCURRENT)),
-            probe_rx: Some(probe_rx),
-            probe_tx: Some(probe_tx),
+            sources_state,
             query_gen: 0,
             query_target_object: None,
             query_handle: None,
@@ -560,9 +530,6 @@ impl App {
             connection_rx: Some(connection_rx),
             connection_tx: Some(connection_tx),
             frame: 0,
-            // usize::MAX: el primer frame detecta la selección inicial (item 0)
-            // y la comprueba al arrancar.
-            last_probed_idx: usize::MAX,
             tables: vec![],
             views: vec![],
             advanced: vec![],
@@ -672,84 +639,10 @@ impl App {
 
     /// Extrae el path probar de una fila del panel de Fuentes. `None` si la
     /// fila no es una fuente (sección, placeholder o acción fija).
-    fn source_probe_path(item: &str) -> Option<String> {
-        if item.starts_with('\u{1}') || item == "<sin entradas>" {
-            return None;
-        }
-        let path = source_path_of(item).to_string();
-        if path == "Abrir sakila.db" || path == "Buscar archivo .db" {
-            return None;
-        }
-        Some(path)
-    }
-
-    /// Paths a probar de una ventana visible de Fuentes: excluye secciones,
-    /// placeholder, acciones fijas y lo ya comprobado (caché) o en vuelo.
-    /// Pura para poder testear el "solo lo visible" sin App.
-    fn visible_probe_targets(
-        items: &[String],
-        window: std::ops::Range<usize>,
-        health: &HashMap<String, bool>,
-        probing: &HashSet<String>,
-    ) -> Vec<String> {
-        items
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| window.contains(i))
-            .filter_map(|(_, item)| Self::source_probe_path(item))
-            .filter(|p| !health.contains_key(p) && !probing.contains(p))
-            .collect()
-    }
-
     /// Lanza el probe de un path en segundo plano. `use_cache = true` (probe
     /// de la ventana visible): solo si nunca se comprobó; `false` (selección
     /// actual): re-verifica siempre, porque el usuario espera ver en vivo si
-    /// la fuente bajo el cursor cambió.
-    fn probe_path(&mut self, path: String, use_cache: bool) {
-        if self.probing.contains(&path) {
-            return;
-        }
-        if use_cache && self.health.contains_key(&path) {
-            return;
-        }
-        let Some(tx) = self.probe_tx.clone() else { return };
-        self.probing.insert(path.clone());
-        tracing::debug!(path = %path, cache = use_cache, "probe lanzado");
-        // Semáforo + spawn_blocking: `probe_source` hace DNS y TCP síncronos
-        // (hasta 2s). Con `tokio::spawn` directo, cada probe ocupaba un
-        // worker async del runtime — un scroll rápido con 15 fuentes agotaba
-        // los workers y frenaba las queries en vuelo. El semáforo limita la
-        // concurrencia a `PROBE_MAX_CONCURRENT`.
-        let semaphore = self.probe_semaphore.clone();
-        tokio::spawn(async move {
-            let _permit = semaphore.acquire_owned().await;
-            let path2 = path.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let ok = probe_source(&path2);
-                let _ = tx.send((path, ok));
-            })
-            .await;
-        });
-    }
-
-    /// Probe de la fuente bajo el cursor. Se re-verifica en cada selección
-    /// (click o flechas): si algo cambió en el exterior, la marca ✗ aparece
-    /// al volver a pasar por la fuente. Nunca bloquea la UI.
-    fn probe_selected(&mut self) {
-        let Some(selected) =
-            self.items_for(PanelKind::Sources).get(self.selected_idx(PanelKind::Sources))
-        else {
-            return;
-        };
-        let Some(path) = Self::source_probe_path(selected) else { return };
-        self.probe_path(path, false);
-    }
-
-    /// Probe de las fuentes SOLO VISIBLES ahora mismo en el panel (ventana
-    /// `scroll_offset..+altura real`): al arrancar se comprueban las pocas
-    /// filas que caben en pantalla, no las 200 de la lista. Cada path se
-    /// verifica a lo sumo una vez por arranque (caché), así no hay bucles de
-    /// re-probe cuando los resultados reordenan la lista.
+    /// Probe de las fuentes SOLO VISIBLES (delega; ventana real del panel).
     fn probe_visible(&mut self) {
         let rect = self
             .layout
@@ -758,68 +651,23 @@ impl App {
             .find(|(k, _)| *k == PanelKind::Sources)
             .map(|(_, r)| *r)
             .unwrap_or_default();
-        // Interior del panel sin bordes: filas de lista realmente visibles.
-        let inner_h = usize::from(rect.height.saturating_sub(2));
-        if inner_h == 0 {
-            return;
-        }
         let offset = self.panel(PanelKind::Sources).scroll_offset.get();
-        // Sin `to_vec()`: este método corre CADA frame y clonar la lista
-        // completa de fuentes era trabajo real por frame aunque nada
-        // cambiara. `visible_probe_targets` recibe el slice + ventana.
-        let targets = Self::visible_probe_targets(
-            self.items_for(PanelKind::Sources),
-            offset..offset.saturating_add(inner_h),
-            &self.health,
-            &self.probing,
-        );
-        for path in targets {
-            self.probe_path(path, true);
-        }
+        self.sources_state.probe_visible(offset, rect.height);
     }
 
-    /// Aplica los resultados de probes terminados (llamado cada frame en
-    /// `compute_layout`) y dispara los probes pendientes: la fuente recién
-    /// seleccionada y las nuevas filas visibles de Fuentes.
+    /// Aplica resultados de probes terminados y dispara los pendientes.
     fn poll_probe_results(&mut self) {
-        // Drenar el canal primero (evita el doble borrow de `self` entre el
-        // receiver y el rebuild de `sources`).
-        let mut resolved: Vec<(String, bool)> = Vec::new();
-        if let Some(rx) = self.probe_rx.as_mut() {
-            while let Ok(msg) = rx.try_recv() {
-                resolved.push(msg);
-            }
-        }
-        let mut changed = false;
-        for (path, ok) in resolved {
-            // Rebuild solo si el estado cambió (primera verificación o ✗ ↔ ok)
-            if self.health.get(&path) != Some(&ok) {
-                changed = true;
-            }
-            self.health.insert(path.clone(), ok);
-            self.probing.remove(&path);
-            tracing::debug!(path = %path, ok, "probe resuelto");
-        }
-        if changed {
-            // Preservar la selección: el rebuild no debe saltar el cursor
-            // a otra fuente (los probes reordenan marcas, no la lista).
+        // 1) Resultados llegados: si cambió la salud, reconstruir la lista
+        //    (las marcas ✗/ok se repintan; la selección se preserva).
+        if self.sources_state.poll_results() {
             self.rebuild_sources(None);
         }
-
-        // Selección de Sources bajo el cursor: la navegación (flechas, click,
-        // drag) escribe `selected_idx` directo, sin pasar por set_selected_idx;
-        // el tick detecta el cambio y re-verifica la fuente recién seleccionada
-        // (siempre, sin caché). Con `last_probed_idx = usize::MAX` al arrancar,
-        // el primer frame comprueba la selección inicial.
+        // 2) ¿Cambió la selección bajo el cursor? → re-probear (en vivo).
         let idx = self.selected_idx(PanelKind::Sources);
-        if idx != self.last_probed_idx {
-            self.last_probed_idx = idx;
-            self.probe_selected();
+        if self.sources_state.selection_changed(idx) {
+            self.sources_state.probe_selected(idx);
         }
-
-        // Ventana visible: si el scroll o la altura del panel cambió, hay filas
-        // nuevas en pantalla que nunca se comprobaron → probearlas (una sola
-        // vez por path gracias a la caché).
+        // 3) Ventana visible nueva → probear (una vez por path, caché).
         self.probe_visible();
     }
 
@@ -898,7 +746,7 @@ impl App {
     fn move_selection(&mut self, step: isize) {
         match self.active_panel {
             PanelKind::Sources => {
-                let len = self.sources.len();
+                let len = self.sources_state.sources.len();
                 Self::shift_index_on_vec_len(
                     &mut self.panel_mut(PanelKind::Sources).selected_idx,
                     len,
@@ -906,7 +754,7 @@ impl App {
                 );
                 // Las secciones (subtítulos) no son seleccionables: saltarlas
                 let idx = self.panel(PanelKind::Sources).selected_idx;
-                let new = Self::skip_section_idx(&self.sources, idx, step);
+                let new = Self::skip_section_idx(&self.sources_state.sources, idx, step);
                 self.panel_mut(PanelKind::Sources).selected_idx = new;
             }
             PanelKind::Tables | PanelKind::Views | PanelKind::Advanced => {
@@ -1032,7 +880,7 @@ impl App {
             return &self.filtered_items;
         }
         match kind {
-            PanelKind::Sources => &self.sources,
+            PanelKind::Sources => &self.sources_state.sources,
             PanelKind::Tables => &self.tables,
             PanelKind::Views => &self.views,
             PanelKind::Advanced => &self.advanced,
@@ -1050,7 +898,7 @@ impl App {
         let num = kind.number();
         match kind {
             PanelKind::Sources => {
-                let tabs = match self.source_tab {
+                let tabs = match self.sources_state.source_tab {
                     SourceTab::All => "[Todo] Local Online",
                     SourceTab::Local => "Todo [Local] Online",
                     SourceTab::Online => "Todo Local [Online]",
@@ -1148,43 +996,21 @@ impl App {
         let current = self
             .items_for(PanelKind::Sources)
             .get(self.selected_idx(PanelKind::Sources))
-            .and_then(|item| Self::source_probe_path(item));
-
-        self.sources = Self::build_sources(
+            .and_then(|item| super::sources::SourcesState::source_probe_path(item));
+        // Fase 1b: la lógica (build + re-ubicación por path) vive en
+        // SourcesState; App solo aplica el índice resultante al panel.
+        if let Some(idx) = self.sources_state.rebuild(
             &self.state,
-            self.source_tab,
             self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-            &self.cwd_databases,
-        );
-
-        // Path objetivo: el preferido o el que estaba seleccionado.
-        let target = prefer.or(current.as_deref());
-        let Some(target) = target else { return };
-        // Comparación canónica: la lista guarda paths normalizados y SIN
-        // credenciales (display), así que el target se normaliza igual.
-        let norm = crate::paths::normalize_path(target);
-        let norm_clean = crate::security::strip_credentials(&norm);
-        if let Some(idx) = self.sources.iter().position(|item| {
-            Self::source_probe_path(item).is_some_and(|p| {
-                crate::security::strip_credentials(&crate::paths::normalize_path(&p)) == norm_clean
-            })
-        }) {
+            current.as_deref(),
+            prefer,
+        ) {
             self.set_selected_idx(PanelKind::Sources, idx);
         }
     }
 
     fn set_source_tab(&mut self, tab: SourceTab) {
-        self.source_tab = tab;
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-            &self.cwd_databases,
-        );
+        self.sources_state.set_tab(tab, &self.state, self.db_path.as_deref());
         self.set_selected_idx(PanelKind::Sources, 0);
     }
 
@@ -1233,7 +1059,7 @@ impl App {
 
     #[allow(dead_code)]
     pub const fn source_tab_label(&self) -> &'static str {
-        self.source_tab.label()
+        self.sources_state.source_tab.label()
     }
 
     #[allow(dead_code)]
@@ -1967,7 +1793,7 @@ impl App {
                 self.preview_rows = vec![
                     format!("db_path: {}", self.db_path_safe()),
                     format!("db_size: {}", self.db_size_display()),
-                    format!("source_tab: {}", self.source_tab.label()),
+                    format!("source_tab: {}", self.sources_state.source_tab.label()),
                     format!("object_section: {}", self.object_section.label()),
                     format!("detail_tab: {}", self.detail_tab.label()),
                     format!("object: {}", object_name),
@@ -2930,13 +2756,13 @@ impl App {
         self.abort_query_in_flight();
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
-        self.sources = Self::build_sources(
+        self.sources_state.sources = Self::build_sources(
             &self.state,
-            self.source_tab,
+            self.sources_state.source_tab,
             None,
-            &self.health,
-            &self.detected_servers,
-            &self.cwd_databases,
+            &self.sources_state.health,
+            &self.sources_state.detected_servers,
+            &self.sources_state.cwd_databases,
         );
         self.set_focus(PanelKind::Sources);
         self.set_selected_idx(PanelKind::Sources, 0);
@@ -3223,7 +3049,7 @@ impl App {
     /// Items originales del panel activo (sin filtro).
     fn original_items_for(&self, kind: PanelKind) -> &[String] {
         match kind {
-            PanelKind::Sources => &self.sources,
+            PanelKind::Sources => &self.sources_state.sources,
             PanelKind::Tables => &self.tables,
             PanelKind::Views => &self.views,
             PanelKind::Advanced => &self.advanced,
@@ -3251,8 +3077,11 @@ impl App {
         self.rows_per_page = ui_config.rows_per_page;
 
         // Ajustar índices si las listas se achicaron
-        if self.selected_idx(PanelKind::Sources) >= self.sources.len() {
-            self.set_selected_idx(PanelKind::Sources, self.sources.len().saturating_sub(1));
+        if self.selected_idx(PanelKind::Sources) >= self.sources_state.sources.len() {
+            self.set_selected_idx(
+                PanelKind::Sources,
+                self.sources_state.sources.len().saturating_sub(1),
+            );
         }
 
         if self.db_path.is_some() {
@@ -3791,8 +3620,12 @@ impl App {
             keys::AppAction::Enter => self.handle_enter(), // legacy, sin binding por defecto
             keys::AppAction::SourceTabRecents => self.set_source_tab(SourceTab::All),
             keys::AppAction::SourceTabFavorites => self.set_source_tab(SourceTab::Local),
-            keys::AppAction::SourceTabNext => self.set_source_tab(self.source_tab.next()),
-            keys::AppAction::SourceTabPrev => self.set_source_tab(self.source_tab.prev()),
+            keys::AppAction::SourceTabNext => {
+                self.set_source_tab(self.sources_state.source_tab.next());
+            }
+            keys::AppAction::SourceTabPrev => {
+                self.set_source_tab(self.sources_state.source_tab.prev());
+            }
             keys::AppAction::DetailTabPrev => self.set_detail_tab(self.detail_tab.prev()),
             keys::AppAction::DetailTabNext => self.set_detail_tab(self.detail_tab.next()),
             keys::AppAction::DetailTabData => self.set_detail_tab(DetailTab::Data),
@@ -3919,7 +3752,7 @@ impl App {
     /// del título (que empieza en rect.x + 1, después de la esquina ┌).
     fn detect_source_tab_click(&self, cursor_x: u16, rect: Rect) -> Option<SourceTab> {
         let num = PanelKind::Sources.number();
-        let tabs = match self.source_tab {
+        let tabs = match self.sources_state.source_tab {
             SourceTab::All => "[Todo] Local Online",
             SourceTab::Local => "Todo [Local] Online",
             SourceTab::Online => "Todo Local [Online]",
@@ -4466,10 +4299,11 @@ mod tests {
     // Helpers del panel Fuentes movidos a sources.rs (Fase 1): los tests
     // de build_sources/marcas/probes los referencian por nombre corto.
     use crate::app::sources::{
-        SourceKind, db_type_mark, is_source_section, source_host_port, source_kind, source_section,
-        strip_source_marks, url_host,
+        SourceKind, SourcesState, db_type_mark, is_source_section, probe_source, source_host_port,
+        source_kind, source_section, strip_source_marks, url_host,
     };
     use crossterm::event::KeyModifiers;
+    use std::collections::HashSet;
 
     fn state_de_prueba() -> storage::AppState {
         let mut state = storage::AppState::new();
@@ -4850,14 +4684,14 @@ mod tests {
 
     #[test]
     fn source_probe_path_ignora_secciones_placeholder_y_acciones() {
-        assert_eq!(App::source_probe_path("\u{1}RECIENTES"), None, "sección");
-        assert_eq!(App::source_probe_path("<sin entradas>"), None, "placeholder");
-        assert_eq!(App::source_probe_path("Abrir sakila.db"), None, "acción fija");
-        assert_eq!(App::source_probe_path("Buscar archivo .db"), None, "acción fija 2");
+        assert_eq!(SourcesState::source_probe_path("\u{1}RECIENTES"), None, "sección");
+        assert_eq!(SourcesState::source_probe_path("<sin entradas>"), None, "placeholder");
+        assert_eq!(SourcesState::source_probe_path("Abrir sakila.db"), None, "acción fija");
+        assert_eq!(SourcesState::source_probe_path("Buscar archivo .db"), None, "acción fija 2");
         // Fuentes reales → path limpio (marcas y prefijos fuera)
-        assert_eq!(App::source_probe_path("▣ /tmp/a.db"), Some("/tmp/a.db".to_string()));
+        assert_eq!(SourcesState::source_probe_path("▣ /tmp/a.db"), Some("/tmp/a.db".to_string()));
         assert_eq!(
-            App::source_probe_path("M mysql://db.azure.com/prod"),
+            SourcesState::source_probe_path("M mysql://db.azure.com/prod"),
             Some("mysql://db.azure.com/prod".to_string())
         );
     }
@@ -4879,20 +4713,20 @@ mod tests {
         probing.insert("/tmp/two.db".to_string());
 
         // Ventana completa: solo queda three.db
-        let targets = App::visible_probe_targets(&items, 0..6, &health, &probing);
+        let targets = SourcesState::visible_probe_targets(&items, 0..6, &health, &probing);
         assert_eq!(targets, vec!["/tmp/three.db".to_string()]);
 
         // Ventana parcial (filas 0..2 = sección + one.db): nada nuevo
-        let targets = App::visible_probe_targets(&items, 0..2, &health, &probing);
+        let targets = SourcesState::visible_probe_targets(&items, 0..2, &health, &probing);
         assert!(targets.is_empty());
 
         // Ventana 0..3: sección + one.db + two.db → los tres filtrados
-        let targets = App::visible_probe_targets(&items, 0..3, &health, &probing);
+        let targets = SourcesState::visible_probe_targets(&items, 0..3, &health, &probing);
         assert!(targets.is_empty());
 
         // Ventana desplazada (2..6): two.db (en vuelo), three.db, placeholder,
         // acción → solo three.db
-        let targets = App::visible_probe_targets(&items, 2..6, &health, &probing);
+        let targets = SourcesState::visible_probe_targets(&items, 2..6, &health, &probing);
         assert_eq!(targets, vec!["/tmp/three.db".to_string()]);
     }
 
@@ -5713,19 +5547,20 @@ mod tests {
 
         let mut app = App::new();
         app.state = state;
-        app.source_tab = SourceTab::All;
-        app.detected_servers = Vec::new();
-        app.cwd_databases = Vec::new();
+        app.sources_state.source_tab = SourceTab::All;
+        app.sources_state.detected_servers = Vec::new();
+        app.sources_state.cwd_databases = Vec::new();
         // El usuario posiciona el cursor sobre la 3ª fuente
-        app.sources = App::build_sources(
+        app.sources_state.sources = App::build_sources(
             &app.state,
             SourceTab::All,
             None,
-            &app.health,
-            &app.detected_servers,
-            &app.cwd_databases,
+            &app.sources_state.health,
+            &app.sources_state.detected_servers,
+            &app.sources_state.cwd_databases,
         );
         let idx_three = app
+            .sources_state
             .sources
             .iter()
             .position(|s| s.contains("/c/three.db"))
@@ -5739,7 +5574,7 @@ mod tests {
         // La selección debe seguir a three.db (ahora en el frente), NO
         // quedarse en el índice viejo apuntando a otra fuente.
         let new_idx = app.selected_idx(PanelKind::Sources);
-        let selected = &app.sources[new_idx];
+        let selected = &app.sources_state.sources[new_idx];
         assert!(
             selected.contains("/c/three.db"),
             "la selección debe apuntar a la fuente conectada, quedó en: {selected}"
@@ -5761,19 +5596,20 @@ mod tests {
 
         let mut app = App::new();
         app.state = state;
-        app.source_tab = SourceTab::All;
-        app.detected_servers = Vec::new();
-        app.cwd_databases = Vec::new();
-        app.sources = App::build_sources(
+        app.sources_state.source_tab = SourceTab::All;
+        app.sources_state.detected_servers = Vec::new();
+        app.sources_state.cwd_databases = Vec::new();
+        app.sources_state.sources = App::build_sources(
             &app.state,
             SourceTab::All,
             None,
-            &app.health,
-            &app.detected_servers,
-            &app.cwd_databases,
+            &app.sources_state.health,
+            &app.sources_state.detected_servers,
+            &app.sources_state.cwd_databases,
         );
         // Seleccionar la 2ª fuente
         let idx_two = app
+            .sources_state
             .sources
             .iter()
             .position(|s| s.contains("/b/two.db"))
@@ -5784,7 +5620,7 @@ mod tests {
         app.rebuild_sources(None);
 
         let new_idx = app.selected_idx(PanelKind::Sources);
-        let selected = &app.sources[new_idx];
+        let selected = &app.sources_state.sources[new_idx];
         assert!(
             selected.contains("/b/two.db"),
             "el rebuild no debe saltar la selección: {selected}"
