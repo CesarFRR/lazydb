@@ -16,6 +16,29 @@ pub enum QueryMsg {
     Free(u64, String, Result<QueryResult, DbError>),
 }
 
+/// Resultado de una conexión ASYNC (ver `App::spawn_connection`): el
+/// adapter resuelto + catálogo + preview de la primera tabla, todo cargado
+/// en background para no congelar el event loop con round-trips de red.
+pub enum ConnectionMsg {
+    /// Conexión completada.
+    Ok {
+        /// Path/URL normalizada (con credenciales, para el adapter).
+        path: String,
+        /// Adapter resuelto y listo para reusar (provider).
+        adapter: std::sync::Arc<dyn crate::db::adapter::DbAdapter>,
+        /// Catálogo separado por tipo (ya ordenado por el backend).
+        tables: Vec<String>,
+        views: Vec<String>,
+        advanced: Vec<String>,
+        /// ¿`NoSQL`? (mongo): cambia terminología de la UI (`row`→`doc`).
+        is_nosql: bool,
+        /// Preview de la primera tabla: (datos paginados, total de filas).
+        first_preview: Option<(crate::db::TableData, u32)>,
+    },
+    /// La conexión falló (resolver, catálogo o preview).
+    Err { path: String, error: String },
+}
+
 /// Tope de filas para una query libre (filosofía culling: nunca materializar
 /// la DB entera en el preview).
 pub const QUERY_RESULT_LIMIT: u32 = 500;

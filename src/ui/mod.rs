@@ -171,8 +171,9 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
 // ---------------------------------------------------------------------------
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // Feedback inmediato del query runner: spinner + estado mientras corre
-    let status = if app.query_state == QueryState::Running {
+    // Feedback inmediato: spinner mientras corre una query O una conexión
+    // (Capa A: antes `is_loading` solo cambiaba el texto, sin animación).
+    let status = if app.is_loading || app.query_state == QueryState::Running {
         let spin = SPINNER[app.frame % SPINNER.len()];
         format!("{spin} {}", app.status)
     } else {

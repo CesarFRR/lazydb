@@ -6,6 +6,10 @@ use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, Ta
 
 pub trait DbAdapter: Send + Sync {
     fn list_objects_by_type(&self, object_type: &str) -> Result<Vec<String>, DbError>;
+    /// Objetos avanzados (índices/triggers) en formato `tipo:nombre`.
+    /// El `list_objects` tipado lo reemplazó en el controller; se mantiene
+    /// como parte del contrato (lo usan los smoke tests de los backends).
+    #[allow(dead_code)]
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError>;
     /// Catálogo completo de objetos en UNA consulta por motor (o el mínimo
     /// de llamadas que el motor permita): tablas/vistas/índices/triggers/

@@ -83,6 +83,7 @@ pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>
 
 /// Objetos avanzados (índices y triggers) en formato `tipo:nombre`.
 /// Solo índices: `DuckDB` 1.5.x eliminó los triggers.
+#[allow(dead_code)] // lo consumen los smoke tests del backend
 pub fn list_advanced_objects(path: &str) -> Result<Vec<String>, DbError> {
     let conn = open_read_only(path)?;
     let mut stmt = conn.prepare(
