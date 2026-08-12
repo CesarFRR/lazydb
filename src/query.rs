@@ -250,6 +250,10 @@ pub struct QueryRunner {
     /// y se crea al abrir el modal `:`. El modal NO se decide por esto:
     /// usa `query_modal_open`.
     pub query_input: Option<QueryInputState>,
+    /// Orden de la TABLA DE RESULTADOS de la pestaña Query: (columna, asc).
+    /// Se aplica EN MEMORIA a `query_results` (a diferencia del Data tab,
+    /// que re-consulta con ORDER BY). Ciclo: click → asc → desc → off.
+    pub query_sort: Option<(String, bool)>,
     /// `true` = el modal `:` está VISUALMENTE abierto (captura teclas y se
     /// dibuja encima). Separado del buffer: la pestaña Query usa el mismo
     /// buffer sin abrir el modal.
@@ -272,6 +276,7 @@ impl QueryRunner {
             query_state: QueryState::Idle,
             query_results: Vec::new(),
             query_input: None,
+            query_sort: None,
             query_modal_open: false,
             query_gen: 0,
             query_target_object: None,

@@ -1584,10 +1584,22 @@ impl App {
         self.panel_mut(PanelKind::Detail).scroll_offset.set(0);
         self.panel_mut(PanelKind::Detail).h_scroll.set(0);
 
+        let object_name = self.selected_object_name();
+
+        // CACHE: ¿mismo (objeto, tab) que el último preview cargado?
+        // Entonces NO relanzar el spawn — el preview ya está en memoria
+        // (volver a Meta no re-consulta el DDL: era lento por el round-trip).
+        let key = (object_name.clone(), self.data_view.detail_tab);
+        if self.data_view.last_preview_key.as_ref() == Some(&key)
+            && !self.data_view.preview_rows.is_empty()
+        {
+            self.is_loading = false;
+            return;
+        }
+
         self.is_loading = true;
         self.status = format!("Cargando {}...", self.data_view.detail_tab.label().trim());
 
-        let object_name = self.selected_object_name();
         if object_name.is_empty() || object_name == "-" {
             self.data_view.preview_rows = vec!["Sin objeto seleccionado".to_string()];
             self.data_view.preview_data = None;
@@ -1795,6 +1807,9 @@ impl App {
                     self.data_view.total_rows = total_rows;
                     self.data_view.preview_loaded_offset =
                         self.data_view.current_page.saturating_mul(self.data_view.rows_per_page);
+                    // Cache válido: (objeto, tab) del preview aplicado
+                    self.data_view.last_preview_key =
+                        Some((self.selected_object_name(), detail_tab));
                     self.set_selected_idx(
                         PanelKind::Detail,
                         usize::from(self.data_view.preview_rows.len() > 1),
@@ -1963,26 +1978,24 @@ impl App {
 
         self.data_view.detail_tab = effective;
         self.set_selected_idx(PanelKind::Detail, 0);
-        // Seed de la pestaña Query: si el buffer está vacío, precargar el
-        // DDL del objeto seleccionado como texto inicial (solo documentación,
-        // NUNCA se auto-ejecuta). Best-effort: si falla o es lento, el
-        // placeholder queda. Para mongo no hay DDL (filtro JSON).
+        // Seed de la pestaña Query: si el buffer está vacío, precargar
+        // `SELECT * FROM <tabla actual>` (el punto de partida natural para
+        // explorar). Sin adapter (objeto inválido) queda el placeholder.
         if effective == DetailTab::Query
-            && !self.is_nosql
             && self.query.query_input.as_ref().is_none_or(|s| s.buffer.is_empty())
         {
-            if let Some(adapter) = self.adapter_arc() {
-                let object = self.selected_object_name();
-                if !object.is_empty() && object != "-" {
-                    if let Ok(sql) = adapter.object_sql(&object) {
-                        let state = self
-                            .query
-                            .query_input
-                            .get_or_insert_with(query::QueryInputState::default);
-                        state.buffer = sql;
-                        state.cursor = state.buffer.chars().count();
-                    }
-                }
+            let object = self.selected_object_name();
+            if !object.is_empty() && object != "-" {
+                // Mongo: filtro JSON sobre la colección actual
+                let sql = if self.is_nosql {
+                    format!("{{ }} // selecciona la colección: {object}")
+                } else {
+                    format!("SELECT * FROM \"{}\"", object.replace('"', "\"\""))
+                };
+                let state =
+                    self.query.query_input.get_or_insert_with(query::QueryInputState::default);
+                state.buffer = sql;
+                state.cursor = state.buffer.chars().count();
             }
         }
         self.refresh_preview_from_selected_object();
@@ -2665,6 +2678,47 @@ impl App {
         self.execute_user_query(&sql);
     }
 
+    /// Toggle del orden de la TABLA DE RESULTADOS (pestaña Query).
+    /// Ciclo: click → asc → desc → desactivado (mismo que el Data tab).
+    fn toggle_query_sort(&mut self, col: String) {
+        if self.query.query_sort.as_ref().is_some_and(|(c, _)| c == &col) {
+            if self.query.query_sort.as_ref().is_some_and(|(_, asc)| *asc) {
+                self.query.query_sort = Some((col, false));
+            } else {
+                self.query.query_sort = None; // 3er click: desactivar
+            }
+        } else {
+            self.query.query_sort = Some((col, true));
+        }
+        self.sort_query_results();
+    }
+
+    /// Ordena `query_results` EN MEMORIA por la columna activa (las líneas
+    /// son "a | b | c"). Comparación numérica si ambas celdas parsean como
+    /// número, si no, texto. Pura para poder testear.
+    fn sort_query_results(&mut self) {
+        let Some((col, asc)) = self.query.query_sort.clone() else { return };
+        let header = self.query.query_results.first().cloned();
+        let Some(header) = header else { return };
+        let col_idx = header.split(" | ").position(|h| h.trim() == col).or_else(|| {
+            // tolerancia: header puede traer tipo ("nombre type")
+            header.split(" | ").position(|h| h.split_whitespace().next() == Some(col.as_str()))
+        });
+        let Some(col_idx) = col_idx else { return };
+
+        let mut body: Vec<String> = self.query.query_results.iter().skip(1).cloned().collect();
+        body.sort_by(|a, b| {
+            let ca = a.split(" | ").nth(col_idx).unwrap_or("").trim();
+            let cb = b.split(" | ").nth(col_idx).unwrap_or("").trim();
+            let order = match (ca.parse::<f64>(), cb.parse::<f64>()) {
+                (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                _ => ca.cmp(cb),
+            };
+            if asc { order } else { order.reverse() }
+        });
+        self.query.query_results = std::iter::once(header).chain(body).collect();
+    }
+
     // ── favoritos ─────────────────────────────────────────────────────
 
     fn mark_current_db_as_favorite(&mut self) {
@@ -2769,6 +2823,7 @@ impl App {
         self.advanced.clear();
         self.data_view.preview_rows.clear();
         self.data_view.preview_data = None;
+        self.data_view.last_preview_key = None; // invalidar cache
         self.connection.connection_form = Some(ConnectionFormState::default());
         self.data_view.total_rows = 0;
         self.data_view.preview_loaded_offset = 0;
@@ -4663,6 +4718,47 @@ mod tests {
         app.query.query_input.as_mut().unwrap().buffer = "SELECT 1".to_string();
         app.handle_query_tab_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.error.is_some() || app.status.contains("primero") || app.db_path.is_none());
+    }
+
+    /// La tabla de resultados se ordena EN MEMORIA por columna: asc → desc
+    /// → off (ciclo de 3 clicks, como el Data tab).
+    #[test]
+    fn query_sort_ciclo_asc_desc_off() {
+        let mut app = App::new();
+        app.query.query_results = vec![
+            "id | nombre".to_string(),
+            "2 | beta".to_string(),
+            "1 | alfa".to_string(),
+            "3 | gamma".to_string(),
+        ];
+        // click 1: asc por 'nombre'
+        app.toggle_query_sort("nombre".to_string());
+        assert_eq!(
+            app.query.query_results.iter().skip(1).cloned().collect::<Vec<_>>(),
+            vec!["1 | alfa", "2 | beta", "3 | gamma"]
+        );
+        // click 2: desc
+        app.toggle_query_sort("nombre".to_string());
+        assert_eq!(app.query.query_results[1], "3 | gamma", "desc: {:#?}", app.query.query_results);
+        // click 3: off (orden original)
+        app.toggle_query_sort("nombre".to_string());
+        assert!(app.query.query_sort.is_none(), "3er click desactiva");
+    }
+
+    /// Orden numérico cuando las celdas parsean como número.
+    #[test]
+    fn query_sort_numerico() {
+        let mut app = App::new();
+        app.query.query_results = vec![
+            "id | nombre".to_string(),
+            "10 | diez".to_string(),
+            "2 | dos".to_string(),
+            "1 | uno".to_string(),
+        ];
+        app.toggle_query_sort("id".to_string());
+        assert_eq!(app.query.query_results[1], "1 | uno", "numérico asc");
+        assert_eq!(app.query.query_results[2], "2 | dos");
+        assert_eq!(app.query.query_results[3], "10 | diez");
     }
 
     /// REGRESIÓN (bug reportado): la pestaña Query NO debe abrir el modal `:`

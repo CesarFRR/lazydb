@@ -648,8 +648,8 @@ fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
         scroll,
         0,
         app.active_panel == PanelKind::Detail,
-        None,
-        true,
+        app.query.query_sort.as_ref().map(|(c, _)| c.as_str()),
+        app.query.query_sort.as_ref().is_some_and(|(_, asc)| *asc),
     );
 }
 

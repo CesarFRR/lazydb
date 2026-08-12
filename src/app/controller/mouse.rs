@@ -629,6 +629,25 @@ impl App {
                 return;
             }
 
+            // Click en header de la TABLA DE RESULTADOS (pestaña Query) →
+            // ordenar en memoria. El layout de render_query_tab: input
+            // (1/3 del alto, mín 4) + hint + separador + header de la tabla.
+            if kind == PanelKind::Detail
+                && self.data_view.detail_tab == DetailTab::Query
+                && !self.query.query_results.is_empty()
+            {
+                let body_h = usize::from(rect.height.saturating_sub(2));
+                let input_h = (body_h / 3).clamp(4, 12);
+                // input_h + hint(1) + separador(1) = fila del header
+                let header_row = input_h + 2;
+                if usize::from(rel_y) == header_row {
+                    if let Some(col_name) = self.column_at_x(x, rect) {
+                        self.toggle_query_sort(col_name);
+                    }
+                    return;
+                }
+            }
+
             // Click en un ítem de la lista
             // Para Data tab, las filas de datos empiezan en rel_y=4 (spacer+header+separator)
             let top_reserved =

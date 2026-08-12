@@ -32,6 +32,11 @@ pub struct DataViewState {
     pub sort_column: Option<String>,
     /// `true` = ascendente (▴), `false` = descendente (▾).
     pub sort_asc: bool,
+    /// Clave del preview CACHEADO: (objeto, tab). Si `refresh_preview` se
+    /// llama con la MISMA clave, no se relanza el spawn (el preview ya está
+    /// en `preview_rows`/`preview_data`). Evita re-consultar al volver a
+    /// una pestaña (ej. Meta: el DDL tardaba en reaparecer).
+    pub last_preview_key: Option<(String, DetailTab)>,
 }
 
 impl DataViewState {
@@ -47,6 +52,7 @@ impl DataViewState {
             query_mode: false,
             sort_column: None,
             sort_asc: true,
+            last_preview_key: None,
         }
     }
 }
