@@ -225,3 +225,51 @@ mod tests {
         cleanup();
     }
 }
+
+/// Estado del input SQL del modal `:` (historial en `AppState`).
+#[derive(Default)]
+pub struct QueryInputState {
+    pub buffer: String,
+    /// Posición del cursor dentro de `buffer` (índice de char).
+    pub cursor: usize,
+    /// `Some(i)` = navegando el historial (la entrada i rellena el buffer);
+    /// `None` = escribiendo una query nueva.
+    pub history_idx: Option<usize>,
+}
+
+/// Estado del query runner en `App` (Fase 4 del refactor): canales,
+/// generación anti-stale y el input del modal. La ejecución real
+/// (`execute_query`/`count_query_results`) ya vive en este módulo.
+// (clippy sugiere quitar el prefijo `query_`; se mantiene para distinguir
+// el estado del runner de los tipos `QueryMsg`/`QueryState` homónimos.)
+#[allow(clippy::struct_field_names)]
+pub struct QueryRunner {
+    pub query_state: QueryState,
+    pub query_results: Vec<String>,
+    pub query_input: Option<QueryInputState>,
+    pub(crate) query_gen: u64,
+    pub(crate) query_target_object: Option<String>,
+    pub(crate) query_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) query_rx: Option<tokio::sync::mpsc::UnboundedReceiver<QueryMsg>>,
+    pub(crate) query_tx: Option<tokio::sync::mpsc::UnboundedSender<QueryMsg>>,
+}
+
+impl QueryRunner {
+    // (clippy sugiere const fn; no puede: los canales tokio no son const.)
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(
+        query_rx: tokio::sync::mpsc::UnboundedReceiver<QueryMsg>,
+        query_tx: tokio::sync::mpsc::UnboundedSender<QueryMsg>,
+    ) -> Self {
+        Self {
+            query_state: QueryState::Idle,
+            query_results: Vec::new(),
+            query_input: None,
+            query_gen: 0,
+            query_target_object: None,
+            query_handle: None,
+            query_rx: Some(query_rx),
+            query_tx: Some(query_tx),
+        }
+    }
+}

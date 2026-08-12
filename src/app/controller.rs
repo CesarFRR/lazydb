@@ -231,15 +231,6 @@ pub struct ErrorPopup {
 /// Estado del popup de input SQL (`:`): buffer, cursor y navegación del
 /// historial (↑/↓ estilo fish).
 #[derive(Clone, Debug, Default)]
-pub struct QueryInputState {
-    pub buffer: String,
-    /// Posición del cursor dentro de `buffer` (índice de char)
-    pub cursor: usize,
-    /// `Some(i)` = navegando el historial (la entrada i rellena el buffer);
-    /// `None` = escribiendo una query nueva.
-    pub history_idx: Option<usize>,
-}
-
 /// Pick de base de datos de un servidor MySQL/MariaDB detectado: lista de
 /// esquemas (`SHOW DATABASES`) a elegir con ↑/↓ + Enter.
 pub struct DbPickerState {
@@ -363,29 +354,10 @@ pub struct App {
     /// (`row` → `doc`) y muestra el toggle JSON del modal.
     pub is_nosql: bool,
     pub status: String,
-    pub query_state: query::QueryState,
-    pub query_results: Vec<String>,
+    /// Estado del query runner (Fase 4): canales, generación e input del
+    /// modal `:` viven en query.rs.
+    pub query: query::QueryRunner,
     pub state: storage::AppState,
-
-    // ── query runner (COUNT(*) real, cancelable) ──
-    /// Generación de la última query lanzada: los resultados que llegan con
-    /// una generación vieja se descartan (stale data). Se incrementa al
-    /// lanzar una query nueva, al limpiar o al desconectar: cancela de
-    /// facto cualquier tarea en vuelo.
-    query_gen: u64,
-    /// Objeto (tabla/vista) activo cuando se lanzó la última query: si el
-    /// usuario navega a OTRO objeto mientras la query corre, el resultado
-    /// se descarta aunque la generación coincida (el COUNT de la tabla A no
-    /// debe pisar el status mirando la tabla B).
-    query_target_object: Option<String>,
-    /// `JoinHandle` de la última query/count en vuelo: permite `abort()` real
-    /// al desconectar o limpiar. Sin esto, la tarea seguía viva hasta
-    /// terminar (la "cancelación" por generación solo ignoraba el resultado)
-    /// sujetando una conexión del pool mientras tanto.
-    query_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Canal de resultados del query runner: generación + SQL + resultado.
-    query_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::QueryMsg>>,
-    query_tx: Option<tokio::sync::mpsc::UnboundedSender<query::QueryMsg>>,
 
     // ── conexión async (Ronda 2: la UI nunca se congela en round-trips) ──
     /// Generación de la última conexión lanzada: descarta resultados stale
@@ -420,9 +392,6 @@ pub struct App {
     /// Popup de error global (modal rojo que se cierra con Enter/Esc/q).
     /// Cualquier error de ejecución/IO lo dispara vía `show_error`.
     pub error: Option<ErrorPopup>,
-    /// Popup de input SQL (`:`): `Some` = abierto. El historial persistente
-    /// vive en `state.query_history` (storage).
-    pub query_input: Option<QueryInputState>,
     /// Estado de la UI de conexión (Fase 2): formulario, prompt de
     /// contraseña y picker de bases viven en connection.rs.
     pub connection: super::connection::ConnectionState,
@@ -507,11 +476,7 @@ impl App {
             last_sidebar_focus: PanelKind::Sources,
             layout: ComputedLayout::default(),
             sources_state,
-            query_gen: 0,
-            query_target_object: None,
-            query_handle: None,
-            query_rx: Some(query_rx),
-            query_tx: Some(query_tx),
+            query: query::QueryRunner::new(query_rx, query_tx),
             connection_gen: 0,
             connection_rx: Some(connection_rx),
             connection_tx: Some(connection_tx),
@@ -531,8 +496,6 @@ impl App {
             db_size_bytes: None,
             is_nosql: false,
             status: "Sin conexion".to_string(),
-            query_state: query::QueryState::Idle,
-            query_results: Vec::new(),
             state,
             keymap,
             show_actions_menu: false,
@@ -545,7 +508,6 @@ impl App {
             show_help: false,
             help_scroll: crate::ui::widgets::modal::ModalScroll::default(),
             error: None,
-            query_input: None,
             connection: super::connection::ConnectionState::new(),
             last_click_time: 0,
             last_click_kind: None,
@@ -2000,21 +1962,21 @@ impl App {
         }
 
         let sql = format!("SELECT COUNT(*) FROM \"{}\";", object.replace('"', "\"\""));
-        tracing::debug!(object = %object, "COUNT(*) lanzado (generación {})", self.query_gen + 1);
+        tracing::debug!(object = %object, "COUNT(*) lanzado (generación {})", self.query.query_gen + 1);
 
         // Generación nueva: cualquier resultado en vuelo de queries anteriores
         // queda marcado como stale y se descarta al llegar.
-        self.query_gen += 1;
-        self.query_target_object = Some(object);
-        let generation = self.query_gen;
-        let Some(tx) = self.query_tx.clone() else { return };
+        self.query.query_gen += 1;
+        self.query.query_target_object = Some(object);
+        let generation = self.query.query_gen;
+        let Some(tx) = self.query.query_tx.clone() else { return };
 
-        self.query_state = query::QueryState::Running;
+        self.query.query_state = query::QueryState::Running;
         self.status = "Contando filas...".to_string();
 
         // Provider: reusar la conexión activa (evita re-handshake en remoto)
         let adapter = self.adapter_arc();
-        self.query_handle = Some(tokio::spawn(async move {
+        self.query.query_handle = Some(tokio::spawn(async move {
             let res = query::count_query_results(adapter, &path, &sql).await;
             let _ = tx.send(query::QueryMsg::Count(generation, sql, res));
         }));
@@ -2053,9 +2015,9 @@ impl App {
     fn query_es_stale_por_navegacion(&mut self) -> bool {
         let objeto_actual = self.selected_object_name();
         let cambio =
-            self.query_target_object.as_deref().is_some_and(|target| target != objeto_actual);
+            self.query.query_target_object.as_deref().is_some_and(|target| target != objeto_actual);
         if cambio {
-            self.query_target_object = None;
+            self.query.query_target_object = None;
         }
         cambio
     }
@@ -2064,7 +2026,7 @@ impl App {
         // Drenar el canal en un scope corto: los borrows del loop no pueden
         // convivir con las mutaciones de self que hace el procesamiento.
         let drained: Vec<query::QueryMsg> = {
-            let Some(rx) = self.query_rx.as_mut() else { return };
+            let Some(rx) = self.query.query_rx.as_mut() else { return };
             std::iter::from_fn(|| rx.try_recv().ok()).collect()
         };
         for msg in drained {
@@ -2074,42 +2036,42 @@ impl App {
             match msg {
                 query::QueryMsg::Count(generation, sql, res) => {
                     let Some((state, status)) =
-                        Self::apply_count_result(self.query_gen, generation, &sql, res)
+                        Self::apply_count_result(self.query.query_gen, generation, &sql, res)
                     else {
                         continue; // stale: descartar
                     };
-                    self.query_results = if let query::QueryState::Done(rows) = &state {
+                    self.query.query_results = if let query::QueryState::Done(rows) = &state {
                         rows.clone()
                     } else {
                         Vec::new()
                     };
-                    self.query_state = state;
+                    self.query.query_state = state;
                     self.status = status;
                 }
                 query::QueryMsg::Free(generation, _sql, res) => {
-                    if generation != self.query_gen {
+                    if generation != self.query.query_gen {
                         continue; // stale: una query más nueva ya se lanzó
                     }
                     self.is_loading = false;
                     let (state, rows) = Self::apply_user_query_result(&res);
                     if matches!(state, query::QueryState::Done(_)) {
                         self.data_view.query_mode = true;
-                        self.query_state = state;
-                        self.query_results = rows;
+                        self.query.query_state = state;
+                        self.query.query_results = rows;
                         self.data_view.detail_tab = DetailTab::Data;
                         // Vista de datos 2D: fila 0 es el header, el
                         // resto son datos (el render ya hace el split).
-                        self.data_view.preview_rows = self.query_results.clone();
+                        self.data_view.preview_rows = self.query.query_results.clone();
                         self.data_view.preview_data = None;
                         self.data_view.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                         self.status = format!(
                             "{} filas · query OK (limit {})",
-                            self.query_results.len(),
+                            self.query.query_results.len(),
                             query::QUERY_RESULT_LIMIT
                         );
                     } else if let query::QueryState::Error(e) = state {
-                        self.query_state = query::QueryState::Error(e.clone());
+                        self.query.query_state = query::QueryState::Error(e.clone());
                         self.status = format!("Error SQL: {e}");
                         self.show_error("Error SQL", &e);
                     }
@@ -2123,31 +2085,31 @@ impl App {
     /// antes, la "cancelación" por generación dejaba correr la query entera
     /// sujetando la conexión (pool de 5 agotado por tareas huérfanas).
     fn abort_query_in_flight(&mut self) {
-        if let Some(handle) = self.query_handle.take() {
+        if let Some(handle) = self.query.query_handle.take() {
             handle.abort();
         }
     }
 
     fn clear_query_state(&mut self) {
         // Invalidar cualquier count en vuelo antes de limpiar
-        self.query_gen += 1;
+        self.query.query_gen += 1;
         self.abort_query_in_flight();
-        self.query_state = query::QueryState::Idle;
-        self.query_results.clear();
+        self.query.query_state = query::QueryState::Idle;
+        self.query.query_results.clear();
         self.status = "Query limpia".to_string();
     }
 
     // ── input SQL (`:` popup + historial persistente estilo fish) ──────
 
     fn handle_query_input_key(&mut self, key: KeyEvent) {
-        let Some(state) = self.query_input.as_mut() else { return };
+        let Some(state) = self.query.query_input.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
-                self.query_input = None;
+                self.query.query_input = None;
             }
             KeyCode::Enter => {
                 let sql = state.buffer.trim().to_string();
-                self.query_input = None;
+                self.query.query_input = None;
                 if sql.is_empty() {
                     return;
                 }
@@ -2487,7 +2449,7 @@ impl App {
     /// ↑/↓ sobre el historial (estilo fish): rellena el buffer con la query
     /// seleccionada; en `step = 0` (↓) vuelve hacia la query nueva.
     fn query_history_select(&mut self, step: usize) {
-        let Some(state) = self.query_input.as_mut() else { return };
+        let Some(state) = self.query.query_input.as_mut() else { return };
         let len = self.state.query_history.len();
         if len == 0 {
             self.status = "Historial vacío".to_string();
@@ -2532,19 +2494,19 @@ impl App {
         let _ = self.state.save();
         self.rebuild_sources(None);
 
-        tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query_gen + 1);
-        self.query_gen += 1;
-        self.query_target_object = Some(self.selected_object_name());
-        let generation = self.query_gen;
-        let Some(tx) = self.query_tx.clone() else { return };
+        tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query.query_gen + 1);
+        self.query.query_gen += 1;
+        self.query.query_target_object = Some(self.selected_object_name());
+        let generation = self.query.query_gen;
+        let Some(tx) = self.query.query_tx.clone() else { return };
 
-        self.query_state = query::QueryState::Running;
+        self.query.query_state = query::QueryState::Running;
         self.status = "Ejecutando query...".to_string();
         self.is_loading = true;
 
         // Provider: reusar la conexión activa (evita re-handshake en remoto)
         let adapter = self.adapter_arc();
-        self.query_handle = Some(tokio::spawn(async move {
+        self.query.query_handle = Some(tokio::spawn(async move {
             let res = query::execute_query(adapter, &path, &sql, query::QUERY_RESULT_LIMIT).await;
             let _ = tx.send(query::QueryMsg::Free(generation, sql, res));
         }));
@@ -2674,10 +2636,10 @@ impl App {
         self.data_view.detail_tab = DetailTab::Data;
         // Invalidar cualquier query en vuelo: su resultado ya no aplica y la
         // conexión del pool se libera YA (abort real, no solo generación)
-        self.query_gen += 1;
+        self.query.query_gen += 1;
         self.abort_query_in_flight();
-        self.query_state = query::QueryState::Idle;
-        self.query_results.clear();
+        self.query.query_state = query::QueryState::Idle;
+        self.query.query_results.clear();
         self.sources_state.sources = Self::build_sources(
             &self.state,
             self.sources_state.source_tab,
@@ -3286,8 +3248,8 @@ impl App {
         }
 
         // Input de query (`:`)
-        if self.query_input.is_some() {
-            if let Some(state) = self.query_input.as_mut() {
+        if self.query.query_input.is_some() {
+            if let Some(state) = self.query.query_input.as_mut() {
                 state.buffer.push_str(&clean);
             }
             return;
@@ -3347,7 +3309,7 @@ impl App {
 
         // ── input SQL (modal `:` — captura TODO mientras está abierto,
         // incluidos chars no mapeados a ninguna acción) ──
-        if self.query_input.is_some() {
+        if self.query.query_input.is_some() {
             self.handle_query_input_key(key);
             return;
         }
@@ -3471,7 +3433,7 @@ impl App {
             keys::AppAction::ClearQueryState => self.clear_query_state(),
             keys::AppAction::ReloadRuntimeConfig => self.reload_runtime_config(),
             keys::AppAction::OpenQueryInput => {
-                self.query_input = Some(QueryInputState::default());
+                self.query.query_input = Some(query::QueryInputState::default());
                 self.status = "SQL: escribe una query, ↑/↓ historial, enter ejecuta".to_string();
             }
             keys::AppAction::ToggleActionsMenu => {
@@ -4854,7 +4816,7 @@ mod tests {
 
     fn app_con_query_input(history: &[&str]) -> App {
         let mut app = App::new();
-        app.query_input = Some(QueryInputState::default());
+        app.query.query_input = Some(query::QueryInputState::default());
         // Más reciente al inicio: coincide con add_query_history (insert(0, ...))
         app.state.query_history = history.iter().map(|s| (*s).to_string()).collect();
         // Para consistencia visual en los tests: invertimos si lo declaran
@@ -4869,7 +4831,7 @@ mod tests {
         let mut app = App::new();
         // `:` está bindeado a OpenQueryInput; la acción abre el popup
         app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
-        assert!(app.query_input.is_some(), "`:` debe abrir el input SQL");
+        assert!(app.query.query_input.is_some(), "`:` debe abrir el input SQL");
     }
 
     #[test]
@@ -4878,7 +4840,7 @@ mod tests {
         for c in ['S', 'E', 'L'] {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         assert_eq!(s.buffer, "SEL");
         assert_eq!(s.cursor, 3);
     }
@@ -4890,7 +4852,7 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         assert_eq!(s.buffer, "SE");
         assert_eq!(s.cursor, 2);
     }
@@ -4900,7 +4862,7 @@ mod tests {
         let mut app = app_con_query_input(&["SELECT 2", "SELECT 1"]);
         // buffer vacío + ↑ → la query más reciente (idx 0 = "SELECT 2")
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         assert_eq!(s.buffer, "SELECT 2");
         assert_eq!(s.history_idx, Some(0));
         assert_eq!(s.cursor, s.buffer.chars().count());
@@ -4911,7 +4873,7 @@ mod tests {
         let mut app = app_con_query_input(&["SELECT 2", "SELECT 1"]);
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         // Llegamos a la entrada más vieja: "SELECT 1"
         assert_eq!(s.buffer, "SELECT 1");
         assert_eq!(s.history_idx, Some(1));
@@ -4923,7 +4885,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         // ↑ rellenó "SELECT 2" (idx 0); ↓ baja hacia la siguiente → "SELECT 1"
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        let s = app.query_input.as_ref().unwrap();
+        let s = app.query.query_input.as_ref().unwrap();
         // ↓ desde idx=1 debería bajar a idx=0 (más reciente)
         assert_eq!(s.buffer, "SELECT 2", "↓ desde posición alta vuelve a la más reciente");
     }
@@ -4932,7 +4894,7 @@ mod tests {
     fn enter_con_buffer_vacio_cierra_sin_ejecutar_ni_historial() {
         let mut app = app_con_query_input(&[]);
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.query_input.is_none());
+        assert!(app.query.query_input.is_none());
         assert!(app.state.query_history.is_empty(), "buffer vacío no registra historial");
     }
 
@@ -4943,7 +4905,7 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.query_input.is_none(), "Enter cierra el popup");
+        assert!(app.query.query_input.is_none(), "Enter cierra el popup");
         // Conexión async: el error del resolver llega por canal → poll.
         // El spawn_blocking corre en paralelo; esperamos a que termine.
         for _ in 0..20 {
@@ -5591,7 +5553,7 @@ mod tests {
         app.set_selected_idx(PanelKind::Tables, 0); // tabla "t" seleccionada
 
         // Lanzar COUNT sobre la tabla actual
-        app.query_target_object = Some("t".to_string());
+        app.query.query_target_object = Some("t".to_string());
 
         // Navegar a otra tabla ANTES de que llegue el resultado
         app.set_selected_idx(PanelKind::Tables, 1); // ahora "otra"
@@ -5610,7 +5572,7 @@ mod tests {
         let mut app = app_con_scroll_fake(100, 25);
         app.tables = vec!["t".to_string()];
         app.set_selected_idx(PanelKind::Tables, 0);
-        app.query_target_object = Some("t".to_string());
+        app.query.query_target_object = Some("t".to_string());
 
         assert!(!app.query_es_stale_por_navegacion(), "mismo objeto → el resultado aplica");
     }

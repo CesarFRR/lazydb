@@ -105,7 +105,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // Input SQL (modal `:` — buffer con cursor + historial estilo fish)
-    if app.query_input.is_some() {
+    if app.query.query_input.is_some() {
         render_query_input(frame, area, app);
     }
 
@@ -193,7 +193,7 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Feedback inmediato: spinner mientras corre una query O una conexión
     // (Capa A: antes `is_loading` solo cambiaba el texto, sin animación).
-    let status = if app.is_loading || app.query_state == QueryState::Running {
+    let status = if app.is_loading || app.query.query_state == QueryState::Running {
         let spin = SPINNER[app.frame % SPINNER.len()];
         format!("{spin} {}", app.status)
     } else {
@@ -387,7 +387,7 @@ fn render_query_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-    let Some(state) = &app.query_input else { return };
+    let Some(state) = &app.query.query_input else { return };
     let theme = &crate::ui::theme::THEME;
 
     // Tamaño del modal: ancho 70%, alto = borde + input + hasta 8 historial + footer
