@@ -235,7 +235,11 @@ async fn row_offset_of_async(
     value: &str,
 ) -> Result<Option<u32>, DbError> {
     let mut conn = pool.get_conn().await?;
-    let sql = format!("SELECT COUNT(*) FROM `{db_name}`.`{table_name}` WHERE `{col}` < '{value}'");
+    // Escapar comillas simples del valor: `O'Brien` no debe romper la query
+    // (ni inyectar SQL — el valor viene de una celda del usuario).
+    let value_esc = value.replace('\'', "''");
+    let sql =
+        format!("SELECT COUNT(*) FROM `{db_name}`.`{table_name}` WHERE `{col}` < '{value_esc}'");
     let count: Option<i64> = conn.query_first(sql).await?;
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     Ok(count.and_then(|c| if c > 0 { Some(c as u32 - 1) } else { None }))
@@ -262,8 +266,9 @@ async fn query_free_async(
     limit: u32,
 ) -> Result<Vec<String>, DbError> {
     let mut conn = pool.get_conn().await?;
-    // Limitar con LIMIT embed (el motor lo optimiza)
-    let row_sql = format!("{sql} LIMIT {limit}");
+    // Envolver SIEMPRE en subquery (inmune a `--`, `;` y LIMIT previo):
+    // ver `crate::db::query_guard`.
+    let row_sql = crate::db::query_guard::bounded_select_sql(sql, limit);
     let rows: Vec<MysqlRow> = conn.query(&row_sql).await?;
     let mut out = Vec::new();
     for row in rows {

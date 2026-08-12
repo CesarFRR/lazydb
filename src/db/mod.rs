@@ -4,6 +4,7 @@ pub mod connection;
 pub mod error;
 pub mod model;
 pub mod pretty;
+pub mod query_guard;
 pub mod resolver;
 // Runtime tokio para los drivers async (`mysql`, `postgres`, `mongodb`).
 // Los backends locales (sqlite/duckdb/files) son sync puro y no lo necesitan.

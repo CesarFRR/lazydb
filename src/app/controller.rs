@@ -287,6 +287,11 @@ fn source_host_port(url: &str) -> Option<(String, u16)> {
     Some((host.trim_matches(['[', ']']).to_string(), port))
 }
 
+/// Máximo de probes de salud en paralelo. `probe_source` hace DNS + TCP
+/// síncrono (hasta 2s por fuente); con el runtime por defecto (workers =
+/// CPUs), un scroll rápido podía agotar los workers y frenar las queries.
+const PROBE_MAX_CONCURRENT: usize = 4;
+
 /// Probe de salud de una fuente (filosofía culling: se invoca solo sobre la
 /// fuente seleccionada, en segundo plano, y el resultado se cachea):
 /// - URLs (`mysql://`, `postgres://`, `http(s)://`…): conexión TCP al
@@ -833,6 +838,11 @@ pub struct App {
     last_probed_idx: usize,
     /// Paths con probe en vuelo (evita lanzar dos probes seguidos en paralelo).
     probing: HashSet<String>,
+    /// Semáforo global de probes: máx `PROBE_MAX_CONCURRENT` en paralelo.
+    /// `probe_source` hace DNS + TCP síncrono (hasta 2s); sin tope, un
+    /// scroll rápido que revela 15 fuentes lanza 15 tareas bloqueantes a la
+    /// vez y satura los workers del runtime.
+    probe_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     /// Canal de resultados de probes en segundo plano (tx/rx).
     probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
     probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
@@ -843,6 +853,16 @@ pub struct App {
     /// lanzar una query nueva, al limpiar o al desconectar: cancela de
     /// facto cualquier tarea en vuelo.
     query_gen: u64,
+    /// Objeto (tabla/vista) activo cuando se lanzó la última query: si el
+    /// usuario navega a OTRO objeto mientras la query corre, el resultado
+    /// se descarta aunque la generación coincida (el COUNT de la tabla A no
+    /// debe pisar el status mirando la tabla B).
+    query_target_object: Option<String>,
+    /// `JoinHandle` de la última query/count en vuelo: permite `abort()` real
+    /// al desconectar o limpiar. Sin esto, la tarea seguía viva hasta
+    /// terminar (la "cancelación" por generación solo ignoraba el resultado)
+    /// sujetando una conexión del pool mientras tanto.
+    query_handle: Option<tokio::task::JoinHandle<()>>,
     /// Canal de resultados del query runner: generación + SQL + resultado.
     query_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::QueryMsg>>,
     query_tx: Option<tokio::sync::mpsc::UnboundedSender<query::QueryMsg>>,
@@ -960,9 +980,12 @@ impl App {
             cwd_databases,
             health: HashMap::new(),
             probing: HashSet::new(),
+            probe_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_MAX_CONCURRENT)),
             probe_rx: Some(probe_rx),
             probe_tx: Some(probe_tx),
             query_gen: 0,
+            query_target_object: None,
+            query_handle: None,
             query_rx: Some(query_rx),
             query_tx: Some(query_tx),
             frame: 0,
@@ -1119,9 +1142,20 @@ impl App {
         let Some(tx) = self.probe_tx.clone() else { return };
         self.probing.insert(path.clone());
         tracing::debug!(path = %path, cache = use_cache, "probe lanzado");
+        // Semáforo + spawn_blocking: `probe_source` hace DNS y TCP síncronos
+        // (hasta 2s). Con `tokio::spawn` directo, cada probe ocupaba un
+        // worker async del runtime — un scroll rápido con 15 fuentes agotaba
+        // los workers y frenaba las queries en vuelo. El semáforo limita la
+        // concurrencia a `PROBE_MAX_CONCURRENT`.
+        let semaphore = self.probe_semaphore.clone();
         tokio::spawn(async move {
-            let ok = probe_source(&path);
-            let _ = tx.send((path, ok));
+            let _permit = semaphore.acquire_owned().await;
+            let path2 = path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let ok = probe_source(&path2);
+                let _ = tx.send((path, ok));
+            })
+            .await;
         });
     }
 
@@ -1157,9 +1191,15 @@ impl App {
             return;
         }
         let offset = self.panel(PanelKind::Sources).scroll_offset.get();
-        let items = self.items_for(PanelKind::Sources).to_vec();
-        let window = offset..offset.saturating_add(inner_h);
-        let targets = Self::visible_probe_targets(&items, window, &self.health, &self.probing);
+        // Sin `to_vec()`: este método corre CADA frame y clonar la lista
+        // completa de fuentes era trabajo real por frame aunque nada
+        // cambiara. `visible_probe_targets` recibe el slice + ventana.
+        let targets = Self::visible_probe_targets(
+            self.items_for(PanelKind::Sources),
+            offset..offset.saturating_add(inner_h),
+            &self.health,
+            &self.probing,
+        );
         for path in targets {
             self.probe_path(path, true);
         }
@@ -2482,6 +2522,7 @@ impl App {
         // Generación nueva: cualquier resultado en vuelo de queries anteriores
         // queda marcado como stale y se descarta al llegar.
         self.query_gen += 1;
+        self.query_target_object = Some(object);
         let generation = self.query_gen;
         let Some(tx) = self.query_tx.clone() else { return };
 
@@ -2490,10 +2531,10 @@ impl App {
 
         // Provider: reusar la conexión activa (evita re-handshake en remoto)
         let adapter = self.adapter_arc();
-        tokio::spawn(async move {
+        self.query_handle = Some(tokio::spawn(async move {
             let res = query::count_query_results(adapter, &path, &sql).await;
             let _ = tx.send(query::QueryMsg::Count(generation, sql, res));
-        });
+        }));
     }
 
     /// Aplica un resultado de count en el estado. Devuelve `None` si era
@@ -2522,6 +2563,20 @@ impl App {
         Some((state, status))
     }
 
+    /// ¿El resultado de la query en vuelo ya no aplica? Devuelve `true` si
+    /// el usuario navegó a OTRO objeto mientras la query corría (aunque la
+    /// generación coincida, el COUNT de la tabla A no debe pisar el status
+    /// de la B). Al detectarlo, se olvida el target (una sola notificación).
+    fn query_es_stale_por_navegacion(&mut self) -> bool {
+        let objeto_actual = self.selected_object_name();
+        let cambio =
+            self.query_target_object.as_deref().is_some_and(|target| target != objeto_actual);
+        if cambio {
+            self.query_target_object = None;
+        }
+        cambio
+    }
+
     fn poll_query_results(&mut self) {
         // Drenar el canal en un scope corto: los borrows del loop no pueden
         // convivir con las mutaciones de self que hace el procesamiento.
@@ -2530,6 +2585,9 @@ impl App {
             std::iter::from_fn(|| rx.try_recv().ok()).collect()
         };
         for msg in drained {
+            if self.query_es_stale_por_navegacion() {
+                continue; // el usuario navegó a otro objeto: descartar
+            }
             match msg {
                 query::QueryMsg::Count(generation, sql, res) => {
                     let Some((state, status)) =
@@ -2577,9 +2635,20 @@ impl App {
         }
     }
 
+    /// Aborta la query/count en vuelo (si hay). La tarea tokio se corta en
+    /// el próximo `.await` y la conexión del pool se libera de inmediato —
+    /// antes, la "cancelación" por generación dejaba correr la query entera
+    /// sujetando la conexión (pool de 5 agotado por tareas huérfanas).
+    fn abort_query_in_flight(&mut self) {
+        if let Some(handle) = self.query_handle.take() {
+            handle.abort();
+        }
+    }
+
     fn clear_query_state(&mut self) {
         // Invalidar cualquier count en vuelo antes de limpiar
         self.query_gen += 1;
+        self.abort_query_in_flight();
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
         self.status = "Query limpia".to_string();
@@ -3078,6 +3147,7 @@ impl App {
 
         tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query_gen + 1);
         self.query_gen += 1;
+        self.query_target_object = Some(self.selected_object_name());
         let generation = self.query_gen;
         let Some(tx) = self.query_tx.clone() else { return };
 
@@ -3087,10 +3157,10 @@ impl App {
 
         // Provider: reusar la conexión activa (evita re-handshake en remoto)
         let adapter = self.adapter_arc();
-        tokio::spawn(async move {
+        self.query_handle = Some(tokio::spawn(async move {
             let res = query::execute_query(adapter, &path, &sql, query::QUERY_RESULT_LIMIT).await;
             let _ = tx.send(query::QueryMsg::Free(generation, sql, res));
-        });
+        }));
     }
 
     /// Aplica el resultado de una query libre. Pura para testear sin App.
@@ -3215,8 +3285,10 @@ impl App {
         self.preview_loaded_offset = 0;
         self.current_page = 0;
         self.detail_tab = DetailTab::Data;
-        // Invalidar cualquier query en vuelo: su resultado ya no aplica
+        // Invalidar cualquier query en vuelo: su resultado ya no aplica y la
+        // conexión del pool se libera YA (abort real, no solo generación)
         self.query_gen += 1;
+        self.abort_query_in_flight();
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
         self.sources = Self::build_sources(
@@ -3645,7 +3717,11 @@ impl App {
             if let Some(adapter) = self.adapter_arc() {
                 if let Ok(tables) = adapter.list_objects_by_type("table") {
                     self.tables = tables;
-                    self.rebuild_sources(None);
+                    // NOTA: aquí NO se reconstruyen las fuentes (bases de
+                    // datos) — lo que cambió es el catálogo de tablas de la
+                    // conexión activa. Antes había un `rebuild_sources(None)`
+                    // fantasma (acoplamiento por copy-paste) que no tenía
+                    // efecto útil: rebuild_sources no lee `self.tables`.
                 }
             }
         }
@@ -6056,5 +6132,39 @@ mod tests {
             selected.contains("/b/two.db"),
             "el rebuild no debe saltar la selección: {selected}"
         );
+    }
+
+    /// REGRESIÓN (C3): el COUNT(*) de la tabla A no debe pisar el status si
+    /// el usuario navegó a la tabla B mientras la query corría. Antes solo
+    /// importaba la generación; ahora también el objeto destino.
+    #[test]
+    fn query_stale_por_navegacion_se_descarta() {
+        let mut app = app_con_scroll_fake(100, 25);
+        app.tables = vec!["t".to_string(), "otra".to_string()];
+        app.set_selected_idx(PanelKind::Tables, 0); // tabla "t" seleccionada
+
+        // Lanzar COUNT sobre la tabla actual
+        app.query_target_object = Some("t".to_string());
+
+        // Navegar a otra tabla ANTES de que llegue el resultado
+        app.set_selected_idx(PanelKind::Tables, 1); // ahora "otra"
+
+        assert!(
+            app.query_es_stale_por_navegacion(),
+            "el resultado del COUNT de 't' es stale si miras 'otra'"
+        );
+        // La primera llamada consume el target; la segunda ya no reporta
+        assert!(!app.query_es_stale_por_navegacion(), "solo se reporta una vez");
+    }
+
+    /// El resultado del COUNT es válido si el usuario sigue en el MISMO objeto.
+    #[test]
+    fn query_no_stale_si_el_objeto_no_cambio() {
+        let mut app = app_con_scroll_fake(100, 25);
+        app.tables = vec!["t".to_string()];
+        app.set_selected_idx(PanelKind::Tables, 0);
+        app.query_target_object = Some("t".to_string());
+
+        assert!(!app.query_es_stale_por_navegacion(), "mismo objeto → el resultado aplica");
     }
 }

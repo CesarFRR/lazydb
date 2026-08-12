@@ -292,8 +292,12 @@ async fn row_offset_of_async(
 ) -> Result<Option<u32>, DbError> {
     let client = pool.get().await?;
     let schema = current_schema(&client).await?;
-    let sql =
-        format!("SELECT COUNT(*) FROM \"{schema}\".\"{table_name}\" WHERE \"{col}\" < '{value}'");
+    // Escapar comillas simples del valor: `O'Brien` no debe romper la query
+    // (ni inyectar SQL — el valor viene de una celda del usuario).
+    let value_esc = value.replace('\'', "''");
+    let sql = format!(
+        "SELECT COUNT(*) FROM \"{schema}\".\"{table_name}\" WHERE \"{col}\" < '{value_esc}'"
+    );
     let row = client.query_one(&sql, &[]).await?;
     let count: i64 = row.get(0);
     drop(client);
@@ -377,16 +381,9 @@ async fn query_free_async(
     limit: u32,
 ) -> Result<Vec<String>, DbError> {
     let client = pool.get().await?;
-    // Solo añadimos LIMIT a SELECTs simples sin LIMIT propio.
-    let trimmed = sql.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let is_select = lower.starts_with("select") || lower.starts_with("with");
-    let has_limit = lower.contains(" limit ");
-    let row_sql = if is_select && !has_limit {
-        format!("{trimmed} LIMIT {limit}")
-    } else {
-        trimmed.to_string()
-    };
+    // Envolver SIEMPRE en subquery (inmune a `--`, `;` y LIMIT previo):
+    // ver `crate::db::query_guard`.
+    let row_sql = crate::db::query_guard::bounded_select_sql(sql, limit);
     let rows = rows_from_simple_rows(client.simple_query(&row_sql).await?);
     drop(client);
     Ok(rows.into_iter().map(|r| r.cells.join(" | ")).collect())
