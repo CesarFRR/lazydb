@@ -104,8 +104,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_help(frame, area, app);
     }
 
-    // Input SQL (modal `:` — buffer con cursor + historial estilo fish)
-    if app.query.query_input.is_some() {
+    // Input SQL (modal `:` — SOLO cuando el usuario lo abrió con `:`; la
+    // pestaña Query usa el mismo buffer sin abrir el modal)
+    if app.query.query_modal_open {
         render_query_input(frame, area, app);
     }
 
@@ -219,7 +220,7 @@ fn footer_bindings(app: &App) -> Vec<FooterBinding> {
     let danger = Style::default().fg(Color::Red);
 
     // ── modales abiertos: los atajos del modal dominan ──
-    if app.query.query_input.is_some() {
+    if app.query.query_modal_open {
         out.push(FooterBinding { key: "enter", description: "ejecutar", style: accent });
         out.push(FooterBinding { key: "esc", description: "cerrar", style: normal });
         out.push(FooterBinding { key: "↑↓", description: "historial", style: normal });
@@ -530,6 +531,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 /// Render de la pestaña Query (`DetailTab::Query`): input de SQL en la parte
 /// superior + resultados (o placeholder) debajo. Split vertical 1/4 - 3/4.
 /// Comparte `QueryInputState` con el modal `:` (un solo historial).
+#[allow(clippy::too_many_lines)] // split input/resultados con la tabla reutilizada
 fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
@@ -547,13 +549,11 @@ fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
     let body = block.inner(area);
     frame.render_widget(block, area);
 
-    // ── split: input (3 filas) + resultados (resto) ──
-    let input_h = 3.min(body.height);
+    // ── split: input ~1/3 del alto (mín 4 filas, con wrap) + resultados ──
+    let input_h = (body.height / 3).clamp(4, 12);
     let input_area = Rect::new(body.x, body.y, body.width, input_h);
-    let results_area =
-        Rect::new(body.x, body.y + input_h, body.width, body.height.saturating_sub(input_h));
 
-    // ── input: prompt + buffer (placeholder según backend) ──
+    // ── input: prompt + buffer (wrap) ──
     let state = app.query.query_input.as_ref();
     let buffer = state.map_or("", |s| s.buffer.as_str());
     let placeholder = if app.is_nosql {
@@ -568,18 +568,19 @@ fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
         Style::default().fg(theme.text)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
+        Paragraph::new(vec![Line::from(vec![
             Span::styled("❯ ", Style::default().fg(theme.selection).add_modifier(Modifier::BOLD)),
             Span::styled(text, text_style),
-        ])),
+        ])])
+        .wrap(ratatui::widgets::Wrap { trim: false }),
         input_area,
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "enter: ejecutar | ctrl+u: limpiar | ctrl+r: contar filas",
+            "enter: ejecutar | ctrl+u: limpiar | ↑↓: historial | ctrl+r: contar filas",
             Style::default().fg(theme.dim),
         ))),
-        Rect::new(body.x, body.y + 1, body.width, 1),
+        Rect::new(body.x, body.y + input_h.saturating_sub(1), body.width, 1),
     );
     // separador sutil
     frame.render_widget(
@@ -587,33 +588,69 @@ fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
             "─".repeat(usize::from(body.width.saturating_sub(1))),
             Style::default().fg(theme.dim),
         ))),
-        Rect::new(body.x, body.y + 2, body.width, 1),
+        Rect::new(body.x, body.y + input_h, body.width, 1),
+    );
+    let results_area = Rect::new(
+        body.x,
+        body.y + input_h + 1,
+        body.width,
+        body.height.saturating_sub(input_h + 1),
     );
 
-    // ── resultados: query_results o las líneas del preview ──
+    // ── resultados: reutilizar render_data_table (cabeceras + celdas 2D) ──
     let results: &[String] = if app.query.query_results.is_empty() {
         &app.data_view.preview_rows
     } else {
         &app.query.query_results
     };
+
+    if results.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Ejecuta una query para ver resultados aquí",
+                Style::default().fg(theme.dim),
+            ))),
+            results_area,
+        );
+        return;
+    }
+
+    // Construir TableData desde las líneas: la primera línea es el header
+    // (separada por ' | '), el resto son filas.
+    let columns: Vec<crate::db::Column> = results
+        .first()
+        .map(|h| {
+            h.split(" | ")
+                .map(|name| crate::db::Column { name: name.to_string(), dtype: String::new() })
+                .collect()
+        })
+        .unwrap_or_default();
+    let rows: Vec<crate::db::Row> = results
+        .iter()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .map(|l| crate::db::Row { cells: l.split(" | ").map(ToString::to_string).collect() })
+        .collect();
+    let table = crate::db::TableData { columns, rows };
+
     let scroll = app
         .panels
         .iter()
         .find(|p| p.kind == PanelKind::Detail)
         .map_or(0, |p| p.scroll_offset.get());
-    let max_visible = usize::from(results_area.height.saturating_sub(1));
-    let scroll = scroll.min(results.len().saturating_sub(max_visible));
-    let lines: Vec<Line<'_>> = results
-        .iter()
-        .skip(scroll)
-        .take(max_visible)
-        .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(theme.text))))
-        .collect();
-    #[allow(clippy::cast_possible_truncation)] // scroll < u16::MAX en terminales reales
-    let scroll_u16 = scroll as u16;
-    frame.render_widget(Paragraph::new(lines).scroll((scroll_u16, 0)), results_area);
-    // dibujar scrollbar vertical del área de resultados
-    widgets::panel::draw_v_scrollbar(frame, results_area, results.len(), scroll);
+    let _ = widgets::panel::render_data_table(
+        frame,
+        results_area,
+        " Resultados ",
+        Some(&table),
+        results,
+        app.panel_selected_idx_for_query_tab(),
+        scroll,
+        0,
+        app.active_panel == PanelKind::Detail,
+        None,
+        true,
+    );
 }
 
 fn render_query_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -793,6 +830,7 @@ mod footer_tests {
     fn modal_query_domina_los_bindings() {
         let mut app = App::new();
         app.query.query_input = Some(crate::query::QueryInputState::default());
+        app.query.query_modal_open = true;
         let d = descs(&app);
         assert!(d.iter().any(|x| x == "ejecutar"), "modal: {d:?}");
         // El modal no muestra bindings de panel

@@ -150,8 +150,8 @@ impl App {
             return;
         }
 
-        // Input de query (`:`)
-        if self.query.query_input.is_some() {
+        // Input de query (`:` — solo si el modal está abierto)
+        if self.query.query_modal_open {
             if let Some(state) = self.query.query_input.as_mut() {
                 state.buffer.push_str(&clean);
             }
@@ -221,9 +221,9 @@ impl App {
             return;
         }
 
-        // ── input SQL (modal `:` — captura TODO mientras está abierto,
-        // incluidos chars no mapeados a ninguna acción) ──
-        if self.query.query_input.is_some() {
+        // ── input SQL (modal `:` — captura TODO solo si está abierto
+        // EXPLÍCITAMENTE; la pestaña Query usa el buffer sin modal) ──
+        if self.query.query_modal_open {
             self.handle_query_input_key(key);
             return;
         }
@@ -347,7 +347,10 @@ impl App {
             keys::AppAction::ClearQueryState => self.clear_query_state(),
             keys::AppAction::ReloadRuntimeConfig => self.reload_runtime_config(),
             keys::AppAction::OpenQueryInput => {
-                self.query.query_input = Some(query::QueryInputState::default());
+                if self.query.query_input.is_none() {
+                    self.query.query_input = Some(query::QueryInputState::default());
+                }
+                self.query.query_modal_open = true;
                 self.status = "SQL: escribe una query, ↑/↓ historial, enter ejecuta".to_string();
             }
             keys::AppAction::ToggleActionsMenu => {

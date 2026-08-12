@@ -246,7 +246,14 @@ pub struct QueryInputState {
 pub struct QueryRunner {
     pub query_state: QueryState,
     pub query_results: Vec<String>,
+    /// Buffer del input SQL. Existe SIEMPRE en la pestaña Query (seed/escritura)
+    /// y se crea al abrir el modal `:`. El modal NO se decide por esto:
+    /// usa `query_modal_open`.
     pub query_input: Option<QueryInputState>,
+    /// `true` = el modal `:` está VISUALMENTE abierto (captura teclas y se
+    /// dibuja encima). Separado del buffer: la pestaña Query usa el mismo
+    /// buffer sin abrir el modal.
+    pub query_modal_open: bool,
     pub(crate) query_gen: u64,
     pub(crate) query_target_object: Option<String>,
     pub(crate) query_handle: Option<tokio::task::JoinHandle<()>>,
@@ -265,6 +272,7 @@ impl QueryRunner {
             query_state: QueryState::Idle,
             query_results: Vec::new(),
             query_input: None,
+            query_modal_open: false,
             query_gen: 0,
             query_target_object: None,
             query_handle: None,

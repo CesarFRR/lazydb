@@ -1040,6 +1040,12 @@ impl App {
     /// Versión SEGURA del path para mostrar en la UI: quita las credenciales
     /// (`user:pass@`) — el password NUNCA debe aparecer en pantalla ni en
     /// logs de estado.
+    /// Índice seleccionado del panel Detail (para el render de la pestaña
+    /// Query: la tabla de resultados reutiliza `render_data_table`).
+    pub fn panel_selected_idx_for_query_tab(&self) -> usize {
+        self.panels.iter().find(|p| p.kind == PanelKind::Detail).map_or(0, |p| p.selected_idx)
+    }
+
     pub fn db_path_safe(&self) -> String {
         self.db_path.as_deref().map_or_else(|| "-".to_string(), crate::security::strip_credentials)
     }
@@ -2151,11 +2157,13 @@ impl App {
         let Some(state) = self.query.query_input.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
-                self.query.query_input = None;
+                // Cerrar el MODAL; el buffer se conserva (la pestaña Query
+                // lo reutiliza)
+                self.query.query_modal_open = false;
             }
             KeyCode::Enter => {
                 let sql = state.buffer.trim().to_string();
-                self.query.query_input = None;
+                self.query.query_modal_open = false;
                 if sql.is_empty() {
                     return;
                 }
@@ -3856,6 +3864,8 @@ mod tests {
     fn app_con_query_input(history: &[&str]) -> App {
         let mut app = App::new();
         app.query.query_input = Some(query::QueryInputState::default());
+        // El modal `:` se considera abierto (los tests escriben en él)
+        app.query.query_modal_open = true;
         // Más reciente al inicio: coincide con add_query_history (insert(0, ...))
         app.state.query_history = history.iter().map(|s| (*s).to_string()).collect();
         // Para consistencia visual en los tests: invertimos si lo declaran
@@ -3933,7 +3943,7 @@ mod tests {
     fn enter_con_buffer_vacio_cierra_sin_ejecutar_ni_historial() {
         let mut app = app_con_query_input(&[]);
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.query.query_input.is_none());
+        assert!(!app.query.query_modal_open, "Enter con buffer vacío cierra el modal");
         assert!(app.state.query_history.is_empty(), "buffer vacío no registra historial");
     }
 
@@ -3944,7 +3954,7 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.query.query_input.is_none(), "Enter cierra el popup");
+        assert!(!app.query.query_modal_open, "Enter cierra el popup");
         // Conexión async: el error del resolver llega por canal → poll.
         // El spawn_blocking corre en paralelo; esperamos a que termine.
         for _ in 0..20 {
@@ -4653,5 +4663,20 @@ mod tests {
         app.query.query_input.as_mut().unwrap().buffer = "SELECT 1".to_string();
         app.handle_query_tab_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.error.is_some() || app.status.contains("primero") || app.db_path.is_none());
+    }
+
+    /// REGRESIÓN (bug reportado): la pestaña Query NO debe abrir el modal `:`
+    /// al entrar — el buffer existe (seed/escritura) pero el modal solo se
+    /// abre con `:` explícito.
+    #[test]
+    fn pestaña_query_no_abre_el_modal() {
+        let mut app = App::new();
+        app.data_view.detail_tab = DetailTab::Query;
+        // Simular el seed: el buffer se crea (como hace set_detail_tab)
+        app.query.query_input = Some(query::QueryInputState::default());
+        app.query.query_input.as_mut().unwrap().buffer = "CREATE TABLE t (id int)".to_string();
+
+        // El modal NO debe estar abierto solo porque el buffer existe
+        assert!(!app.query.query_modal_open, "el buffer de la pestaña no abre el modal");
     }
 }
