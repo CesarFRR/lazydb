@@ -403,12 +403,21 @@ pub fn render_data_table(
         // fila) y headers (click = ordenar). Con `▄` el thumb se pegaba a los
         // headers y la mitad vacía parecía "barra fantasma".
         let thumb_style = Style::default().fg(THEME.selection);
+        // Clamp contra el buffer REAL del frame: al redimensionar la
+        // terminal a una dimensión menor, el rect del panel (calculado con
+        // el layout anterior) puede sobresalir del buffer → `cell_mut`
+        // paniqueaba "index outside of buffer" (mismo bug que ya estaba
+        // protegido en el scrollbar vertical, línea ~668).
+        let (frame_w, frame_h) = (frame.area().width, frame.area().height);
+        if inner.y >= frame_h {
+            return scroll;
+        }
         let buf = frame.buffer_mut();
         for i in thumb_start..thumb_start + thumb_w {
-            let cell = buf
-                .cell_mut((inner.x + i as u16, inner.y))
-                .expect("celda dentro del área del panel");
-            cell.set_symbol("▀").set_style(thumb_style);
+            let x = (inner.x + i as u16).min(frame_w.saturating_sub(1));
+            if let Some(cell) = buf.cell_mut((x, inner.y)) {
+                cell.set_symbol("▀").set_style(thumb_style);
+            }
         }
     }
 

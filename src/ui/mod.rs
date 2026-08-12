@@ -27,11 +27,31 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
-    // El layout ya fue computado en el loop principal
-    render_footer(frame, app.layout.footer, app);
+    // Resize race: si la terminal cambió entre `compute_layout(size)` y
+    // `draw()` (el frame tiene el tamaño REAL del buffer), recomputar el
+    // layout AHORA para que nunca sobresalga. Los clamps de abajo quedan
+    // como red de seguridad para cualquier desfase residual.
+    if app.layout.footer.width != area.width || app.layout.footer.height != area.height {
+        app.compute_layout(area.width, area.height);
+    }
 
-    // Renderizar cada panel en su posición
+    // El layout ya fue computado (y re-computado si hizo falta). Clamp
+    // contra el frame por seguridad: ratatui 0.29 PANICA con rects que
+    // sobresalen del buffer.
+    let footer = app.layout.footer.intersection(area);
+    if footer.height > 0 && footer.width > 0 {
+        render_footer(frame, footer, app);
+    }
+
+    // Renderizar cada panel en su posición. Clamp contra el área REAL del
+    // frame: al redimensionar la terminal, el layout (computado con el
+    // tamaño anterior) puede sobresalir del buffer → ratatui paniquea
+    // "index outside of buffer". `intersection` recorta sin panic.
     for &(kind, rect) in &app.layout.panels {
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        let rect = rect.intersection(area);
         if rect.width == 0 || rect.height == 0 {
             continue;
         }
@@ -448,4 +468,53 @@ fn render_query_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
     let msg = "Terminal pequena: amplia ancho/alto para ver lazydb";
     frame.render_widget(Paragraph::new(msg), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// REGRESIÓN: al redimensionar la terminal a una dimensión MENOR, el
+    /// layout (computado con el tamaño anterior) sobresale del buffer del
+    /// frame → ratatui paniqueaba "index outside of buffer" (scrollbar
+    /// horizontal del Data tab y rects de panel sin clamp).
+    #[tokio::test]
+    async fn render_con_layout_mayor_que_el_frame_no_paniquea() {
+        let mut app = App::new();
+        // Layout grande (terminal anterior): 120x40
+        app.compute_layout(120, 40);
+        // Frame REAL pequeño (terminal nueva): 30x10 → el layout sobresale
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal de test");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render con resize no debe paniquear");
+    }
+
+    /// REGRESIÓN (escenario real del usuario): resize con Data tab poblado
+    /// y muchas columnas — el thumb del scrollbar horizontal se dibujaba
+    /// con `.expect()` y paniqueaba al sobresalir del buffer nuevo.
+    #[tokio::test]
+    async fn render_resize_con_scrollbar_horizontal_no_paniquea() {
+        let mut app = App::new();
+        // Data tab con MUCHAS columnas → h_scroll activo (thumb dibujado).
+        // El resize a un frame pequeño hace que el rect del panel sobresalga.
+        app.detail_tab = DetailTab::Data;
+        app.tables = vec!["t".to_string()];
+        let headers: Vec<String> = (0..30).map(|i| format!("col_{i}")).collect();
+        let mut rows = vec![headers.join(" | ")];
+        rows.extend(
+            (0..50).map(|i| (0..30).map(|c| format!("v{i}_{c}")).collect::<Vec<_>>().join(" | ")),
+        );
+        app.preview_rows = rows;
+
+        // Layout grande → frame pequeño (resize race)
+        app.compute_layout(150, 40);
+        let backend = ratatui::backend::TestBackend::new(25, 8);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render con h_scroll + resize no debe paniquear");
+    }
 }
