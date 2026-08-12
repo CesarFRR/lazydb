@@ -1595,6 +1595,12 @@ impl App {
                 self.data_view.preview_rows = rows.clone();
                 self.data_view.preview_data = None;
                 self.data_view.total_rows = *total;
+                // INVALIDAR el cache de Data: `preview_rows` ya no contiene
+                // los datos de Data (ahora es Schema/Meta). Sin esto, al
+                // volver a Data el CACHE 2 daba falso hit y mostraba el
+                // contenido de Schema en la pestaña Datos (bug reportado:
+                // datos --> esquema --> datos muestra esquema en ambos).
+                self.data_view.last_preview_key = None;
                 self.is_loading = false;
                 self.set_selected_idx(PanelKind::Detail, 0);
                 return;
@@ -4809,6 +4815,46 @@ mod tests {
         assert!(
             app.data_view.preview_rows.first().is_some_and(|l| l.contains("Cargando")),
             "el preview viejo se limpia al cambiar de tab: {:?}",
+            app.data_view.preview_rows
+        );
+    }
+
+    /// REGRESIÓN (bug reportado): Data → Schema → Data NO debe mostrar
+    /// Schema en la pestaña Datos. El cache 1 (Schema) al restaurar
+    /// invalida `last_preview_key` → al volver a Data, el cache 2 no da
+    /// falso hit y relanza el preview de datos.
+    #[test]
+    fn data_schema_data_no_muestra_esquema_en_datos() {
+        let mut app = App::new();
+        app.tables = vec!["t".to_string()];
+        app.set_selected_idx(PanelKind::Tables, 0);
+        // Data cargado (como si el poll hubiera aplicado)
+        app.data_view.preview_rows = vec!["id | nombre".to_string(), "1 | cesar".to_string()];
+        app.data_view.last_preview_key = Some(("t".to_string(), DetailTab::Data));
+
+        // Schema cacheado
+        app.data_view.preview_cache.insert(
+            ("t".to_string(), DetailTab::Schema),
+            (vec!["cid | name | type".to_string(), "0 | id | INTEGER".to_string()], 0),
+        );
+
+        // Ir a Schema → restaura del cache (insta)
+        app.data_view.detail_tab = DetailTab::Schema;
+        app.refresh_preview_from_selected_object();
+        assert!(
+            app.data_view.preview_rows[0].contains("cid"),
+            "Schema restaurado: {:?}",
+            app.data_view.preview_rows
+        );
+        // last_preview_key invalidado: el preview ya no es de Data
+        assert!(app.data_view.last_preview_key.is_none(), "el cache 1 invalida la clave de Data");
+
+        // Volver a Data → cache 2 NO debe dar hit (relanza → "Cargando")
+        app.data_view.detail_tab = DetailTab::Data;
+        app.refresh_preview_from_selected_object();
+        assert!(
+            app.data_view.preview_rows[0].starts_with("Cargando"),
+            "Data relanza (no muestra Schema): {:?}",
             app.data_view.preview_rows
         );
     }
