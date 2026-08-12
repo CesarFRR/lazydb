@@ -2,25 +2,24 @@
 // concreto a partir de una cadena de conexión o path.
 use crate::db::adapter::DbAdapter;
 
-#[cfg(feature = "sqlite")]
-use crate::db::backends::sqlite_adapter::SqliteAdapter;
 #[cfg(feature = "duckdb")]
 use crate::db::backends::duckdb_adapter::DuckdbAdapter;
 #[cfg(feature = "files")]
 use crate::db::backends::file_adapter::FileAdapter;
+#[cfg(feature = "mongodb")]
+use crate::db::backends::mongo_adapter::MongoAdapter;
 #[cfg(feature = "mysql")]
 use crate::db::backends::mysql_adapter::MysqlAdapter;
 #[cfg(feature = "postgres")]
 use crate::db::backends::postgres_adapter::PostgresAdapter;
-#[cfg(feature = "mongodb")]
-use crate::db::backends::mongo_adapter::MongoAdapter;
+#[cfg(feature = "sqlite")]
+use crate::db::backends::sqlite_adapter::SqliteAdapter;
 
 /// Devuelve un adaptador para la fuente indicada o None si no se puede resolver.
 /// Detecta paths locales (*.db → sqlite, *.duckdb/*.ddb → duckdb,
 /// *.csv/*.parquet/*.json/*.geojson/*.gpkg → archivo de datos) o URLs
 /// con prefijo `sqlite://` / `duckdb://` / `mysql://` / `postgres://` /
 /// `mongodb://`.
-#[allow(dead_code)]
 pub fn resolve_backend(source: &str) -> Option<Box<dyn DbAdapter>> {
     #[cfg(feature = "sqlite")]
     if let Some(rest) = source.strip_prefix("sqlite://") {

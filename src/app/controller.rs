@@ -8,7 +8,6 @@ use crate::ui::layout::{self, ComputedLayout};
 use crate::ui::widgets::panel::MIN_COL_W;
 use crate::{config, db, keys, query, storage};
 
-#[allow(dead_code)]
 const LARGE_WIDTH: u16 = 120;
 const KB_BYTES: u64 = 1024;
 const MB_BYTES: u64 = KB_BYTES * 1024;
@@ -288,6 +287,11 @@ fn source_host_port(url: &str) -> Option<(String, u16)> {
     Some((host.trim_matches(['[', ']']).to_string(), port))
 }
 
+/// Máximo de probes de salud en paralelo. `probe_source` hace DNS + TCP
+/// síncrono (hasta 2s por fuente); con el runtime por defecto (workers =
+/// CPUs), un scroll rápido podía agotar los workers y frenar las queries.
+const PROBE_MAX_CONCURRENT: usize = 4;
+
 /// Probe de salud de una fuente (filosofía culling: se invoca solo sobre la
 /// fuente seleccionada, en segundo plano, y el resultado se cachea):
 /// - URLs (`mysql://`, `postgres://`, `http(s)://`…): conexión TCP al
@@ -390,8 +394,7 @@ fn strip_url_credentials(url: &str) -> (String, Option<String>) {
     };
     let creds = &rest[..at_mark];
     let host = &rest[at_mark + 1..];
-    let user =
-        creds.split_once(':').map_or(Some(creds), |(u, _)| Some(u)).map(ToString::to_string);
+    let user = creds.split_once(':').map_or(Some(creds), |(u, _)| Some(u)).map(ToString::to_string);
     (format!("{scheme_part}{host}"), user)
 }
 
@@ -409,6 +412,22 @@ fn server_url_has_database(url: &str) -> bool {
     // `host`, `host:puerto`, `user:pass@host:puerto` → sin `/` = sin BD.
     // Con `/bd` → hay base.
     rest.contains('/') && !rest.ends_with('/')
+}
+
+/// ¿Es una URL remota (`mysql://`, `postgres://`, `postgresql://`, `mongodb://`)?
+fn is_remote_url(url: &str) -> bool {
+    url.starts_with("mysql://")
+        || url.starts_with("postgres://")
+        || url.starts_with("postgresql://")
+        || url.starts_with("mongodb://")
+}
+
+/// Inserta `user:pass@` tras el scheme de la URL (para reconectar con las
+/// credenciales del keyring). Devuelve la URL con credenciales.
+fn inject_credentials(url: &str, scheme: &str, user: &str, pass: &str) -> String {
+    let prefix = format!("{scheme}://");
+    url.strip_prefix(&prefix)
+        .map_or_else(|| url.to_string(), |rest| format!("{prefix}{user}:{pass}@{rest}"))
 }
 
 /// Quita las marcas decorativas (● ★ ▣ ⊙, combinables: "● ★ x") de un item de
@@ -523,8 +542,13 @@ impl SourceList<'_> {
             health_mark
         );
         match display {
-            Some(name) => self.out.push(format!("{mark}{prefix}{name} => {path}")),
-            None => self.out.push(format!("{mark}{prefix}{path}")),
+            Some(name) => self.out.push(format!(
+                "{mark}{prefix}{name} => {}",
+                crate::security::strip_credentials(&path)
+            )),
+            None => self
+                .out
+                .push(format!("{mark}{prefix}{}", crate::security::strip_credentials(&path))),
         }
     }
 
@@ -556,7 +580,7 @@ impl SourceList<'_> {
         }
     }
 
-    fn add_detected(&mut self, detected_servers: &[String]) {
+    fn add_detected(&mut self, detected_servers: &[String], cwd_databases: &[String]) {
         // Servidores SQL locales detectados por puerto (escaneo cacheable)
         if !detected_servers.is_empty() {
             self.section("SERVIDORES LOCALES");
@@ -567,10 +591,10 @@ impl SourceList<'_> {
             }
         }
 
-        // DBs SQLite de la carpeta actual (donde se ejecuta lazydb)
-        let scanned = scan_cwd_databases();
+        // DBs SQLite de la carpeta actual (donde se ejecuta lazydb). El
+        // escaneo se cachea en `App::new` (I/O de filesystem bloqueante).
         let fresh: Vec<String> =
-            scanned.iter().filter(|p| !self.seen.contains(*p)).cloned().collect();
+            cwd_databases.iter().filter(|p| !self.seen.contains(*p)).cloned().collect();
         if fresh.is_empty() {
             return;
         }
@@ -760,6 +784,11 @@ pub struct App {
     /// el escaneo es bloqueante y no debe repetirse en cada render). Cada
     /// entrada es una URL sin credenciales, p. ej. `mysql://127.0.0.1:3306`.
     pub detected_servers: Vec<String>,
+    /// DBs de archivo del cwd (escaneadas UNA vez en `new`, igual que
+    /// `detected_servers`): `build_sources` corre dentro del frame loop
+    /// (`poll_probe_results`) y un `read_dir` + `stat` por frame hacía el
+    /// panel de Fuentes notablemente lento.
+    pub cwd_databases: Vec<String>,
     pub source_tab: SourceTab,
     pub tables: Vec<String>,
     pub views: Vec<String>,
@@ -783,7 +812,8 @@ pub struct App {
     /// conexiones lentas (`CleverCloud`) por límite de conexiones.
     /// `Rc` permite clonar la referencia sin prestar `self` (los métodos
     /// que usan el adapter también asignan campos de `self`).
-    pub active_adapter: Option<std::sync::Arc<dyn crate::db::adapter::DbAdapter>>,    pub db_size_bytes: Option<u64>,
+    pub active_adapter: Option<std::sync::Arc<dyn crate::db::adapter::DbAdapter>>,
+    pub db_size_bytes: Option<u64>,
     /// ¿El backend conectado es `NoSQL` (mongo)? La UI cambia terminología
     /// (`row` → `doc`) y muestra el toggle JSON del modal.
     pub is_nosql: bool,
@@ -808,6 +838,11 @@ pub struct App {
     last_probed_idx: usize,
     /// Paths con probe en vuelo (evita lanzar dos probes seguidos en paralelo).
     probing: HashSet<String>,
+    /// Semáforo global de probes: máx `PROBE_MAX_CONCURRENT` en paralelo.
+    /// `probe_source` hace DNS + TCP síncrono (hasta 2s); sin tope, un
+    /// scroll rápido que revela 15 fuentes lanza 15 tareas bloqueantes a la
+    /// vez y satura los workers del runtime.
+    probe_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     /// Canal de resultados de probes en segundo plano (tx/rx).
     probe_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, bool)>>,
     probe_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, bool)>>,
@@ -818,9 +853,27 @@ pub struct App {
     /// lanzar una query nueva, al limpiar o al desconectar: cancela de
     /// facto cualquier tarea en vuelo.
     query_gen: u64,
+    /// Objeto (tabla/vista) activo cuando se lanzó la última query: si el
+    /// usuario navega a OTRO objeto mientras la query corre, el resultado
+    /// se descarta aunque la generación coincida (el COUNT de la tabla A no
+    /// debe pisar el status mirando la tabla B).
+    query_target_object: Option<String>,
+    /// `JoinHandle` de la última query/count en vuelo: permite `abort()` real
+    /// al desconectar o limpiar. Sin esto, la tarea seguía viva hasta
+    /// terminar (la "cancelación" por generación solo ignoraba el resultado)
+    /// sujetando una conexión del pool mientras tanto.
+    query_handle: Option<tokio::task::JoinHandle<()>>,
     /// Canal de resultados del query runner: generación + SQL + resultado.
     query_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::QueryMsg>>,
     query_tx: Option<tokio::sync::mpsc::UnboundedSender<query::QueryMsg>>,
+
+    // ── conexión async (Ronda 2: la UI nunca se congela en round-trips) ──
+    /// Generación de la última conexión lanzada: descarta resultados stale
+    /// (el usuario conectó A, luego B antes de que terminara A).
+    connection_gen: u64,
+    /// Resultado de la conexión en vuelo (adapter + catálogo + preview).
+    connection_rx: Option<tokio::sync::mpsc::UnboundedReceiver<query::ConnectionMsg>>,
+    connection_tx: Option<tokio::sync::mpsc::UnboundedSender<query::ConnectionMsg>>,
     /// Contador de frames para el spinner del status bar.
     pub frame: usize,
     pub keymap: keys::Keymap,
@@ -886,6 +939,7 @@ impl App {
 
     // ── construcción ──────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)] // App::new construye TODO el estado (Ronda 3: mover)
     pub fn new() -> Self {
         let state = storage::AppState::load();
         let keymap = keys::Keymap::load();
@@ -893,11 +947,16 @@ impl App {
         let source_tab = SourceTab::All;
         let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
         let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (connection_tx, connection_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Detección de servidores SQL locales: bloqueante (E/S de red), por
         // eso se cachea UNA vez en el arranque. Timeout corto por puerto.
         let detected_servers =
             crate::db::servers::scan_local_servers(std::time::Duration::from_millis(300));
+
+        // DBs de archivo del cwd: escaneo de filesystem bloqueante, se cachea
+        // UNA vez igual que los servidores (build_sources corre en cada frame).
+        let cwd_databases = scan_cwd_databases();
 
         tracing::debug!(
             recents = state.recents.len(),
@@ -924,16 +983,24 @@ impl App {
                 None,
                 &HashMap::new(),
                 &detected_servers,
+                &cwd_databases,
             ),
             source_tab,
             detected_servers,
+            cwd_databases,
             health: HashMap::new(),
             probing: HashSet::new(),
+            probe_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(PROBE_MAX_CONCURRENT)),
             probe_rx: Some(probe_rx),
             probe_tx: Some(probe_tx),
             query_gen: 0,
+            query_target_object: None,
+            query_handle: None,
             query_rx: Some(query_rx),
             query_tx: Some(query_tx),
+            connection_gen: 0,
+            connection_rx: Some(connection_rx),
+            connection_tx: Some(connection_tx),
             frame: 0,
             // usize::MAX: el primer frame detecta la selección inicial (item 0)
             // y la comprueba al arrancar.
@@ -1013,6 +1080,8 @@ impl App {
         // altura real del panel de Sources (ventana visible).
         self.poll_probe_results();
         self.poll_query_results();
+        // Conexiones async terminadas (adapter + catálogo + preview).
+        self.poll_connection_results();
     }
 
     // ── helpers de paneles ────────────────────────────────────────────
@@ -1088,9 +1157,20 @@ impl App {
         let Some(tx) = self.probe_tx.clone() else { return };
         self.probing.insert(path.clone());
         tracing::debug!(path = %path, cache = use_cache, "probe lanzado");
+        // Semáforo + spawn_blocking: `probe_source` hace DNS y TCP síncronos
+        // (hasta 2s). Con `tokio::spawn` directo, cada probe ocupaba un
+        // worker async del runtime — un scroll rápido con 15 fuentes agotaba
+        // los workers y frenaba las queries en vuelo. El semáforo limita la
+        // concurrencia a `PROBE_MAX_CONCURRENT`.
+        let semaphore = self.probe_semaphore.clone();
         tokio::spawn(async move {
-            let ok = probe_source(&path);
-            let _ = tx.send((path, ok));
+            let _permit = semaphore.acquire_owned().await;
+            let path2 = path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let ok = probe_source(&path2);
+                let _ = tx.send((path, ok));
+            })
+            .await;
         });
     }
 
@@ -1126,9 +1206,15 @@ impl App {
             return;
         }
         let offset = self.panel(PanelKind::Sources).scroll_offset.get();
-        let items = self.items_for(PanelKind::Sources).to_vec();
-        let window = offset..offset.saturating_add(inner_h);
-        let targets = Self::visible_probe_targets(&items, window, &self.health, &self.probing);
+        // Sin `to_vec()`: este método corre CADA frame y clonar la lista
+        // completa de fuentes era trabajo real por frame aunque nada
+        // cambiara. `visible_probe_targets` recibe el slice + ventana.
+        let targets = Self::visible_probe_targets(
+            self.items_for(PanelKind::Sources),
+            offset..offset.saturating_add(inner_h),
+            &self.health,
+            &self.probing,
+        );
         for path in targets {
             self.probe_path(path, true);
         }
@@ -1138,22 +1224,28 @@ impl App {
     /// `compute_layout`) y dispara los probes pendientes: la fuente recién
     /// seleccionada y las nuevas filas visibles de Fuentes.
     fn poll_probe_results(&mut self) {
-        let Some(rx) = self.probe_rx.as_mut() else { return };
-        while let Ok((path, ok)) = rx.try_recv() {
+        // Drenar el canal primero (evita el doble borrow de `self` entre el
+        // receiver y el rebuild de `sources`).
+        let mut resolved: Vec<(String, bool)> = Vec::new();
+        if let Some(rx) = self.probe_rx.as_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                resolved.push(msg);
+            }
+        }
+        let mut changed = false;
+        for (path, ok) in resolved {
             // Rebuild solo si el estado cambió (primera verificación o ✗ ↔ ok)
-            let changed = self.health.get(&path) != Some(&ok);
+            if self.health.get(&path) != Some(&ok) {
+                changed = true;
+            }
             self.health.insert(path.clone(), ok);
             self.probing.remove(&path);
-            if changed {
-                tracing::debug!(path = %path, ok, "probe resuelto (estado cambiado)");
-                self.sources = Self::build_sources(
-                    &self.state,
-                    self.source_tab,
-                    self.db_path.as_deref(),
-                    &self.health,
-                    &self.detected_servers,
-                );
-            }
+            tracing::debug!(path = %path, ok, "probe resuelto");
+        }
+        if changed {
+            // Preservar la selección: el rebuild no debe saltar el cursor
+            // a otra fuente (los probes reordenan marcas, no la lista).
+            self.rebuild_sources(None);
         }
 
         // Selección de Sources bajo el cursor: la navegación (flechas, click,
@@ -1475,6 +1567,7 @@ impl App {
         connected: Option<&str>,
         health: &HashMap<String, bool>,
         detected_servers: &[String],
+        cwd_databases: &[String],
     ) -> Vec<String> {
         let mut list = SourceList {
             state,
@@ -1489,12 +1582,12 @@ impl App {
             SourceTab::All => {
                 list.add_favs(SourceFilter::All);
                 list.add_recents(SourceFilter::All);
-                list.add_detected(detected_servers);
+                list.add_detected(detected_servers, cwd_databases);
             }
             SourceTab::Local => {
                 list.add_favs(SourceFilter::Local);
                 list.add_recents(SourceFilter::Local);
-                list.add_detected(detected_servers);
+                list.add_detected(detected_servers, cwd_databases);
             }
             SourceTab::Online => {
                 list.add_favs(SourceFilter::Online);
@@ -1505,6 +1598,43 @@ impl App {
         list.finish(source_tab)
     }
 
+    /// Reconstruye `sources` preservando la selección POR PATH (no por
+    /// índice numérico): `add_recent`/`add_favorite` reordenan la lista y
+    /// el índice viejo quedaría apuntando a OTRA fuente ("se abre una db
+    /// pero otra queda seleccionada"). Guarda el path seleccionado, hace el
+    /// rebuild y re-ubica el cursor en el mismo path. `prefer` (p. ej. la
+    /// fuente recién conectada) gana sobre la selección previa.
+    fn rebuild_sources(&mut self, prefer: Option<&str>) {
+        let current = self
+            .items_for(PanelKind::Sources)
+            .get(self.selected_idx(PanelKind::Sources))
+            .and_then(|item| Self::source_probe_path(item));
+
+        self.sources = Self::build_sources(
+            &self.state,
+            self.source_tab,
+            self.db_path.as_deref(),
+            &self.health,
+            &self.detected_servers,
+            &self.cwd_databases,
+        );
+
+        // Path objetivo: el preferido o el que estaba seleccionado.
+        let target = prefer.or(current.as_deref());
+        let Some(target) = target else { return };
+        // Comparación canónica: la lista guarda paths normalizados y SIN
+        // credenciales (display), así que el target se normaliza igual.
+        let norm = crate::paths::normalize_path(target);
+        let norm_clean = crate::security::strip_credentials(&norm);
+        if let Some(idx) = self.sources.iter().position(|item| {
+            Self::source_probe_path(item).is_some_and(|p| {
+                crate::security::strip_credentials(&crate::paths::normalize_path(&p)) == norm_clean
+            })
+        }) {
+            self.set_selected_idx(PanelKind::Sources, idx);
+        }
+    }
+
     fn set_source_tab(&mut self, tab: SourceTab) {
         self.source_tab = tab;
         self.sources = Self::build_sources(
@@ -1513,6 +1643,7 @@ impl App {
             self.db_path.as_deref(),
             &self.health,
             &self.detected_servers,
+            &self.cwd_databases,
         );
         self.set_selected_idx(PanelKind::Sources, 0);
     }
@@ -1593,8 +1724,11 @@ impl App {
         self.actions_menu_idx
     }
 
-    pub fn db_path_display(&self) -> &str {
-        self.db_path.as_deref().unwrap_or("-")
+    /// Versión SEGURA del path para mostrar en la UI: quita las credenciales
+    /// (`user:pass@`) — el password NUNCA debe aparecer en pantalla ni en
+    /// logs de estado.
+    pub fn db_path_safe(&self) -> String {
+        self.db_path.as_deref().map_or_else(|| "-".to_string(), crate::security::strip_credentials)
     }
 
     pub fn db_size_display(&self) -> String {
@@ -1625,7 +1759,7 @@ impl App {
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
     #[cfg(feature = "mysql")]
     fn connect_mysql_server(&mut self, url: &str) {
-        self.status = format!("Conectando a {url}...");
+        self.status = format!("Conectando a {}...", crate::security::strip_credentials(url));
         // Si la URL YA trae credenciales (`user:pass@`), se conservan: es una
         // conexión a servidor autenticada desde el inicio.
         let has_creds = url
@@ -1647,17 +1781,23 @@ impl App {
         });
         match result {
             Ok((db_name, dbs)) if dbs.is_empty() => {
-                self.status =
-                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario (BD actual: {db_name})",
+                    crate::security::strip_credentials(url)
+                );
             }
             Ok((_db_name, dbs)) => {
-                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(url),
+                    dbs.len()
+                );
                 self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
                 // Sin acceso (auth o red): pedir contraseña. URL limpia (sin
                 // credenciales) y el user de la URL si lo traía.
-                tracing::warn!(url = %url, error = ?err, "servidor sin acceso, pidiendo contraseña");
+                tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "servidor sin acceso, pidiendo contraseña");
                 self.status = String::new();
                 let (clean_url, user) = strip_url_credentials(url);
                 self.password_prompt = Some(PasswordPromptState {
@@ -1679,7 +1819,8 @@ impl App {
             || server_url.clone(),
             |host_port| format!("mysql://{user}:{buffer}@{host_port}"),
         );
-        self.status = format!("Autenticando en {server_url}...");
+        self.status =
+            format!("Autenticando en {}...", crate::security::strip_credentials(&server_url));
         let result = crate::db::rt::block_on(async {
             let (pool, _db_name) = crate::db::backends::mysql::connect(&url)?;
             let dbs = crate::db::backends::mysql::list_databases(&pool)?;
@@ -1687,14 +1828,21 @@ impl App {
         });
         match result {
             Ok(dbs) if dbs.is_empty() => {
-                self.status = format!("Servidor {server_url}: sin bases de usuario");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario",
+                    crate::security::strip_credentials(&server_url)
+                );
             }
             Ok(dbs) => {
-                self.status = format!("Servidor {server_url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(&server_url),
+                    dbs.len()
+                );
                 self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
             }
             Err(err) => {
-                tracing::warn!(url = %server_url, error = ?err, "credenciales rechazadas");
+                tracing::warn!(url = %crate::security::strip_credentials(&server_url), error = ?err, "credenciales rechazadas");
                 self.show_error("No se pudo autenticar", &err.to_string());
             }
         }
@@ -1705,7 +1853,7 @@ impl App {
     /// abre el prompt de contraseña con user `postgres` por defecto.
     #[cfg(feature = "postgres")]
     fn connect_postgres_server(&mut self, url: &str) {
-        self.status = format!("Conectando a {url}...");
+        self.status = format!("Conectando a {}...", crate::security::strip_credentials(url));
         // Normalizamos `postgresql://` → `postgres://` (el crate solo entiende
         // el segundo). Si la URL YA trae credenciales (`user:pass@`), se
         // conservan: es una conexión a servidor autenticada desde el inicio.
@@ -1731,16 +1879,22 @@ impl App {
         });
         match result {
             Ok((db_name, dbs)) if dbs.is_empty() => {
-                self.status =
-                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario (BD actual: {db_name})",
+                    crate::security::strip_credentials(url)
+                );
             }
             Ok((_db_name, dbs)) => {
-                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(url),
+                    dbs.len()
+                );
                 self.db_picker =
                     Some(DbPickerState { server_url: scheme_normalized.clone(), dbs, idx: 0 });
             }
             Err(err) => {
-                tracing::warn!(url = %url, error = ?err, "servidor postgres sin acceso, pidiendo contraseña");
+                tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "servidor postgres sin acceso, pidiendo contraseña");
                 self.status = String::new();
                 // Prompt con URL SIN credenciales (no repetir la password en
                 // pantalla) y el user de la URL si lo traía.
@@ -1763,7 +1917,8 @@ impl App {
             || server_url.clone(),
             |host_port| format!("postgres://{user}:{buffer}@{host_port}"),
         );
-        self.status = format!("Autenticando en {server_url}...");
+        self.status =
+            format!("Autenticando en {}...", crate::security::strip_credentials(&server_url));
         let result = crate::db::rt::block_on(async {
             let (pool, _db_name) = crate::db::backends::postgres::connect(&url)?;
             let dbs = crate::db::backends::postgres::list_databases(&pool)?;
@@ -1771,14 +1926,21 @@ impl App {
         });
         match result {
             Ok(dbs) if dbs.is_empty() => {
-                self.status = format!("Servidor {server_url}: sin bases de usuario");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario",
+                    crate::security::strip_credentials(&server_url)
+                );
             }
             Ok(dbs) => {
-                self.status = format!("Servidor {server_url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(&server_url),
+                    dbs.len()
+                );
                 self.db_picker = Some(DbPickerState { server_url: url, dbs, idx: 0 });
             }
             Err(err) => {
-                tracing::warn!(url = %server_url, error = ?err, "credenciales postgres rechazadas");
+                tracing::warn!(url = %crate::security::strip_credentials(&server_url), error = ?err, "credenciales postgres rechazadas");
                 self.show_error("No se pudo autenticar", &err.to_string());
             }
         }
@@ -1789,7 +1951,7 @@ impl App {
     /// credenciales en la URL, el connect las usa.
     #[cfg(feature = "mongodb")]
     fn connect_mongo_server(&mut self, url: &str) {
-        self.status = format!("Conectando a {url}...");
+        self.status = format!("Conectando a {}...", crate::security::strip_credentials(url));
         let result = crate::db::rt::block_on(async {
             let (client, db_name) = crate::db::backends::mongo::connect(url)?;
             let dbs = crate::db::backends::mongo::list_databases(&client)?;
@@ -1797,15 +1959,21 @@ impl App {
         });
         match result {
             Ok((db_name, dbs)) if dbs.is_empty() => {
-                self.status =
-                    format!("Servidor {url}: sin bases de usuario (BD actual: {db_name})");
+                self.status = format!(
+                    "Servidor {}: sin bases de usuario (BD actual: {db_name})",
+                    crate::security::strip_credentials(url)
+                );
             }
             Ok((_db_name, dbs)) => {
-                self.status = format!("Servidor {url}: elige una base ({})", dbs.len());
+                self.status = format!(
+                    "Servidor {}: elige una base ({})",
+                    crate::security::strip_credentials(url),
+                    dbs.len()
+                );
                 self.db_picker = Some(DbPickerState { server_url: url.to_string(), dbs, idx: 0 });
             }
             Err(err) => {
-                tracing::warn!(url = %url, error = ?err, "mongo sin acceso");
+                tracing::warn!(url = %crate::security::strip_credentials(url), error = ?err, "mongo sin acceso");
                 self.show_error("No se pudo conectar a MongoDB", &err.to_string());
             }
         }
@@ -1813,10 +1981,11 @@ impl App {
 
     /// ¿La URL mysql:// trae base explícita (`.../bd`)? Las URLs detectadas
     /// por `scan_local_servers` NO la traen: son conexiones a nivel servidor.
+    #[allow(clippy::too_many_lines)]
     fn connect_sqlite(&mut self, path: &str) {
         // Choke point de normalización: solo para rutas de archivo. Las URLs
         // (`mysql://`, `duckdb://` remotos) no se tocan.
-        let path = if path.starts_with('/') || path.starts_with("mysql://") {
+        let mut path = if path.starts_with('/') || path.starts_with("mysql://") {
             path.to_string()
         } else if path.starts_with("postgresql://") {
             // El crate solo entiende `postgres://`; unificar el alias aquí.
@@ -1830,13 +1999,38 @@ impl App {
             crate::paths::normalize_path(path)
         };
 
+        // Seguridad: si la URL trae credenciales, se guardan en el keyring
+        // del SO (nunca en disco). La conexión usa la URL tal cual.
+        if crate::security::has_credentials(&path) {
+            if let Err(err) = crate::security::save_credentials(&path) {
+                tracing::warn!(error = ?err, "no se pudieron guardar credenciales en el keyring");
+            }
+        } else if is_remote_url(&path) {
+            // Reabrir un reciente (URL sin credenciales): recuperarlas del
+            // keyring y reconstruir la URL para conectar.
+            match crate::security::get_credentials(&path) {
+                Ok(Some((user, pass))) if !pass.is_empty() => {
+                    let scheme = if path.starts_with("mongodb://") {
+                        "mongodb"
+                    } else if path.starts_with("mysql://") {
+                        "mysql"
+                    } else {
+                        "postgres"
+                    };
+                    path = inject_credentials(&path, scheme, &user, &pass);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = ?err, "keyring: sin credenciales para {path}"),
+            }
+        }
+
         // URL mysql:// SIN base → conexión a nivel de SERVIDOR: listar los
         // esquemas (SHOW DATABASES) y dejar que el usuario elija. Las URLs
         // detectadas por `scan_local_servers` llegan sin `/bd`.
-        tracing::debug!(path = %path, "connect_sqlite: url normalizada");
+        tracing::debug!(path = %crate::security::strip_credentials(&path), "connect_sqlite: url normalizada");
         #[cfg(feature = "mysql")]
         if path.starts_with("mysql://") && !server_url_has_database(&path) {
-            tracing::debug!(path = %path, "mysql sin base → flujo de servidor");
+            tracing::debug!(path = %crate::security::strip_credentials(&path), "mysql sin base → flujo de servidor");
             self.connect_mysql_server(&path);
             return;
         }
@@ -1844,7 +2038,7 @@ impl App {
         if (path.starts_with("postgres://") || path.starts_with("postgresql://"))
             && !server_url_has_database(&path)
         {
-            tracing::debug!(path = %path, "postgres sin base → flujo de servidor");
+            tracing::debug!(path = %crate::security::strip_credentials(&path), "postgres sin base → flujo de servidor");
             self.connect_postgres_server(&path);
             return;
         }
@@ -1857,68 +2051,168 @@ impl App {
             return;
         }
         self.is_loading = true;
-        self.status = format!("Conectando a {path}...");
+        self.status = format!("Conectando a {}...", crate::security::strip_credentials(&path));
+        // Conexión ASYNC: el adapter (resolve + catálogo + preview de la
+        // tabla 1) corre en spawn_blocking; el event loop queda libre y el
+        // spinner del status bar gira de verdad (Ronda 2 de la auditoría:
+        // antes esto bloqueaba el hilo de 60fps en ~5 round-trips de red).
+        self.spawn_connection(path);
+    }
 
-        // Backend resuelto por extensión: sqlite (.db/.sqlite) o duckdb (.duckdb/.ddb)
-        let Some(adapter) = db::resolver::resolve_backend(&path) else {
-            self.is_loading = false;
-            self.show_error("No se pudo abrir la base", &format!("{path}: fuente no soportada"));
-            tracing::error!(path = %path, "fuente no soportada por el resolver");
-            return;
+    /// Lanza la conexión en background: resuelve el backend, lista el
+    /// catálogo (UNA consulta con `list_objects`) y precarga el preview de
+    /// la primera tabla. El resultado llega por `connection_rx` y se aplica
+    /// en `poll_connection_results` (mismo patrón que query.rs).
+    fn spawn_connection(&mut self, path: String) {
+        self.connection_gen += 1;
+        let Some(tx) = self.connection_tx.clone() else { return };
+        // `is_loading` se apaga cuando el resultado se aplica (o en el error
+        // inmediato del resolver); los callers que esperaban sincronía ahora
+        // ven el estado "conectando" hasta el próximo frame.
+        let rows_per_page = self.rows_per_page;
+        let tx2 = tx.clone();
+        let path2 = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(adapter) = db::resolver::resolve_backend(&path) else {
+                let _ = tx.send(query::ConnectionMsg::Err {
+                    path,
+                    error: "fuente no soportada por el resolver".to_string(),
+                });
+                return;
+            };
+            // Compartir el adapter: la conexión/pool se crea UNA vez y se
+            // reusa para todas las operaciones (evita límite de conexiones).
+            let adapter: std::sync::Arc<dyn crate::db::adapter::DbAdapter> =
+                std::sync::Arc::from(adapter);
+
+            // Catálogo completo en UNA consulta (list_objects: pg_class /
+            // sqlite_master / information_schema / list_collections).
+            let objects = match adapter.list_objects() {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = tx.send(query::ConnectionMsg::Err { path, error: e.to_string() });
+                    return;
+                }
+            };
+            let mut tables = Vec::new();
+            let mut views = Vec::new();
+            let mut advanced = Vec::new();
+            for obj in &objects {
+                match obj.tipo {
+                    crate::db::DbObjectKind::Table => tables.push(obj.nombre.clone()),
+                    crate::db::DbObjectKind::View | crate::db::DbObjectKind::MaterializedView => {
+                        views.push(obj.nombre.clone());
+                    }
+                    _ => advanced.push(obj.nombre.clone()),
+                }
+            }
+            // Preservar el orden del backend (los tests dependen de orden).
+            let is_nosql = adapter.is_nosql();
+
+            // Preview de la primera tabla EN BACKGROUND: count + primera
+            // página. Antes esto se hacía síncrono después de conectar
+            // (2 round-trips más en el hilo del event loop).
+            let first_preview = tables.first().and_then(|t| {
+                let count = adapter.table_row_count(t).ok()?;
+                let data = adapter.table_rows_sorted(t, rows_per_page, 0, None).ok()?;
+                Some((data, count))
+            });
+
+            let _ = tx.send(query::ConnectionMsg::Ok {
+                path: path2,
+                adapter,
+                tables,
+                views,
+                advanced,
+                is_nosql,
+                first_preview,
+            });
+            let _ = tx2; // tx clonado solo para el borrow checker
+        });
+    }
+
+    /// Aplica los resultados de conexión terminados (llamado cada frame en
+    /// `compute_layout`): poblado del catálogo + preview + foco a Tablas.
+    fn poll_connection_results(&mut self) {
+        let drained: Vec<query::ConnectionMsg> = {
+            let Some(rx) = self.connection_rx.as_mut() else { return };
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
         };
-        // Compartir el adapter: la conexión/pool se crea UNA vez y se reusa
-        // para todas las operaciones (evita límite de conexiones + handshakes).
-        self.active_adapter = Some(std::sync::Arc::from(adapter));
-        let adapter = self.active_adapter.as_ref().unwrap().as_ref();
-        let tables = adapter.list_objects_by_type("table");
-        let views = adapter.list_objects_by_type("view");
-        let advanced = adapter.list_advanced_objects();
+        for msg in drained {
+            match msg {
+                query::ConnectionMsg::Ok {
+                    path,
+                    adapter,
+                    tables,
+                    views,
+                    advanced,
+                    is_nosql,
+                    first_preview,
+                } => {
+                    self.is_loading = false;
+                    self.active_adapter = Some(adapter);
+                    self.db_path = Some(path.clone());
+                    self.is_nosql = is_nosql;
+                    self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
+                    self.tables = tables;
+                    self.views = views;
+                    self.advanced = advanced;
+                    self.object_section = ObjectSection::Tables;
 
-        if let (Ok(tables), Ok(views), Ok(advanced)) = (tables, views, advanced) {
-            let path_str = path.clone();
-            self.state.add_recent(path_str);
-            let _ = self.state.save();
-            self.sources = Self::build_sources(
-                &self.state,
-                self.source_tab,
-                Some(&path),
-                &self.health,
-                &self.detected_servers,
-            );
+                    // Seguridad: el reciente se guarda SIN credenciales.
+                    let path_str = crate::security::strip_credentials(&path);
+                    self.state.add_recent(path_str);
+                    let _ = self.state.save();
+                    // add_recent movió la fuente al frente → rebuild y
+                    // re-ubicar la selección en la fuente conectada.
+                    self.rebuild_sources(Some(&path));
 
-            self.db_path = Some(path.clone());
-            // ¿NoSQL? (mongo): cambia la terminología de la UI (row→doc) y
-            // habilita el toggle JSON del modal de detalles.
-            self.is_nosql = self.adapter_arc().is_some_and(|a| a.is_nosql());
-            // `db_size_bytes` solo aplica a bds de archivo (mysql:// no es path)
-            self.db_size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
-            self.tables = tables;
-            self.views = views;
-            self.advanced = advanced;
-            self.object_section = ObjectSection::Tables;
+                    // Resetear índices
+                    self.set_selected_idx(PanelKind::Tables, 0);
+                    self.set_selected_idx(PanelKind::Views, 0);
+                    self.set_selected_idx(PanelKind::Advanced, 0);
+                    self.set_selected_idx(PanelKind::Detail, 0);
+                    self.current_page = 0;
+                    self.preview_loaded_offset = 0;
+                    self.detail_tab = DetailTab::Data;
 
-            // Resetear índices
-            self.set_selected_idx(PanelKind::Tables, 0);
-            self.set_selected_idx(PanelKind::Views, 0);
-            self.set_selected_idx(PanelKind::Advanced, 0);
-            self.set_selected_idx(PanelKind::Detail, 0);
-            self.current_page = 0;
-            self.preview_loaded_offset = 0;
-            self.detail_tab = DetailTab::Data;
+                    // Preview ya cargado en background (count + primera
+                    // página): aplicarlo directo, sin re-consultar.
+                    if let Some((data, total)) = first_preview {
+                        self.preview_data = Some(data.clone());
+                        self.preview_rows = data.to_lines();
+                        self.total_rows = total;
+                        self.set_selected_idx(PanelKind::Detail, 1);
+                    } else {
+                        self.preview_data = None;
+                        self.preview_rows = vec!["<sin tablas>".to_string()];
+                        self.total_rows = 0;
+                        self.set_selected_idx(PanelKind::Detail, 0);
+                    }
 
-            self.refresh_preview_from_selected_object();
-            self.status = format!("Conectado en modo read-only: {path}");
-            tracing::info!(path = %path, tablas = self.tables.len(), vistas = self.views.len(), "conectado");
+                    self.status = format!(
+                        "Conectado en modo read-only: {}",
+                        crate::security::strip_credentials(&path)
+                    );
+                    tracing::info!(
+                        path = %crate::security::strip_credentials(&path),
+                        tablas = self.tables.len(),
+                        vistas = self.views.len(),
+                        "conectado (async)"
+                    );
 
-            // Mover foco a Tablas
-            self.set_focus(PanelKind::Tables);
-        } else {
-            self.is_loading = false;
-            self.show_error(
-                "No se pudo abrir la base",
-                &format!("{path}: no se pudo leer el catálogo"),
-            );
-            tracing::error!(path = %path, "no se pudo abrir: catálogo ilegible");
+                    // Mover foco a Tablas
+                    self.set_focus(PanelKind::Tables);
+                }
+                query::ConnectionMsg::Err { path, error } => {
+                    self.is_loading = false;
+                    self.show_error("No se pudo abrir la base", &error);
+                    tracing::error!(
+                        path = %crate::security::strip_credentials(&path),
+                        "conexión fallida: {error}"
+                    );
+                }
+            }
         }
     }
 
@@ -2131,7 +2425,7 @@ impl App {
             DetailTab::Meta => {
                 self.preview_data = None;
                 self.preview_rows = vec![
-                    format!("db_path: {}", self.db_path_display()),
+                    format!("db_path: {}", self.db_path_safe()),
                     format!("db_size: {}", self.db_size_display()),
                     format!("source_tab: {}", self.source_tab.label()),
                     format!("object_section: {}", self.object_section.label()),
@@ -2196,6 +2490,15 @@ impl App {
                 return;
             }
             self.preview_rows.extend(data.rows.iter().map(|row| row.to_line(" | ")));
+            // Sincronizar las celdas tipadas del render 2D: el viewport usa
+            // `preview_data.rows.len()` como tope (`rows_hint`) — sin esto el
+            // scroll se congela en la primera página mientras el label de
+            // `row X/Y` sigue avanzando (bug "la vista no baja").
+            if let Some(existing) = self.preview_data.take() {
+                let mut rows = existing.rows;
+                rows.extend(data.rows);
+                self.preview_data = Some(crate::db::TableData { columns: existing.columns, rows });
+            }
         }
         self.is_loading = false;
     }
@@ -2264,6 +2567,16 @@ impl App {
             // (las filas nuevas se anteponen; la vista no salta).
             let cur = self.selected_idx(PanelKind::Detail);
             self.set_selected_idx(PanelKind::Detail, cur.saturating_add(n));
+
+            // El viewport (`scroll_offset`) también se desplaza +n: las filas
+            // nuevas entraron ARRIBA del buffer y la vista debe seguir
+            // mostrando las mismas filas globales de antes. Sin esto, el
+            // render ve la selección "lejos" del scroll viejo y salta la
+            // vista hacia abajo ("cambio de página" fantasma con la rueda:
+            // baja N filas de golpe y la fila enfocada queda abajo).
+            let p = self.panel_mut(PanelKind::Detail);
+            let so = p.scroll_offset.get();
+            p.scroll_offset.set(so.saturating_add(n));
         }
         self.is_loading = false;
     }
@@ -2308,6 +2621,7 @@ impl App {
         // Generación nueva: cualquier resultado en vuelo de queries anteriores
         // queda marcado como stale y se descarta al llegar.
         self.query_gen += 1;
+        self.query_target_object = Some(object);
         let generation = self.query_gen;
         let Some(tx) = self.query_tx.clone() else { return };
 
@@ -2316,10 +2630,10 @@ impl App {
 
         // Provider: reusar la conexión activa (evita re-handshake en remoto)
         let adapter = self.adapter_arc();
-        tokio::spawn(async move {
+        self.query_handle = Some(tokio::spawn(async move {
             let res = query::count_query_results(adapter, &path, &sql).await;
             let _ = tx.send(query::QueryMsg::Count(generation, sql, res));
-        });
+        }));
     }
 
     /// Aplica un resultado de count en el estado. Devuelve `None` si era
@@ -2348,6 +2662,20 @@ impl App {
         Some((state, status))
     }
 
+    /// ¿El resultado de la query en vuelo ya no aplica? Devuelve `true` si
+    /// el usuario navegó a OTRO objeto mientras la query corría (aunque la
+    /// generación coincida, el COUNT de la tabla A no debe pisar el status
+    /// de la B). Al detectarlo, se olvida el target (una sola notificación).
+    fn query_es_stale_por_navegacion(&mut self) -> bool {
+        let objeto_actual = self.selected_object_name();
+        let cambio =
+            self.query_target_object.as_deref().is_some_and(|target| target != objeto_actual);
+        if cambio {
+            self.query_target_object = None;
+        }
+        cambio
+    }
+
     fn poll_query_results(&mut self) {
         // Drenar el canal en un scope corto: los borrows del loop no pueden
         // convivir con las mutaciones de self que hace el procesamiento.
@@ -2356,6 +2684,9 @@ impl App {
             std::iter::from_fn(|| rx.try_recv().ok()).collect()
         };
         for msg in drained {
+            if self.query_es_stale_por_navegacion() {
+                continue; // el usuario navegó a otro objeto: descartar
+            }
             match msg {
                 query::QueryMsg::Count(generation, sql, res) => {
                     let Some((state, status)) =
@@ -2403,9 +2734,20 @@ impl App {
         }
     }
 
+    /// Aborta la query/count en vuelo (si hay). La tarea tokio se corta en
+    /// el próximo `.await` y la conexión del pool se libera de inmediato —
+    /// antes, la "cancelación" por generación dejaba correr la query entera
+    /// sujetando la conexión (pool de 5 agotado por tareas huérfanas).
+    fn abort_query_in_flight(&mut self) {
+        if let Some(handle) = self.query_handle.take() {
+            handle.abort();
+        }
+    }
+
     fn clear_query_state(&mut self) {
         // Invalidar cualquier count en vuelo antes de limpiar
         self.query_gen += 1;
+        self.abort_query_in_flight();
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
         self.status = "Query limpia".to_string();
@@ -2566,25 +2908,24 @@ impl App {
         let rebuild = self.connection_form.as_ref().is_some_and(|form| {
             matches!(
                 form.active,
-                ConnField::Host | ConnField::Port | ConnField::User | ConnField::Pass
+                ConnField::Host
+                    | ConnField::Port
+                    | ConnField::User
+                    | ConnField::Pass
                     | ConnField::Db
             )
         });
         if rebuild {
             self.conn_rebuild_url_from_fields();
         }
-        let url = self
-            .connection_form
-            .as_ref()
-            .map(|f| f.url.clone())
-            .unwrap_or_default();
+        let url = self.connection_form.as_ref().map(|f| f.url.clone()).unwrap_or_default();
         // Purga final antes de conectar (defensa en profundidad contra \n)
         let url = url.trim().replace(['\n', '\r'], "");
         if url.trim().is_empty() {
             self.status = "Escribe una URL o ruta para conectar".to_string();
             return;
         }
-        tracing::debug!(url = %url, rebuild, "conn_submit: url a conectar");
+        tracing::debug!(url = %crate::security::strip_credentials(&url), rebuild, "conn_submit: url a conectar");
         // Conexión real (sync por ahora; el spinner se limpia después)
         self.connection_form.as_mut().unwrap().connecting = true;
         self.connect_sqlite(&url);
@@ -2596,7 +2937,8 @@ impl App {
             form.url_debounce_scheduled = false;
         }
         if self.db_path.is_none() {
-            self.status = format!("No se pudo conectar a {url}");
+            self.status =
+                format!("No se pudo conectar a {}", crate::security::strip_credentials(&url));
         }
     }
 
@@ -2611,7 +2953,8 @@ impl App {
                 // REGLA DE ORO: el formulario nunca se cierra sin db. Esc solo
                 // mueve el foco a Fuentes (la conexión queda pendiente).
                 self.active_panel = PanelKind::Sources;
-                self.status = "Conexión pendiente: el formulario queda en el panel Detalle".to_string();
+                self.status =
+                    "Conexión pendiente: el formulario queda en el panel Detalle".to_string();
             }
             // Ctrl+U: limpiar el campo activo (estándar readline)
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2899,16 +3242,11 @@ impl App {
 
         self.state.add_query_history(&sql);
         let _ = self.state.save();
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            Some(&path),
-            &self.health,
-            &self.detected_servers,
-        );
+        self.rebuild_sources(None);
 
         tracing::debug!(sql = %sql, "query libre lanzada (generación {})", self.query_gen + 1);
         self.query_gen += 1;
+        self.query_target_object = Some(self.selected_object_name());
         let generation = self.query_gen;
         let Some(tx) = self.query_tx.clone() else { return };
 
@@ -2918,10 +3256,10 @@ impl App {
 
         // Provider: reusar la conexión activa (evita re-handshake en remoto)
         let adapter = self.adapter_arc();
-        tokio::spawn(async move {
+        self.query_handle = Some(tokio::spawn(async move {
             let res = query::execute_query(adapter, &path, &sql, query::QUERY_RESULT_LIMIT).await;
             let _ = tx.send(query::QueryMsg::Free(generation, sql, res));
-        });
+        }));
     }
 
     /// Aplica el resultado de una query libre. Pura para testear sin App.
@@ -2953,13 +3291,7 @@ impl App {
 
         self.state.add_favorite(favorite_name.clone(), path.to_string());
         let _ = self.state.save();
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-        );
+        self.rebuild_sources(None);
         self.status = format!("Favorito guardado: {favorite_name}");
     }
 
@@ -2992,13 +3324,7 @@ impl App {
         }
 
         let _ = self.state.save();
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-        );
+        self.rebuild_sources(None);
     }
 
     /// `d` en el panel Fuentes: olvida la fuente bajo el cursor (la quita de
@@ -3032,13 +3358,7 @@ impl App {
         if self.db_path.as_deref() == Some(canonical.as_str()) {
             self.disconnect_db();
         } else {
-            self.sources = Self::build_sources(
-                &self.state,
-                self.source_tab,
-                self.db_path.as_deref(),
-                &self.health,
-                &self.detected_servers,
-            );
+            self.rebuild_sources(None);
             self.status = format!("Fuente olvidada: {path}");
         }
     }
@@ -3064,8 +3384,10 @@ impl App {
         self.preview_loaded_offset = 0;
         self.current_page = 0;
         self.detail_tab = DetailTab::Data;
-        // Invalidar cualquier query en vuelo: su resultado ya no aplica
+        // Invalidar cualquier query en vuelo: su resultado ya no aplica y la
+        // conexión del pool se libera YA (abort real, no solo generación)
         self.query_gen += 1;
+        self.abort_query_in_flight();
         self.query_state = query::QueryState::Idle;
         self.query_results.clear();
         self.sources = Self::build_sources(
@@ -3074,6 +3396,7 @@ impl App {
             None,
             &self.health,
             &self.detected_servers,
+            &self.cwd_databases,
         );
         self.set_focus(PanelKind::Sources);
         self.set_selected_idx(PanelKind::Sources, 0);
@@ -3382,13 +3705,7 @@ impl App {
     fn reload_runtime_config(&mut self) {
         self.keymap = keys::Keymap::load();
         self.state = storage::AppState::load();
-        self.sources = Self::build_sources(
-            &self.state,
-            self.source_tab,
-            self.db_path.as_deref(),
-            &self.health,
-            &self.detected_servers,
-        );
+        self.rebuild_sources(None);
 
         let ui_config = config::Config::load().ui;
         self.rows_per_page = ui_config.rows_per_page;
@@ -3499,13 +3816,11 @@ impl App {
             if let Some(adapter) = self.adapter_arc() {
                 if let Ok(tables) = adapter.list_objects_by_type("table") {
                     self.tables = tables;
-                    self.sources = Self::build_sources(
-                        &self.state,
-                        self.source_tab,
-                        self.db_path.as_deref(),
-                        &self.health,
-                        &self.detected_servers,
-                    );
+                    // NOTA: aquí NO se reconstruyen las fuentes (bases de
+                    // datos) — lo que cambió es el catálogo de tablas de la
+                    // conexión activa. Antes había un `rebuild_sources(None)`
+                    // fantasma (acoplamiento por copy-paste) que no tenía
+                    // efecto útil: rebuild_sources no lee `self.tables`.
                 }
             }
         }
@@ -3592,7 +3907,8 @@ impl App {
                 self.connect_sqlite(s);
             }
             _ => {
-                self.status = format!("No se puede conectar: {clean}");
+                self.status =
+                    format!("No se puede conectar: {}", crate::security::strip_credentials(&clean));
             }
         }
     }
@@ -3664,7 +3980,10 @@ impl App {
             if let Some(form) = self.connection_form.as_ref() {
                 if matches!(
                     form.active,
-                    ConnField::Host | ConnField::Port | ConnField::User | ConnField::Pass
+                    ConnField::Host
+                        | ConnField::Port
+                        | ConnField::User
+                        | ConnField::Pass
                         | ConnField::Db
                 ) {
                     self.conn_rebuild_url_from_fields();
@@ -4693,7 +5012,8 @@ mod tests {
     fn build_sources_online_agrupa_favoritos_y_recents() {
         let mut state = state_de_prueba();
         state.favorites.insert("remote".to_string(), "https://remote.example/db".to_string());
-        let sources = App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[]);
+        let sources =
+            App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[], &[]);
 
         // Sin sección FAVORITOS: la ★ identifica al favorito, va el primero
         assert!(
@@ -4716,7 +5036,7 @@ mod tests {
     fn build_sources_pon_los_favoritos_de_primeras() {
         // En el tab All: favoritos al inicio (sin sección), luego RECIENTES
         let state = state_de_prueba(); // favorito "one => /a/one.db", recientes /a/one.db + https
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
 
         assert!(sources.first().is_some_and(|s| s.starts_with("★ one => /a/one.db")));
         let recents_idx = sources
@@ -4732,8 +5052,14 @@ mod tests {
     #[test]
     fn build_sources_marca_la_conectada() {
         let state = state_de_prueba();
-        let sources =
-            App::build_sources(&state, SourceTab::All, Some("/a/one.db"), &HashMap::new(), &[]);
+        let sources = App::build_sources(
+            &state,
+            SourceTab::All,
+            Some("/a/one.db"),
+            &HashMap::new(),
+            &[],
+            &[],
+        );
         assert!(sources.iter().any(|s| s.starts_with("● ★ one => /a/one.db")));
     }
 
@@ -4746,7 +5072,7 @@ mod tests {
         // colapsar en UNA sola entrada: el `seen` compara rutas canónicas.
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string(), "https://remote.example/db".to_string()];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
 
         let matches = sources
             .iter()
@@ -4766,7 +5092,7 @@ mod tests {
         state.recents = vec!["one.db".to_string()];
         let connected = crate::paths::normalize_path("one.db");
         let sources =
-            App::build_sources(&state, SourceTab::All, Some(&connected), &HashMap::new(), &[]);
+            App::build_sources(&state, SourceTab::All, Some(&connected), &HashMap::new(), &[], &[]);
         assert!(
             sources.iter().any(|s| s.starts_with(&format!("● ▣ {connected}"))),
             "la entrada absoluta debe llevar ●: {sources:?}"
@@ -4778,7 +5104,7 @@ mod tests {
         // El reciente relativo "one.db" debe mostrarse en su forma canónica.
         let mut state = storage::AppState::new();
         state.recents = vec!["one.db".to_string()];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
         let shown = sources.iter().find_map(|s| {
             let p = source_path_of(s);
             (!is_source_section(s) && p != "Abrir sakila.db" && p != "Buscar archivo .db")
@@ -4840,6 +5166,7 @@ mod tests {
             None,
             &HashMap::new(),
             &["mongodb://127.0.0.1:27017".to_string()],
+            &[],
         );
         let entry = sources
             .iter()
@@ -4849,10 +5176,7 @@ mod tests {
             entry.contains("mongodb://127.0.0.1:27017"),
             "la URL debe quedar intacta (no un path normalizado): {entry}"
         );
-        assert!(
-            !entry.contains("lazydb/mongodb"),
-            "no debe mezclarse con el cwd: {entry}"
-        );
+        assert!(!entry.contains("lazydb/mongodb"), "no debe mezclarse con el cwd: {entry}");
     }
 
     #[test]
@@ -4863,7 +5187,7 @@ mod tests {
             "one.db".to_string(),
             "https://remote.example/db".to_string(),
         ];
-        let local = App::build_sources(&state, SourceTab::Local, None, &HashMap::new(), &[]);
+        let local = App::build_sources(&state, SourceTab::Local, None, &HashMap::new(), &[], &[]);
         assert!(
             local.iter().any(|s| s.starts_with("M mysql://127.0.0.1:3306/lazy")),
             "mysql de localhost debe estar en el tab Local: {local:?}"
@@ -4874,7 +5198,7 @@ mod tests {
             "lo online NO debe filtrarse al tab Local"
         );
 
-        let online = App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[]);
+        let online = App::build_sources(&state, SourceTab::Online, None, &HashMap::new(), &[], &[]);
         assert!(
             online.iter().any(|s| s.starts_with("⊙ https://remote.example/db")),
             "lo online debe estar en el tab Online: {online:?}"
@@ -4898,7 +5222,10 @@ mod tests {
         // Sin puerto → default del esquema
         assert_eq!(source_host_port("mysql://localhost/lazy"), Some(("localhost".into(), 3306)));
         assert_eq!(source_host_port("mongodb://localhost/mydb"), Some(("localhost".into(), 27017)));
-        assert_eq!(source_host_port("mongodb://127.0.0.1:27017"), Some(("127.0.0.1".into(), 27017)));
+        assert_eq!(
+            source_host_port("mongodb://127.0.0.1:27017"),
+            Some(("127.0.0.1".into(), 27017))
+        );
         assert_eq!(
             source_host_port("https://api.example.com/x"),
             Some(("api.example.com".into(), 443))
@@ -4953,7 +5280,7 @@ mod tests {
         let canonical_caida = crate::paths::normalize_path("caida.db");
 
         // Sin caché → sin marcas de salud en absoluto (nada de ✓ por defecto)
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
         assert!(
             sources.iter().any(|s| s.contains(&canonical_ok) && !s.starts_with("✗ ")),
             "la fuente sana no debe llevar marca: {sources:?}"
@@ -4961,14 +5288,14 @@ mod tests {
 
         let mut health = HashMap::new();
         health.insert(canonical_caida.clone(), false);
-        let sources = App::build_sources(&state, SourceTab::All, None, &health, &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &health, &[], &[]);
         assert!(
             sources.iter().any(|s| s.starts_with(&format!("✗ ▣ {canonical_caida}"))),
             "fuente caída debe llevar ✗: {sources:?}"
         );
         // Conectada y caída combina ● + ✗
         let sources_connected =
-            App::build_sources(&state, SourceTab::All, Some(&canonical_caida), &health, &[]);
+            App::build_sources(&state, SourceTab::All, Some(&canonical_caida), &health, &[], &[]);
         assert!(
             sources_connected.iter().any(|s| s.starts_with(&format!("● ✗ ▣ {canonical_caida}"))),
             "conectada + caída = '● ✗': {sources_connected:?}"
@@ -5031,7 +5358,7 @@ mod tests {
             "mysql://localhost/lazy".to_string(),
             "postgres://db.azure.com/prod".to_string(),
         ];
-        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[]);
+        let sources = App::build_sources(&state, SourceTab::All, None, &HashMap::new(), &[], &[]);
         assert!(sources.iter().any(|s| s.starts_with("D ")), "DuckDB debe marcarse D");
         assert!(sources.iter().any(|s| s.starts_with("M ")), "MySQL debe marcarse M");
         assert!(sources.iter().any(|s| s.starts_with("P ")), "Postgres debe marcarse P");
@@ -5281,14 +5608,23 @@ mod tests {
         assert!(app.state.query_history.is_empty(), "buffer vacío no registra historial");
     }
 
-    #[test]
-    fn enter_con_sql_sin_db_muestra_error_sin_panico() {
+    #[tokio::test]
+    async fn enter_con_sql_sin_db_muestra_error_sin_panico() {
         let mut app = app_con_query_input(&[]);
         for c in "SELECT 1".chars() {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.query_input.is_none(), "Enter cierra el popup");
+        // Conexión async: el error del resolver llega por canal → poll.
+        // El spawn_blocking corre en paralelo; esperamos a que termine.
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            app.poll_connection_results();
+            if app.error.is_some() {
+                break;
+            }
+        }
         assert!(app.error.is_some(), "sin db_path → error global (no paniquea)");
         assert!(app.state.query_history.is_empty(), "historial solo se guarda al ejecutar con DB");
     }
@@ -5405,11 +5741,7 @@ mod tests {
         let Some(picker) = &app.db_picker else {
             panic!("debe abrirse el picker (status: {})", app.status);
         };
-        assert!(
-            picker.dbs.iter().any(|d| d == "lazydb_probe"),
-            "bases: {:?}",
-            picker.dbs
-        );
+        assert!(picker.dbs.iter().any(|d| d == "lazydb_probe"), "bases: {:?}", picker.dbs);
         // Elegir la base por índice → connect_sqlite conecta el catálogo
         let idx = picker.dbs.iter().position(|d| d == "lazydb_probe").unwrap();
         let picker = app.db_picker.take().unwrap();
@@ -5418,11 +5750,7 @@ mod tests {
         url.push('/');
         url.push_str(&db);
         app.connect_sqlite(&url);
-        assert!(
-            app.tables.iter().any(|c| c == "test_probe"),
-            "colecciones: {:?}",
-            app.tables
-        );
+        assert!(app.tables.iter().any(|c| c == "test_probe"), "colecciones: {:?}", app.tables);
     }
 
     /// Enter en el campo URL con URL válida → parsea Y conecta (no solo
@@ -5454,11 +5782,7 @@ mod tests {
             app.active_adapter.is_some(),
             "el adapter debe compartirse en active_adapter tras conectar"
         );
-        assert!(
-            app.tables.iter().any(|c| c == "test_probe"),
-            "colecciones: {:?}",
-            app.tables
-        );
+        assert!(app.tables.iter().any(|c| c == "test_probe"), "colecciones: {:?}", app.tables);
     }
 
     #[test]
@@ -5480,10 +5804,7 @@ mod tests {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            app.connection_form.is_some(),
-            "Esc no debe cerrar el formulario sin db abierta"
-        );
+        assert!(app.connection_form.is_some(), "Esc no debe cerrar el formulario sin db abierta");
         assert_eq!(app.active_panel, PanelKind::Sources, "Esc mueve el foco a Fuentes");
 
         // Navegar a otros paneles no elimina el formulario tampoco
@@ -5561,15 +5882,13 @@ mod tests {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail; // el formulario captura con foco en Detail
         app.connection_form = Some(ConnectionFormState::default());
-        app.connection_form.as_mut().unwrap().url = "mysql://user:pass@localhost:3306/lazy".to_string();
+        app.connection_form.as_mut().unwrap().url =
+            "mysql://user:pass@localhost:3306/lazy".to_string();
         app.connection_form.as_mut().unwrap().host = "localhost".to_string();
         app.connection_form.as_mut().unwrap().active = ConnField::Url;
 
         // Ctrl+U limpia el campo URL activo
-        app.on_key(KeyEvent::new(
-            KeyCode::Char('u'),
-            KeyModifiers::CONTROL,
-        ));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(app.connection_form.as_ref().unwrap().url, "");
         assert_eq!(
             app.connection_form.as_ref().unwrap().host,
@@ -5579,10 +5898,7 @@ mod tests {
 
         // Ctrl+L limpia todo el formulario
         app.connection_form.as_mut().unwrap().host = "localhost".to_string();
-        app.on_key(KeyEvent::new(
-            KeyCode::Char('l'),
-            KeyModifiers::CONTROL,
-        ));
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         let form = app.connection_form.as_ref().unwrap();
         assert!(form.host.is_empty(), "Ctrl+L limpia todo");
         assert!(form.url.is_empty());
@@ -5627,9 +5943,9 @@ mod tests {
     /// y credenciales) y dar Enter NO debe abrir el prompt de contraseña —
     /// la URL ya trae `user:pass` y `/db`. Sin red, el resolver falla con
     /// error de conexión, pero NUNCA debe activar `password_prompt`.
-    #[test]
     #[cfg(feature = "postgres")]
-    fn uri_clevercloud_con_base_no_abre_prompt_de_contrasena() {
+    #[tokio::test]
+    async fn uri_clevercloud_con_base_no_abre_prompt_de_contrasena() {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
         app.connection_form = Some(ConnectionFormState::default());
@@ -5651,8 +5967,8 @@ mod tests {
     /// Regresión: una URL pegada PARTIDA por un `\n` (`CleverCloud` la parte en
     /// dos líneas) debe purgarse antes de analizar/conectar: sin saltos de
     /// línea y con la base registrada. Nunca debe ir al flujo de servidor.
-    #[test]
-    fn on_paste_sanitiza_nueva_linea_y_conn_parse_purga_la_url() {
+    #[tokio::test]
+    async fn on_paste_sanitiza_nueva_linea_y_conn_parse_purga_la_url() {
         let mut app = App::new();
         app.active_panel = PanelKind::Detail;
         app.connection_form = Some(ConnectionFormState::default());
@@ -5664,10 +5980,7 @@ mod tests {
         );
         app.on_paste(pegada);
         let url_limpia = app.connection_form.as_ref().unwrap().url.clone();
-        assert!(
-            !url_limpia.contains('\n'),
-            "el paste debe quitar el \\n: {url_limpia:?}"
-        );
+        assert!(!url_limpia.contains('\n'), "el paste debe quitar el \\n: {url_limpia:?}");
         assert!(
             url_limpia.ends_with("bh4bhaewrpd8qqcreso5"),
             "la base debe quedar al final: {url_limpia:?}"
@@ -5680,5 +5993,289 @@ mod tests {
             "URL purgada no debe pedir contraseña (status: {})",
             app.status
         );
+    }
+
+    // ── scroll infinito del Data tab (regresión) ──────────────────────
+
+    /// Adapter fake: simula una tabla con `total` filas. Cada página
+    /// (`table_rows_sorted`) devuelve `limit` filas a partir de `offset`,
+    /// con celdas `v{idx}` — suficiente para ejercitar el scroll infinito
+    /// sin tocar una BD real.
+    struct FakeScrollAdapter {
+        total: u32,
+    }
+
+    impl crate::db::adapter::DbAdapter for FakeScrollAdapter {
+        fn list_objects_by_type(&self, _object_type: &str) -> Result<Vec<String>, db::DbError> {
+            Ok(vec![])
+        }
+        fn list_objects(&self) -> Result<Vec<db::DbObjectHeader>, db::DbError> {
+            Ok(vec![])
+        }
+        fn list_advanced_objects(&self) -> Result<Vec<String>, db::DbError> {
+            Ok(vec![])
+        }
+        fn object_sql(&self, _object_name: &str) -> Result<String, db::DbError> {
+            Ok(String::new())
+        }
+        fn table_columns(&self, _table_name: &str) -> Result<Vec<db::ColumnInfo>, db::DbError> {
+            Ok(vec![])
+        }
+        fn table_row_count(&self, _table_name: &str) -> Result<u32, db::DbError> {
+            Ok(self.total)
+        }
+        fn column_names(&self, _table_name: &str) -> Result<Vec<db::Column>, db::DbError> {
+            Ok(vec![])
+        }
+        fn table_data_rows(
+            &self,
+            _table_name: &str,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<Vec<db::Row>, db::DbError> {
+            Ok(vec![])
+        }
+        fn table_rows_sorted(
+            &self,
+            _table_name: &str,
+            limit: u32,
+            offset: u32,
+            _order_col: Option<(&str, bool)>,
+        ) -> Result<db::TableData, db::DbError> {
+            let columns = vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }];
+            let rows: Vec<db::Row> = (offset..offset.saturating_add(limit))
+                .filter(|i| *i < self.total)
+                .map(|i| db::Row { cells: vec![format!("v{i}")] })
+                .collect();
+            Ok(db::TableData { columns, rows })
+        }
+        fn foreign_keys(&self, _table_name: &str) -> Result<Vec<db::ForeignKey>, db::DbError> {
+            Ok(vec![])
+        }
+        fn row_offset_of(
+            &self,
+            _table_name: &str,
+            _col: &str,
+            _value: &str,
+        ) -> Result<Option<u32>, db::DbError> {
+            Ok(None)
+        }
+        fn query(&self, _sql: &str, _limit: u32) -> Result<Vec<String>, db::DbError> {
+            Ok(vec![])
+        }
+        fn count(&self, _sql: &str) -> Result<u32, db::DbError> {
+            Ok(self.total)
+        }
+    }
+
+    fn app_con_scroll_fake(total: u32, page: u32) -> App {
+        let mut app = App::new();
+        app.active_adapter = Some(std::sync::Arc::new(FakeScrollAdapter { total }));
+        app.active_panel = PanelKind::Detail;
+        app.detail_tab = DetailTab::Data;
+        app.tables = vec!["t".to_string()];
+        app.object_section = ObjectSection::Tables;
+        app.set_selected_idx(PanelKind::Tables, 0);
+        app.rows_per_page = page;
+        app.total_rows = total;
+        app
+    }
+
+    /// Llena `preview_rows` (header + `n` filas) y `preview_data` (tipado)
+    /// con `n` filas — el estado exacto tras cargar una página.
+    fn cargar_pagina(app: &mut App, n: u32) {
+        let rows: Vec<db::Row> = (0..n).map(|i| db::Row { cells: vec![format!("v{i}")] }).collect();
+        app.preview_data = Some(db::TableData {
+            columns: vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }],
+            rows: rows.clone(),
+        });
+        let mut lines = vec!["id".to_string()];
+        lines.extend(rows.iter().map(|r| r.to_line(" | ")));
+        app.preview_rows = lines;
+    }
+
+    /// REGRESIÓN: el scroll hacia abajo se congelaba porque
+    /// `scroll_down_infinite` extendía `preview_rows` (strings) pero NO
+    /// `preview_data` (celdas tipadas). El render usa `data.rows.len()`
+    /// como tope del viewport → la vista se quedaba en la primera página
+    /// mientras el label `row X/Y` seguía subiendo.
+    #[tokio::test]
+    async fn scroll_down_infinite_mantiene_preview_data_sincronizado() {
+        let mut app = app_con_scroll_fake(250, 25);
+        cargar_pagina(&mut app, 25); // página 1 cargada (25 filas)
+
+        app.scroll_down_infinite(); // carga la página 2
+
+        let data_len = app.preview_data.as_ref().expect("preview_data").rows.len();
+        assert_eq!(data_len, 50, "preview_data debe crecer con cada página");
+        assert_eq!(
+            app.preview_rows.len(),
+            data_len + 1,
+            "preview_rows (con header) debe seguir a preview_data"
+        );
+    }
+
+    /// REGRESIÓN: al hacer scroll hacia arriba en el borde, el prepend de N
+    /// filas saltaba la vista hacia abajo ("cambio de página" con la rueda):
+    /// la selección se desplazaba +N pero `scroll_offset` (viewport) no, y
+    /// el render "corregía" saltando la página. Ahora el viewport se
+    /// desplaza junto con la selección y la vista queda estable.
+    #[tokio::test]
+    async fn scroll_up_infinite_desplaza_viewport_con_la_seleccion() {
+        let mut app = app_con_scroll_fake(250, 25);
+        // Simula haber bajado 4 páginas: buffer con 25 filas, offset global 100
+        let rows: Vec<db::Row> =
+            (0..25).map(|i| db::Row { cells: vec![format!("v{}", i + 100)] }).collect();
+        app.preview_data = Some(db::TableData {
+            columns: vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }],
+            rows: rows.clone(),
+        });
+        let mut lines = vec!["id".to_string()];
+        lines.extend(rows.iter().map(|r| r.to_line(" | ")));
+        app.preview_rows = lines;
+        app.preview_loaded_offset = 100;
+        // El usuario está en la PRIMERA fila del buffer (borde superior)
+        app.set_selected_idx(PanelKind::Detail, 1);
+        app.panel_mut(PanelKind::Detail).scroll_offset.set(0);
+
+        app.scroll_up_infinite(); // prepend de la página anterior (25 filas)
+
+        // El viewport debe desplazarse +25 igual que la selección
+        assert_eq!(app.panel(PanelKind::Detail).scroll_offset.get(), 25);
+        assert_eq!(app.selected_idx(PanelKind::Detail), 26, "selección +25");
+        assert_eq!(app.preview_loaded_offset, 75, "offset global retrocede 25");
+        // Invariante de fila global: misma fila visible que antes del prepend
+        // (100 global antes == 75 + (26 - 1) después)
+        let fila_global =
+            app.preview_loaded_offset as usize + app.selected_idx(PanelKind::Detail) - 1;
+        assert_eq!(fila_global, 100);
+    }
+
+    // ── panel Fuentes: rebuild y selección (regresión) ────────────────
+
+    /// REGRESIÓN: `add_recent` mueve la fuente conectada al FRENTE de la
+    /// lista. Antes, `connect_sqlite` reconstruía `sources` sin re-ubicar la
+    /// selección → el cursor quedaba en el índice viejo (OTRA fuente): "se
+    /// abre una db pero otra queda seleccionada". Ahora `rebuild_sources`
+    /// re-ubica la selección por PATH.
+    #[test]
+    fn rebuild_sources_sigue_a_la_fuente_conectada() {
+        let mut state = storage::AppState::new();
+        // 3 recientes: la que se conecta es la 3ª (índice 2, bajo el cursor)
+        state.recents =
+            vec!["/a/one.db".to_string(), "/b/two.db".to_string(), "/c/three.db".to_string()];
+
+        let mut app = App::new();
+        app.state = state;
+        app.source_tab = SourceTab::All;
+        app.detected_servers = Vec::new();
+        app.cwd_databases = Vec::new();
+        // El usuario posiciona el cursor sobre la 3ª fuente
+        app.sources = App::build_sources(
+            &app.state,
+            SourceTab::All,
+            None,
+            &app.health,
+            &app.detected_servers,
+            &app.cwd_databases,
+        );
+        let idx_three = app
+            .sources
+            .iter()
+            .position(|s| s.contains("/c/three.db"))
+            .expect("three.db debe estar en la lista");
+        app.set_selected_idx(PanelKind::Sources, idx_three);
+
+        // Simula connect_sqlite: add_recent + rebuild con la fuente conectada
+        app.state.add_recent("/c/three.db".to_string());
+        app.rebuild_sources(Some("/c/three.db"));
+
+        // La selección debe seguir a three.db (ahora en el frente), NO
+        // quedarse en el índice viejo apuntando a otra fuente.
+        let new_idx = app.selected_idx(PanelKind::Sources);
+        let selected = &app.sources[new_idx];
+        assert!(
+            selected.contains("/c/three.db"),
+            "la selección debe apuntar a la fuente conectada, quedó en: {selected}"
+        );
+        // Y debe ser la PRIMERA fuente de la lista (add_recent la movió al
+        // frente de RECIENTES; el índice 0 es el header de la sección).
+        assert_eq!(new_idx, 1, "three.db recién conectada debe quedar al frente");
+    }
+
+    /// REGRESIÓN (perf): `build_sources` ya no re-escanea el cwd en cada
+    /// llamada — usa la lista cacheada que se construyó UNA vez en `new`.
+    /// Este test asegura que un rebuild tras un probe no cambia la selección
+    /// del usuario.
+    #[test]
+    fn rebuild_sources_preserva_seleccion_cuando_el_path_sigue() {
+        let mut state = storage::AppState::new();
+        state.recents =
+            vec!["/a/one.db".to_string(), "/b/two.db".to_string(), "/c/three.db".to_string()];
+
+        let mut app = App::new();
+        app.state = state;
+        app.source_tab = SourceTab::All;
+        app.detected_servers = Vec::new();
+        app.cwd_databases = Vec::new();
+        app.sources = App::build_sources(
+            &app.state,
+            SourceTab::All,
+            None,
+            &app.health,
+            &app.detected_servers,
+            &app.cwd_databases,
+        );
+        // Seleccionar la 2ª fuente
+        let idx_two = app
+            .sources
+            .iter()
+            .position(|s| s.contains("/b/two.db"))
+            .expect("two.db debe estar en la lista");
+        app.set_selected_idx(PanelKind::Sources, idx_two);
+
+        // Un probe resuelto (cambio de marca ✗/✓) dispara rebuild
+        app.rebuild_sources(None);
+
+        let new_idx = app.selected_idx(PanelKind::Sources);
+        let selected = &app.sources[new_idx];
+        assert!(
+            selected.contains("/b/two.db"),
+            "el rebuild no debe saltar la selección: {selected}"
+        );
+    }
+
+    /// REGRESIÓN (C3): el COUNT(*) de la tabla A no debe pisar el status si
+    /// el usuario navegó a la tabla B mientras la query corría. Antes solo
+    /// importaba la generación; ahora también el objeto destino.
+    #[test]
+    fn query_stale_por_navegacion_se_descarta() {
+        let mut app = app_con_scroll_fake(100, 25);
+        app.tables = vec!["t".to_string(), "otra".to_string()];
+        app.set_selected_idx(PanelKind::Tables, 0); // tabla "t" seleccionada
+
+        // Lanzar COUNT sobre la tabla actual
+        app.query_target_object = Some("t".to_string());
+
+        // Navegar a otra tabla ANTES de que llegue el resultado
+        app.set_selected_idx(PanelKind::Tables, 1); // ahora "otra"
+
+        assert!(
+            app.query_es_stale_por_navegacion(),
+            "el resultado del COUNT de 't' es stale si miras 'otra'"
+        );
+        // La primera llamada consume el target; la segunda ya no reporta
+        assert!(!app.query_es_stale_por_navegacion(), "solo se reporta una vez");
+    }
+
+    /// El resultado del COUNT es válido si el usuario sigue en el MISMO objeto.
+    #[test]
+    fn query_no_stale_si_el_objeto_no_cambio() {
+        let mut app = app_con_scroll_fake(100, 25);
+        app.tables = vec!["t".to_string()];
+        app.set_selected_idx(PanelKind::Tables, 0);
+        app.query_target_object = Some("t".to_string());
+
+        assert!(!app.query_es_stale_por_navegacion(), "mismo objeto → el resultado aplica");
     }
 }

@@ -96,6 +96,13 @@ pub fn render(
 /// scroll horizontal (shift+rueda / ctrl+rueda).
 pub const MIN_COL_W: usize = 12;
 
+/// Filas FIJAS que corren delante de los datos en el Data tab:
+/// `0` = spacer (bajo el título), `1` = header, `2` = separador `─┼─`.
+/// La selección del `TableState` apunta a `FIXED_ROWS + rel` y el
+/// viewport de datos resta estas filas. Antes era el literal mágico `3`
+/// repetido en 4 sitios que debían sincronizarse a mano.
+pub const FIXED_ROWS: usize = 3;
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
 #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
 pub fn render_data_table(
@@ -157,11 +164,8 @@ pub fn render_data_table(
     } else {
         items[0].split(" | ").collect()
     };
-    let headers_display: Vec<&str> = if typed {
-        display.iter().map(String::as_str).collect()
-    } else {
-        headers.clone()
-    };
+    let headers_display: Vec<&str> =
+        if typed { display.iter().map(String::as_str).collect() } else { headers.clone() };
 
     let col_count = headers.len().max(1);
 
@@ -240,7 +244,7 @@ pub fn render_data_table(
         selected_idx.saturating_sub(1).min(data_len.saturating_sub(1))
     };
 
-    let vp_data = viewport.saturating_sub(3); // filas de datos visibles
+    let vp_data = viewport.saturating_sub(FIXED_ROWS); // filas de datos visibles
     let max_scroll = data_len.saturating_sub(vp_data);
 
     let scroll = if data_len > 0 && vp_data > 0 {
@@ -337,7 +341,7 @@ pub fn render_data_table(
     // Filas de datos (con scroll). En modo tipado las celdas viajan intactas
     // (Row.cells, sin split('|')); la selección la marca el TableState con
     // `highlight_symbol` ("▎"), no el render manual.
-    let max_visible = viewport.saturating_sub(3); // spacer + header + separator
+    let max_visible = viewport.saturating_sub(FIXED_ROWS); // spacer + header + separator
     let visible_selected: Option<usize> = if selected_idx > 0 {
         Some(selected_idx.saturating_sub(1).saturating_sub(scroll))
     } else {
@@ -361,8 +365,9 @@ pub fn render_data_table(
 
     // ── TableState real: la selección se resalta con ▎ al borde (patrón
     // lazygit). La fila 0 (spacer) + 1 (header) + 2 (separador) corren
-    // delante de los datos: la selección apunta a `3 + rel`.
-    let mut state = TableState::default().with_selected(visible_selected.map(|rel| 3 + rel));
+    // delante de los datos: la selección apunta a `FIXED_ROWS + rel`.
+    let mut state =
+        TableState::default().with_selected(visible_selected.map(|rel| FIXED_ROWS + rel));
     frame.render_stateful_widget(
         table
             .highlight_symbol("▎")
@@ -398,12 +403,21 @@ pub fn render_data_table(
         // fila) y headers (click = ordenar). Con `▄` el thumb se pegaba a los
         // headers y la mitad vacía parecía "barra fantasma".
         let thumb_style = Style::default().fg(THEME.selection);
+        // Clamp contra el buffer REAL del frame: al redimensionar la
+        // terminal a una dimensión menor, el rect del panel (calculado con
+        // el layout anterior) puede sobresalir del buffer → `cell_mut`
+        // paniqueaba "index outside of buffer" (mismo bug que ya estaba
+        // protegido en el scrollbar vertical, línea ~668).
+        let (frame_w, frame_h) = (frame.area().width, frame.area().height);
+        if inner.y >= frame_h {
+            return scroll;
+        }
         let buf = frame.buffer_mut();
         for i in thumb_start..thumb_start + thumb_w {
-            let cell = buf
-                .cell_mut((inner.x + i as u16, inner.y))
-                .expect("celda dentro del área del panel");
-            cell.set_symbol("▀").set_style(thumb_style);
+            let x = (inner.x + i as u16).min(frame_w.saturating_sub(1));
+            if let Some(cell) = buf.cell_mut((x, inner.y)) {
+                cell.set_symbol("▀").set_style(thumb_style);
+            }
         }
     }
 
@@ -423,7 +437,7 @@ fn typed_row_cells(
         .map(|i| {
             let w = cell_widths[i - vis_start];
             let val = row.cells.get(i).map_or("", String::as_str);
-            data_cell(val, i, vis_start, vis_end, w)
+            data_cell(val, i, vis_end, w)
         })
         .collect()
 }
@@ -439,20 +453,25 @@ fn plain_row_cells(
         .map(|i| {
             let w = cell_widths[i - vis_start];
             let val = cells.get(i).map_or("", |s| s.trim());
-            data_cell(val, i, vis_start, vis_end, w)
+            data_cell(val, i, vis_end, w)
         })
         .collect()
 }
 
 /// Una celda con padding y separador `│` (el ▎ del highlight queda en la
 /// columna reservada, fuera de la celda).
-fn data_cell(val: &str, i: usize, vis_start: usize, vis_end: usize, w: usize) -> Cell<'static> {
-    Cell::from(data_cell_str(val, i, vis_start, vis_end, w))
+fn data_cell(val: &str, i: usize, vis_end: usize, w: usize) -> Cell<'static> {
+    Cell::from(data_cell_str(val, i, vis_end, w))
 }
 
 /// Texto de la celda (función pura, testeable sin depender del widget).
-fn data_cell_str(val: &str, i: usize, vis_start: usize, vis_end: usize, w: usize) -> String {
-    if i == vis_start || i < vis_end.saturating_sub(1) {
+fn data_cell_str(val: &str, i: usize, vis_end: usize, w: usize) -> String {
+    // Regla idéntica al header: la ÚLTIMA columna visible va sin `│` final
+    // (ancho w-1), el resto con `│` (ancho w-3). Con una sola columna
+    // visible (`vis_start == vis_end - 1`) ambas ramas deben coincidir;
+    // antes esta función usaba `i == vis_start` y desalineaba el header
+    // (w-1) contra el dato (w-3) en terminales angostas.
+    if i < vis_end.saturating_sub(1) {
         let iw = w.saturating_sub(3);
         let truncated = truncate_middle(val, iw);
         format!(" {truncated:<iw$} │")
@@ -691,8 +710,8 @@ mod tests {
         let cells = typed_row_cells(&row, 0, 2, &[12, 12]);
         assert_eq!(cells.len(), 2);
         // La celda "a | b" sigue siendo UNA celda: sin split, sin │ interno
-        assert!(data_cell_str(&row.cells[1], 1, 0, 2, 12).contains("a | b"));
-        assert_eq!(data_cell_str(&row.cells[1], 1, 0, 2, 12).matches('│').count(), 0);
+        assert!(data_cell_str(&row.cells[1], 1, 2, 12).contains("a | b"));
+        assert_eq!(data_cell_str(&row.cells[1], 1, 2, 12).matches('│').count(), 0);
         let _ = cells;
     }
 
@@ -700,15 +719,30 @@ mod tests {
     fn plain_row_cells_usa_el_formato_con_separador() {
         let cells = plain_row_cells(&["1", "ok"], 0, 2, &[12, 12]);
         assert_eq!(cells.len(), 2);
-        assert!(data_cell_str("1", 0, 0, 2, 12).ends_with('│'));
-        assert!(!data_cell_str("ok", 1, 0, 2, 12).ends_with('│')); // última columna
+        assert!(data_cell_str("1", 0, 2, 12).ends_with('│'));
+        assert!(!data_cell_str("ok", 1, 2, 12).ends_with('│')); // última columna
         let _ = cells;
     }
 
     #[test]
     fn data_cell_trunca_en_medio_sin_perder_el_borde() {
-        let text = data_cell_str("nombre muy largo de columna", 0, 0, 2, 10);
+        let text = data_cell_str("nombre muy largo de columna", 0, 2, 10);
         assert!(text.chars().count() <= 11);
         assert!(text.ends_with('│'));
+    }
+
+    /// REGRESIÓN (C6): con UNA sola columna visible, el header usa la rama
+    /// "sin │" (w-1) pero el dato usaba la rama "con │" (w-3) → desalineados.
+    /// Ambas deben usar la misma regla (última visible → sin │).
+    #[test]
+    fn data_cell_una_sola_columna_visible_sin_separador() {
+        // vis_start=0, vis_end=1: la única columna ES la última visible
+        let cell = data_cell_str("valor", 0, 1, 12);
+        assert!(!cell.ends_with('│'), "con 1 columna visible el dato no debe llevar │: {cell:?}");
+        // Multi-columna: la primera lleva │, la última no (regla del header)
+        let primera = data_cell_str("a", 0, 3, 12);
+        let ultima = data_cell_str("b", 2, 3, 12);
+        assert!(primera.ends_with('│'), "primera columna visible lleva │");
+        assert!(!ultima.ends_with('│'), "última columna visible no lleva │");
     }
 }

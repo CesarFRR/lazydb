@@ -22,9 +22,6 @@ pub struct ComputedLayout {
     pub footer: Rect,
     /// Posiciones de cada panel en orden de renderizado
     pub panels: [(PanelKind, Rect); 5],
-    /// ¿Modo angosto (detalle en stack vertical)?
-    #[allow(dead_code)]
-    pub is_narrow: bool,
 }
 
 impl Default for ComputedLayout {
@@ -38,7 +35,6 @@ impl Default for ComputedLayout {
                 (PanelKind::Advanced, Rect::default()),
                 (PanelKind::Detail, Rect::default()),
             ],
-            is_narrow: false,
         }
     }
 }
@@ -79,7 +75,6 @@ pub fn compute(
     ComputedLayout {
         footer: Rect::new(0, height.saturating_sub(footer_height), width, footer_height),
         panels,
-        is_narrow,
     }
 }
 
@@ -262,7 +257,7 @@ fn find_panel_rect(rects: &[(PanelKind, Rect)], kind: PanelKind) -> (PanelKind, 
     rects.iter().find(|(k, _)| *k == kind).copied().unwrap_or_else(|| (kind, Rect::default()))
 }
 
-fn empty_layout(width: u16, height: u16, footer_h: u16, is_narrow: bool) -> ComputedLayout {
+fn empty_layout(width: u16, height: u16, footer_h: u16, _is_narrow: bool) -> ComputedLayout {
     ComputedLayout {
         footer: Rect::new(0, height.saturating_sub(footer_h), width, footer_h),
         panels: [(PanelKind::Sources, Rect::default()); 5]
@@ -275,6 +270,5 @@ fn empty_layout(width: u16, height: u16, footer_h: u16, is_narrow: bool) -> Comp
             .collect::<Vec<_>>()
             .try_into()
             .unwrap_or_else(|_: Vec<_>| [(PanelKind::Sources, Rect::default()); 5]),
-        is_narrow,
     }
 }

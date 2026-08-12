@@ -144,9 +144,7 @@ impl AppAction {
             RunCountQuery | ClearQueryState | ReloadRuntimeConfig | OpenQueryInput
             | HScrollLeft | HScrollRight => KeyGroup::Data,
             Enter | ToggleActionsMenu | Yank | ExportCsv | StartFilter | ToggleHelp
-            | ToggleInspectorJson => {
-                KeyGroup::Actions
-            }
+            | ToggleInspectorJson => KeyGroup::Actions,
         }
     }
 

@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use crate::db::adapter::DbAdapter;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, TableData};
 
 use deadpool_postgres::Pool;
 
@@ -46,6 +46,10 @@ impl DbAdapter for PostgresAdapter {
         })
     }
 
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError> {
+        self.with_pool(crate::db::backends::postgres::list_objects)
+    }
+
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError> {
         // Para PostgreSQL: solo índices (los triggers no se listan)
         self.with_pool(crate::db::backends::postgres::list_all_indexes)
@@ -57,14 +61,6 @@ impl DbAdapter for PostgresAdapter {
 
     fn table_columns(&self, table_name: &str) -> Result<Vec<ColumnInfo>, DbError> {
         self.with_pool(|pool, db| crate::db::backends::postgres::column_info(pool, db, table_name))
-    }
-
-    fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
-        self.with_pool(|pool, db| {
-            crate::db::backends::postgres::table_rows_sorted(
-                pool, db, table_name, limit, offset, None,
-            )
-        })
     }
 
     fn table_row_count(&self, table_name: &str) -> Result<u32, DbError> {

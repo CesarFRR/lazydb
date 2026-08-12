@@ -1,5 +1,5 @@
 use crate::db::adapter::DbAdapter;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, TableData};
 
 /// Adapter ligero que delega en las funciones existentes de `db::backends::duckdb`.
 #[allow(dead_code)]
@@ -19,6 +19,10 @@ impl DbAdapter for DuckdbAdapter {
         crate::db::backends::duckdb::list_objects_by_type(&self.path, object_type)
     }
 
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError> {
+        crate::db::backends::duckdb::list_objects(&self.path)
+    }
+
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError> {
         crate::db::backends::duckdb::list_advanced_objects(&self.path)
     }
@@ -29,10 +33,6 @@ impl DbAdapter for DuckdbAdapter {
 
     fn table_columns(&self, table_name: &str) -> Result<Vec<ColumnInfo>, DbError> {
         crate::db::backends::duckdb::table_columns(&self.path, table_name)
-    }
-
-    fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
-        crate::db::backends::duckdb::table_rows(&self.path, table_name, limit, offset)
     }
 
     fn table_row_count(&self, table_name: &str) -> Result<u32, DbError> {

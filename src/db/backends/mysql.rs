@@ -66,6 +66,44 @@ async fn list_triggers_async(pool: &Pool, db_name: &str) -> Result<Vec<String>, 
     Ok(trg.into_iter().map(|(name,)| name).collect())
 }
 
+/// Catálogo completo en UNA consulta (4 SELECTs unidos): tablas, vistas,
+/// índices (con `SELECT DISTINCT`: `information_schema.statistics` repite
+/// una fila por columna del índice compuesto) y triggers.
+async fn list_objects_async(
+    pool: &Pool,
+    db_name: &str,
+) -> Result<Vec<crate::db::DbObjectHeader>, DbError> {
+    let mut conn = pool.get_conn().await?;
+    let sql = format!(
+        "SELECT 'table' AS tipo, table_name AS nombre FROM information_schema.tables
+           WHERE table_schema = '{db_name}' AND table_type = 'BASE TABLE'
+         UNION ALL
+         SELECT 'view', table_name FROM information_schema.tables
+           WHERE table_schema = '{db_name}' AND table_type = 'VIEW'
+         UNION ALL
+         SELECT DISTINCT 'index', index_name FROM information_schema.statistics
+           WHERE table_schema = '{db_name}' AND index_name != 'PRIMARY'
+         UNION ALL
+         SELECT 'trigger', trigger_name FROM information_schema.triggers
+           WHERE trigger_schema = '{db_name}'
+         ORDER BY tipo, nombre"
+    );
+    let rows: Vec<(String, String)> = conn.query(sql).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(tipo, nombre)| crate::db::DbObjectHeader {
+            schema: Some(db_name.to_string()),
+            nombre,
+            tipo: match tipo.as_str() {
+                "view" => crate::db::DbObjectKind::View,
+                "index" => crate::db::DbObjectKind::Index,
+                "trigger" => crate::db::DbObjectKind::Trigger,
+                _ => crate::db::DbObjectKind::Table,
+            },
+        })
+        .collect())
+}
+
 // ─── Metadata de columnas ─────────────────────────────────────────────
 
 async fn column_info_async(
@@ -235,7 +273,11 @@ async fn row_offset_of_async(
     value: &str,
 ) -> Result<Option<u32>, DbError> {
     let mut conn = pool.get_conn().await?;
-    let sql = format!("SELECT COUNT(*) FROM `{db_name}`.`{table_name}` WHERE `{col}` < '{value}'");
+    // Escapar comillas simples del valor: `O'Brien` no debe romper la query
+    // (ni inyectar SQL — el valor viene de una celda del usuario).
+    let value_esc = value.replace('\'', "''");
+    let sql =
+        format!("SELECT COUNT(*) FROM `{db_name}`.`{table_name}` WHERE `{col}` < '{value_esc}'");
     let count: Option<i64> = conn.query_first(sql).await?;
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     Ok(count.and_then(|c| if c > 0 { Some(c as u32 - 1) } else { None }))
@@ -262,8 +304,9 @@ async fn query_free_async(
     limit: u32,
 ) -> Result<Vec<String>, DbError> {
     let mut conn = pool.get_conn().await?;
-    // Limitar con LIMIT embed (el motor lo optimiza)
-    let row_sql = format!("{sql} LIMIT {limit}");
+    // Envolver SIEMPRE en subquery (inmune a `--`, `;` y LIMIT previo):
+    // ver `crate::db::query_guard`.
+    let row_sql = crate::db::query_guard::bounded_select_sql(sql, limit);
     let rows: Vec<MysqlRow> = conn.query(&row_sql).await?;
     let mut out = Vec::new();
     for row in rows {
@@ -317,6 +360,12 @@ pub fn list_all_indexes(pool: &Pool, db_name: &str) -> Result<Vec<String>, DbErr
 
 pub fn list_triggers(pool: &Pool, db_name: &str) -> Result<Vec<String>, DbError> {
     block_on(list_triggers_async(pool, db_name))
+}
+
+/// Catálogo completo en una sola ida al servidor.
+#[allow(dead_code)] // lo consumirá el lazy catalog (controller) en la Ronda 2
+pub fn list_objects(pool: &Pool, db_name: &str) -> Result<Vec<crate::db::DbObjectHeader>, DbError> {
+    block_on(list_objects_async(pool, db_name))
 }
 
 pub fn column_info(

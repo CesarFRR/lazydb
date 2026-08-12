@@ -1,6 +1,45 @@
 use duckdb::{Connection, OptionalExt, types::ValueRef};
 
-use crate::db::{Column, ColumnInfo, DbError, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, DbObjectKind, Row, TableData};
+
+/// Catálogo completo en UNA pasada: `information_schema.tables` (tablas) +
+/// `duckdb_views()` (vistas, filtrando internas) + `duckdb_indexes()`.
+/// `DuckDB` no tiene triggers desde 1.5.x.
+#[allow(dead_code)] // lo consumirá el lazy catalog (controller) en la Ronda 2
+pub fn list_objects(path: &str) -> Result<Vec<DbObjectHeader>, DbError> {
+    let conn = open_read_only(path)?;
+    let sql = "SELECT 'table' AS tipo, table_name AS nombre FROM information_schema.tables
+                 WHERE table_schema = 'main' AND table_type = 'BASE TABLE'
+               UNION ALL
+               SELECT 'view', view_name FROM duckdb_views()
+                 WHERE schema_name = 'main' AND NOT internal
+               UNION ALL
+               SELECT 'index', index_name FROM duckdb_indexes()
+                 WHERE schema_name = 'main'
+               ORDER BY tipo, nombre";
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        let kind: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        Ok((kind, name))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (kind, name) = row?;
+        out.push(DbObjectHeader {
+            schema: None,
+            nombre: name,
+            tipo: match kind.as_str() {
+                "view" => DbObjectKind::View,
+                "index" => DbObjectKind::Index,
+                _ => DbObjectKind::Table,
+            },
+        });
+    }
+    Ok(out)
+}
 
 /// Lista objetos por tipo ('table', 'view', 'index', 'trigger').
 /// `DuckDB` expone el catálogo vía `information_schema` (tablas) y
@@ -44,6 +83,7 @@ pub fn list_objects_by_type(path: &str, object_type: &str) -> Result<Vec<String>
 
 /// Objetos avanzados (índices y triggers) en formato `tipo:nombre`.
 /// Solo índices: `DuckDB` 1.5.x eliminó los triggers.
+#[allow(dead_code)] // lo consumen los smoke tests del backend
 pub fn list_advanced_objects(path: &str) -> Result<Vec<String>, DbError> {
     let conn = open_read_only(path)?;
     let mut stmt = conn.prepare(
@@ -205,15 +245,6 @@ fn rows_impl(
 }
 
 /// Filas + columnas, para el preview de datos.
-pub fn table_rows(
-    path: &str,
-    table_name: &str,
-    limit: u32,
-    offset: u32,
-) -> Result<TableData, DbError> {
-    table_rows_sorted(path, table_name, limit, offset, None)
-}
-
 /// Filas + columnas, con ORDER BY opcional. El contrato del dominio habla
 /// en modelos (`TableData`), no en strings formateados.
 pub fn table_rows_sorted(
@@ -1043,7 +1074,7 @@ mod tests {
             }
             let n = table_row_count(path, t).expect("count");
             println!("  {t}: {n} filas");
-            let data = table_rows(path, t, 3, 0).expect("rows");
+            let data = table_rows_sorted(path, t, 3, 0, None).expect("rows");
             for r in &data.rows {
                 println!("    row: {:?}", r.cells);
             }
@@ -1161,7 +1192,7 @@ mod tests {
                 Ok(cols) => println!("  COLUMNAS: {cols:?}"),
                 Err(err) => println!("  ERROR COLUMNAS: {err:?}"),
             }
-            match adapter.table_rows(&dataset, 2, 0) {
+            match adapter.table_rows_sorted(&dataset, 2, 0, None) {
                 Ok(data) => {
                     for row in &data.rows {
                         println!("    row: {row:?}");
@@ -1237,7 +1268,7 @@ mod tests {
             Ok(cols) => println!("  COLUMNAS categories: {cols:?}"),
             Err(err) => println!("  ERROR COLUMNAS: {err:?}"),
         }
-        match adapter.table_rows("categories", 3, 0) {
+        match adapter.table_rows_sorted("categories", 3, 0, None) {
             Ok(data) => {
                 for row in &data.rows {
                     println!("    row: {row:?}");

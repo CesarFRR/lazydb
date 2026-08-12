@@ -23,30 +23,6 @@ pub enum PanelKind {
 }
 
 impl PanelKind {
-    /// Título corto en inglés (usado en cabecera)
-    #[allow(dead_code)]
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::Sources => "Sources",
-            Self::Tables => "Tables",
-            Self::Views => "Views",
-            Self::Advanced => "Advanced",
-            Self::Detail => "Detail",
-        }
-    }
-
-    /// Etiqueta amigable en español
-    #[allow(dead_code)]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Sources => "Fuentes",
-            Self::Tables => "Tablas",
-            Self::Views => "Vistas",
-            Self::Advanced => "Avanzado",
-            Self::Detail => "Detalle",
-        }
-    }
-
     /// Todos los paneles en orden de navegación con Tab
     pub const ALL: [Self; 5] =
         [Self::Sources, Self::Tables, Self::Views, Self::Advanced, Self::Detail];

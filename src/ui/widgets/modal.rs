@@ -55,23 +55,6 @@ impl ModalScroll {
     }
 }
 
-/// Renderiza un modal centrado con scroll vertical.
-///
-/// Devuelve el inner rect (área de contenido sin bordes) para cálculos futuros.
-#[allow(dead_code)]
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &str,
-    lines: &[String],
-    scroll: &mut ModalScroll,
-    width_pct: u16,
-    height_pct: u16,
-) -> Rect {
-    let styled: Vec<Line<'_>> = lines.iter().map(|s| Line::from(s.as_str())).collect();
-    render_lines(frame, area, title, &styled, scroll, width_pct, height_pct, None)
-}
-
 /// Geometría centrada del modal. La comparte el render (para dibujar) y el
 /// controller (para el hit-testing del scrollbar interior y del drag).
 #[must_use]

@@ -4,6 +4,7 @@ mod db;
 mod keys;
 mod paths;
 mod query;
+mod security;
 mod storage;
 mod ui;
 
@@ -12,9 +13,8 @@ use std::{fs, io, path::PathBuf, time::Duration};
 use app::App;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
-        MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
 };

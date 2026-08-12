@@ -34,11 +34,7 @@ pub fn connect(uri: &str) -> Result<(Client, String), DbError> {
     let client = block_on(Client::with_uri_str(uri))
         .map_err(|e| DbError::Open(format!("MongoDB ({uri}): {e}")))?;
     // El nombre de base viene en el path de la URI (`.../27017/dbname`).
-    let db_name = uri
-        .split('/')
-        .nth(3)
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let db_name = uri.split('/').nth(3).map(ToString::to_string).unwrap_or_default();
     Ok((client, db_name))
 }
 
@@ -47,10 +43,7 @@ pub fn connect(uri: &str) -> Result<(Client, String), DbError> {
 pub fn list_databases(client: &Client) -> Result<Vec<String>, DbError> {
     let names = block_on(async { client.list_database_names().await })
         .map_err(|e| DbError::Open(format!("listDatabases: {e}")))?;
-    Ok(names
-        .into_iter()
-        .filter(|d| !matches!(d.as_str(), "admin" | "config" | "local"))
-        .collect())
+    Ok(names.into_iter().filter(|d| !matches!(d.as_str(), "admin" | "config" | "local")).collect())
 }
 
 fn db(client: &Client, db_name: &str) -> Database {
@@ -64,6 +57,34 @@ pub fn list_collections(client: &Client, db_name: &str) -> Result<Vec<String>, D
     let names = block_on(async { db.list_collection_names().await })
         .map_err(|e| DbError::Open(format!("{db_name}.listCollections: {e}")))?;
     Ok(names)
+}
+
+/// Catálogo completo en UNA llamada: `list_collections` devuelve colecciones,
+/// vistas y timeseries con su tipo. Mongo NO tiene triggers nativos
+/// (solo Atlas App Services) ni un listado global de índices en el driver —
+/// los índices se consultan on-demand por colección si la UI los necesita.
+#[allow(dead_code)] // lo consumirá el lazy catalog (controller) en la Ronda 2
+pub fn list_objects(
+    client: &Client,
+    db_name: &str,
+) -> Result<Vec<crate::db::DbObjectHeader>, DbError> {
+    use futures_util::stream::TryStreamExt;
+
+    let db = db(client, db_name);
+    let out = block_on(async {
+        let mut cursor = db.list_collections().await?;
+        let mut out: Vec<crate::db::DbObjectHeader> = Vec::new();
+        while let Some(spec) = cursor.try_next().await? {
+            let tipo = match spec.collection_type {
+                mongodb::results::CollectionType::View => crate::db::DbObjectKind::View,
+                _ => crate::db::DbObjectKind::Collection,
+            };
+            out.push(crate::db::DbObjectHeader { schema: None, nombre: spec.name, tipo });
+        }
+        Ok::<_, mongodb::error::Error>(out)
+    })
+    .map_err(|e| DbError::Open(format!("{db_name}.listCollections: {e}")))?;
+    Ok(out)
 }
 
 // ─── Metadata de "columnas" (claves observadas en una página) ──────────
@@ -158,10 +179,8 @@ pub fn bson_to_string(v: &Bson) -> String {
 
 /// Render compacto de un documento BSON (una línea).
 fn render_doc_compact(doc: &Document) -> String {
-    let inner: Vec<String> = doc
-        .iter()
-        .map(|(k, v)| format!("{k}: {}", bson_to_string(v)))
-        .collect();
+    let inner: Vec<String> =
+        doc.iter().map(|(k, v)| format!("{k}: {}", bson_to_string(v))).collect();
     format!("{{ {} }}", inner.join(", "))
 }
 
@@ -186,7 +205,8 @@ fn has_nested(v: &Bson) -> bool {
 /// clave va en su línea; los valores simples se mantienen en línea y solo
 /// los compuestos con hijos propios se expanden.
 pub fn render_doc_pretty(doc: &Document, indent: usize) -> String {
-    let nested = doc.values().any(|v| matches!(v, Bson::Document(_) | Bson::Array(_)) || has_nested(v));
+    let nested =
+        doc.values().any(|v| matches!(v, Bson::Document(_) | Bson::Array(_)) || has_nested(v));
     if doc.is_empty() || !nested {
         return render_doc_compact(doc);
     }
@@ -214,9 +234,7 @@ fn render_value_pretty(v: &Bson, indent: usize) -> String {
             // elemento es a su vez un array (2D) o tiene compuestos anidados
             // con profundidad real: `[[1,2],[3,4]]` expande;
             // `[{a:1},{b:2}]` (docs simples) no.
-            let deep_nested = items
-                .iter()
-                .any(|x| matches!(x, Bson::Array(_)) || has_nested(x));
+            let deep_nested = items.iter().any(|x| matches!(x, Bson::Array(_)) || has_nested(x));
             if items.is_empty() || !deep_nested {
                 return bson_to_string(v);
             }
@@ -257,9 +275,7 @@ async fn docs_page_async(
         find = find.sort(Document::from_iter([(col.to_string(), Bson::Int32(dir))]));
     }
     find = find.limit(i64::from(limit)).skip(u64::from(offset));
-    let mut cursor = find
-        .await
-        .map_err(|e| DbError::Open(format!("{collection}.find: {e}")))?;
+    let mut cursor = find.await.map_err(|e| DbError::Open(format!("{collection}.find: {e}")))?;
 
     let mut docs: Vec<Document> = Vec::with_capacity(limit as usize);
     while let Some(doc) = cursor
@@ -285,10 +301,7 @@ async fn docs_page_async(
         })
         .collect();
     Ok(TableData {
-        columns: key_types
-            .into_iter()
-            .map(|(name, dtype)| Column { name, dtype })
-            .collect(),
+        columns: key_types.into_iter().map(|(name, dtype)| Column { name, dtype }).collect(),
         rows,
     })
 }
@@ -329,9 +342,7 @@ async fn docs_page_pretty_async(
         .map(|doc| {
             let cells = keys
                 .iter()
-                .map(|k| {
-                    doc.get(k).map_or_else(String::new, |v| render_value_pretty(v, 0))
-                })
+                .map(|k| doc.get(k).map_or_else(String::new, |v| render_value_pretty(v, 0)))
                 .collect();
             Row { cells }
         })
@@ -342,16 +353,6 @@ async fn docs_page_pretty_async(
 //
 // El trait `DbAdapter` es síncrono; el driver de mongo es async. Igual que
 // mysql: cada función bloquea con `block_on` sobre el runtime compartido.
-
-pub fn table_rows(
-    client: &Client,
-    db_name: &str,
-    collection: &str,
-    limit: u32,
-    offset: u32,
-) -> Result<TableData, DbError> {
-    block_on(docs_page_async(client, db_name, collection, limit, offset, None))
-}
 
 /// Filas con compuestos expandidos (inspector de fila).
 pub fn table_data_rows_pretty(
@@ -407,10 +408,7 @@ pub fn observed_columns(
         }
         Ok::<Vec<Document>, DbError>(docs)
     })?;
-    Ok(observed_key_types(&docs)
-        .into_iter()
-        .map(|(name, dtype)| Column { name, dtype })
-        .collect())
+    Ok(observed_key_types(&docs).into_iter().map(|(name, dtype)| Column { name, dtype }).collect())
 }
 
 /// Metadata de columnas para el inspector.
@@ -435,11 +433,7 @@ pub fn column_info(
 }
 
 /// Los FKs no existen en Mongo: siempre vacío.
-pub const fn foreign_keys(
-    _client: &Client,
-    _db_name: &str,
-    _collection: &str,
-) -> Vec<ForeignKey> {
+pub const fn foreign_keys(_client: &Client, _db_name: &str, _collection: &str) -> Vec<ForeignKey> {
     Vec::new()
 }
 
@@ -449,7 +443,9 @@ pub const fn foreign_keys(
 /// no se pierda información de tipo.
 fn bson_to_json_value(v: &Bson) -> serde_json::Value {
     match v {
-        Bson::Double(f) => serde_json::Value::Number(serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0))),
+        Bson::Double(f) => serde_json::Value::Number(
+            serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
+        ),
         Bson::String(s) => serde_json::Value::String(s.clone()),
         Bson::Boolean(b) => serde_json::Value::Bool(*b),
         Bson::Int32(i) => serde_json::Value::Number((*i).into()),
@@ -464,10 +460,8 @@ fn bson_to_json_value(v: &Bson) -> serde_json::Value {
             serde_json::Value::Array(items.iter().map(bson_to_json_value).collect())
         }
         Bson::Document(doc) => {
-            let map: serde_json::Map<String, serde_json::Value> = doc
-                .iter()
-                .map(|(k, v)| (k.clone(), bson_to_json_value(v)))
-                .collect();
+            let map: serde_json::Map<String, serde_json::Value> =
+                doc.iter().map(|(k, v)| (k.clone(), bson_to_json_value(v))).collect();
             serde_json::Value::Object(map)
         }
         other => serde_json::Value::String(other.to_string()),
@@ -505,10 +499,7 @@ pub fn row_inspector_pairs(
         else {
             return Ok((Vec::new(), String::new()));
         };
-        let pairs = doc
-            .iter()
-            .map(|(k, v)| (k.clone(), render_value_pretty(v, 0)))
-            .collect();
+        let pairs = doc.iter().map(|(k, v)| (k.clone(), render_value_pretty(v, 0))).collect();
         Ok((pairs, doc_to_json_pretty(&doc)))
     })
 }
@@ -613,11 +604,7 @@ mod tests {
 
     #[test]
     fn observed_keys_une_en_orden_de_aparicion() {
-        let docs = vec![
-            doc! {"a": 1, "b": "x"},
-            doc! {"c": true},
-            doc! {"a": 2},
-        ];
+        let docs = vec![doc! {"a": 1, "b": "x"}, doc! {"c": true}, doc! {"a": 2}];
         assert_eq!(observed_keys(&docs), vec!["a", "b", "c"]);
     }
 
@@ -643,10 +630,7 @@ mod tests {
         let doc = doc! {"a": 1, "nested": doc! {"b": [1, 2]}};
         let out = render_doc_pretty(&doc, 0);
         assert!(out.contains("\n  a: 1"), "doc: {out}");
-        assert!(
-            out.contains("\n  nested: {\n    b: [1, 2]\n  }"),
-            "doc: {out}"
-        );
+        assert!(out.contains("\n  nested: {\n    b: [1, 2]\n  }"), "doc: {out}");
     }
 
     #[test]
@@ -725,14 +709,13 @@ mod tests {
             .iter()
             .find(|c| c.contains("smoke") || c.contains("probe"))
             .map_or_else(|| cols[0].clone(), ToString::to_string);
-        let data = table_rows(&client, &db, &coll_name, 5, 0).expect("leer docs");
+        let data = table_rows_sorted(&client, &db, &coll_name, 5, 0, None).expect("leer docs");
         println!("COLUMNAS de la página: {:?}", data.columns);
         println!("FILAS (compacto): {:?}", data.rows);
         // Las columnas vienen INCLUIDAS en la misma query (1 round-trip):
         // el adapter ya no hace `observed_columns` aparte para el Data tab.
         assert!(data.columns.iter().any(|c| c.name == "_id"), "columnas: {:?}", data.columns);
-        let pretty =
-            table_data_rows_pretty(&client, &db, &coll_name, 5, 0).expect("docs pretty");
+        let pretty = table_data_rows_pretty(&client, &db, &coll_name, 5, 0).expect("docs pretty");
         println!("FILAS (pretty): {pretty:?}");
 
         let count = collection_count(&client, &db, &coll_name).expect("count");
@@ -746,8 +729,8 @@ mod tests {
         // Inspector de fila: pares SOLO de campos presentes en cada doc.
         // Los docs tienen campos distintos → los pares deben reflejarlo
         // (un doc sin `age` no debe traer un par `age` vacío).
-        let offset_cesar = row_offset_of(&client, &db, &coll_name, "name", "cesar")
-            .expect("offset cesar");
+        let offset_cesar =
+            row_offset_of(&client, &db, &coll_name, "name", "cesar").expect("offset cesar");
         if let Some(idx) = offset_cesar {
             let (pairs, json) =
                 row_inspector_pairs(&client, &db, &coll_name, idx).expect("pares de fila");
@@ -773,8 +756,11 @@ mod tests {
         let cesar = count_free(&client, &db, &coll_name, "{\"name\": \"cesar\"}")
             .expect("count con filtro");
         println!("COUNT total: {total}, con filtro name=cesar: {cesar}");
-        assert_eq!(total, collection_count(&client, &db, &coll_name).expect("estimated"),
-            "count sin filtro ≈ estimatedDocumentCount");
+        assert_eq!(
+            total,
+            collection_count(&client, &db, &coll_name).expect("estimated"),
+            "count sin filtro ≈ estimatedDocumentCount"
+        );
         assert!(cesar >= 1, "debe haber al menos 1 doc cesar");
         assert!(cesar <= total, "el filtro no puede contar más que el total");
     }

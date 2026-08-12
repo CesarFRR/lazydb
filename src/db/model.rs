@@ -87,6 +87,56 @@ pub struct ForeignKey {
     pub to: Option<String>,
 }
 
+/// Tipo de objeto del catálogo (árbol lateral de objetos).
+///
+/// Es la unión de lo que cada motor expone: SQL tiene tablas/vistas/
+/// índices/triggers/sequences, mongo colecciones/vistas, duckdb además
+/// materialized views. Los motores sin el concepto devuelven `None` en
+/// `DbObjectHeader::schema`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Function/Procedure los usará la UI del árbol (Ronda 3)
+pub enum DbObjectKind {
+    Table,
+    View,
+    MaterializedView,
+    Index,
+    Trigger,
+    Sequence,
+    ForeignTable,
+    /// Mongo: colección (el equivalente a tabla).
+    Collection,
+    Function,
+    Procedure,
+}
+
+impl DbObjectKind {
+    /// Etiqueta corta para la UI (panel de objetos).
+    #[allow(dead_code)] // lo usará el árbol lateral (Ronda 3)
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::View => "view",
+            Self::MaterializedView => "matview",
+            Self::Index => "index",
+            Self::Trigger => "trigger",
+            Self::Sequence => "sequence",
+            Self::ForeignTable => "foreign_table",
+            Self::Collection => "collection",
+            Self::Function => "function",
+            Self::Procedure => "procedure",
+        }
+    }
+}
+
+/// Objeto del catálogo: schema (si el motor lo tiene) + nombre + tipo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbObjectHeader {
+    /// `None` cuando el motor no tiene el concepto (sqlite, mongo, archivos).
+    pub schema: Option<String>,
+    pub nombre: String,
+    pub tipo: DbObjectKind,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +172,12 @@ mod tests {
             pk: true,
         };
         assert_eq!(c.to_line(), "0 | id | INTEGER | NOT NULL PK");
+    }
+
+    #[test]
+    fn db_object_kind_label_es_estable() {
+        assert_eq!(DbObjectKind::Table.label(), "table");
+        assert_eq!(DbObjectKind::Collection.label(), "collection");
+        assert_eq!(DbObjectKind::MaterializedView.label(), "matview");
     }
 }

@@ -1,5 +1,7 @@
 use crate::db::adapter::DbAdapter;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{
+    Column, ColumnInfo, DbError, DbObjectHeader, DbObjectKind, ForeignKey, Row, TableData,
+};
 
 /// Adapter de archivos de datos locales (csv/tsv/parquet/json/jsonl/geojson/gpkg):
 /// un archivo = un dataset virtual con una sola "tabla" (ver `file.rs`).
@@ -30,6 +32,11 @@ impl DbAdapter for FileAdapter {
         }
     }
 
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError> {
+        // Un archivo = UN dataset virtual (la "tabla" del archivo).
+        Ok(vec![DbObjectHeader { schema: None, nombre: self.dataset(), tipo: DbObjectKind::Table }])
+    }
+
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError> {
         Ok(Vec::new())
     }
@@ -47,13 +54,6 @@ impl DbAdapter for FileAdapter {
             return Err(DbError::Sqlite(format!("objeto desconocido: {table_name}")));
         }
         crate::db::backends::file::table_columns(&self.path)
-    }
-
-    fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
-        if table_name != self.dataset() {
-            return Err(DbError::Sqlite(format!("objeto desconocido: {table_name}")));
-        }
-        crate::db::backends::file::table_rows_sorted(&self.path, limit, offset, None)
     }
 
     fn table_row_count(&self, table_name: &str) -> Result<u32, DbError> {

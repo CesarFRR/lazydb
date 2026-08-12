@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use crate::db::adapter::DbAdapter;
-use crate::db::{Column, ColumnInfo, DbError, ForeignKey, Row, TableData};
+use crate::db::{Column, ColumnInfo, DbError, DbObjectHeader, ForeignKey, Row, TableData};
 
 use mongodb::Client;
 
@@ -44,12 +44,14 @@ impl DbAdapter for MongoAdapter {
 
     fn list_objects_by_type(&self, object_type: &str) -> Result<Vec<String>, DbError> {
         self.with_client(|client, db| match object_type {
-            "table" | "collection" => {
-                crate::db::backends::mongo::list_collections(client, db)
-            }
+            "table" | "collection" => crate::db::backends::mongo::list_collections(client, db),
             // Mongo no tiene vistas SQL ni triggers ni índices separados
             _ => Ok(Vec::new()),
         })
+    }
+
+    fn list_objects(&self) -> Result<Vec<DbObjectHeader>, DbError> {
+        self.with_client(crate::db::backends::mongo::list_objects)
     }
 
     fn list_advanced_objects(&self) -> Result<Vec<String>, DbError> {
@@ -58,18 +60,14 @@ impl DbAdapter for MongoAdapter {
 
     fn object_sql(&self, object_name: &str) -> Result<String, DbError> {
         // No hay DDL en Mongo: devolvemos una descripción del objeto.
-        Ok(format!("// Colección MongoDB: {object_name}\n// Mongo no tiene DDL; los documentos son bson::Document libres."))
+        Ok(format!(
+            "// Colección MongoDB: {object_name}\n// Mongo no tiene DDL; los documentos son bson::Document libres."
+        ))
     }
 
     fn table_columns(&self, table_name: &str) -> Result<Vec<ColumnInfo>, DbError> {
         self.with_client(|client, db| {
             crate::db::backends::mongo::column_info(client, db, table_name)
-        })
-    }
-
-    fn table_rows(&self, table_name: &str, limit: u32, offset: u32) -> Result<TableData, DbError> {
-        self.with_client(|client, db| {
-            crate::db::backends::mongo::table_rows(client, db, table_name, limit, offset)
         })
     }
 
@@ -92,8 +90,10 @@ impl DbAdapter for MongoAdapter {
         offset: u32,
     ) -> Result<Vec<Row>, DbError> {
         self.with_client(|client, db| {
-            crate::db::backends::mongo::table_rows(client, db, table_name, limit, offset)
-                .map(|data| data.rows)
+            crate::db::backends::mongo::table_rows_sorted(
+                client, db, table_name, limit, offset, None,
+            )
+            .map(|data| data.rows)
         })
     }
 
@@ -104,7 +104,9 @@ impl DbAdapter for MongoAdapter {
         offset: u32,
     ) -> Result<Vec<Row>, DbError> {
         self.with_client(|client, db| {
-            crate::db::backends::mongo::table_data_rows_pretty(client, db, table_name, limit, offset)
+            crate::db::backends::mongo::table_data_rows_pretty(
+                client, db, table_name, limit, offset,
+            )
         })
     }
 
@@ -139,11 +141,7 @@ impl DbAdapter for MongoAdapter {
         })
     }
 
-    fn row_inspector_pairs(
-        &self,
-        object_name: &str,
-        offset: u32,
-    ) -> Option<Vec<(String, String)>> {
+    fn row_inspector_pairs(&self, object_name: &str, offset: u32) -> Option<Vec<(String, String)>> {
         self.with_client(|client, db| {
             crate::db::backends::mongo::row_inspector_pairs(client, db, object_name, offset)
                 .map(|(pairs, _json)| pairs)
@@ -163,9 +161,7 @@ impl DbAdapter for MongoAdapter {
         self.with_client(|client, db| {
             let (coll, filter) = split_collection_filter(sql);
             if coll.is_empty() {
-                return Err(DbError::Open(
-                    "selecciona una colección antes de filtrar".into(),
-                ));
+                return Err(DbError::Open("selecciona una colección antes de filtrar".into()));
             }
             crate::db::backends::mongo::query_free(client, db, &coll, &filter, limit)
         })

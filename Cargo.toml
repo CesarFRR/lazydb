@@ -52,6 +52,7 @@ deadpool-postgres = { version = "0.14", optional = true }
 # el driver por defecto) + `rustls-tls` (TLS sin openssl).
 mongodb = { version = "3.8", default-features = false, features = ["compat-3-3-0", "bson-2", "rustls-tls"], optional = true }
 futures-util = "0.3"
+keyring = "3.6.3"
 
 [lints.rust]
 unsafe_code = "forbid"
