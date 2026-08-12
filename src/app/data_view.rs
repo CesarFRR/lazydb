@@ -37,10 +37,15 @@ pub struct DataViewState {
     /// en `preview_rows`/`preview_data`). Evita re-consultar al volver a
     /// una pestaña (ej. Meta: el DDL tardaba en reaparecer).
     pub last_preview_key: Option<(String, DetailTab)>,
+    /// Cache de info ESTÁTICA por (objeto, tab): Schema y Meta se guardan
+    /// aquí para que volver a una pestaña ya cargada sea INSTANTÁNEO (sin
+    /// "Cargando..."). Data NO se cachea aquí: el scroll infinito lo maneja
+    /// (`last_preview_key` conserva su estado).
+    pub preview_cache: std::collections::HashMap<(String, DetailTab), (Vec<String>, u32)>,
 }
 
 impl DataViewState {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             preview_rows: Vec::new(),
             preview_data: None,
@@ -53,6 +58,7 @@ impl DataViewState {
             sort_column: None,
             sort_asc: true,
             last_preview_key: None,
+            preview_cache: std::collections::HashMap::new(),
         }
     }
 }

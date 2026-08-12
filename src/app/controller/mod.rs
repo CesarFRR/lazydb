@@ -108,7 +108,7 @@ enum DragState {
     InspectorScroll { rect: Rect, content_len: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DetailTab {
     Data,
     Schema,
@@ -1586,12 +1586,27 @@ impl App {
 
         let object_name = self.selected_object_name();
 
-        // CACHE: ¿mismo (objeto, tab) que el último preview cargado?
-        // Entonces NO relanzar el spawn — el preview ya está en memoria
-        // (volver a Meta no re-consulta el DDL: era lento por el round-trip).
+        // CACHE 1 — info estática (Schema/Meta): restaurar del HashMap SIN
+        // spawn ni "Cargando..." (volver a una pestaña ya cargada es
+        // instantáneo; antes relanzaba y mostraba "Cargando X...").
         let key = (object_name.clone(), self.data_view.detail_tab);
+        if self.data_view.detail_tab != DetailTab::Data {
+            if let Some((rows, total)) = self.data_view.preview_cache.get(&key) {
+                self.data_view.preview_rows = rows.clone();
+                self.data_view.preview_data = None;
+                self.data_view.total_rows = *total;
+                self.is_loading = false;
+                self.set_selected_idx(PanelKind::Detail, 0);
+                return;
+            }
+        }
+
+        // CACHE 2 — Data: conserva el estado del scroll infinito (la clave
+        // del último preview aplicado). El check de "Cargando" evita el
+        // falso hit tras pasar por otra pestaña que limpió preview_rows.
         if self.data_view.last_preview_key.as_ref() == Some(&key)
             && !self.data_view.preview_rows.is_empty()
+            && !self.data_view.preview_rows[0].starts_with("Cargando")
         {
             self.is_loading = false;
             return;
@@ -1808,6 +1823,15 @@ impl App {
                         || self.selected_object_name() != object
                     {
                         continue;
+                    }
+                    // Info estática (Schema/Meta): guardar en cache ANTES de
+                    // mover preview_rows (restauración instantánea al volver;
+                    // Data no: scroll infinito).
+                    if detail_tab != DetailTab::Data {
+                        self.data_view.preview_cache.insert(
+                            (self.selected_object_name(), detail_tab),
+                            (preview_rows.clone(), total_rows),
+                        );
                     }
                     self.data_view.preview_rows = preview_rows;
                     self.data_view.preview_data = preview_data;
@@ -2831,6 +2855,7 @@ impl App {
         self.data_view.preview_rows.clear();
         self.data_view.preview_data = None;
         self.data_view.last_preview_key = None; // invalidar cache
+        self.data_view.preview_cache.clear(); // invalidar cache estático
         self.connection.connection_form = Some(ConnectionFormState::default());
         self.data_view.total_rows = 0;
         self.data_view.preview_loaded_offset = 0;
@@ -4786,6 +4811,34 @@ mod tests {
             "el preview viejo se limpia al cambiar de tab: {:?}",
             app.data_view.preview_rows
         );
+    }
+
+    /// REGRESIÓN (bug reportado): volver a una pestaña ya cacheada
+    /// (Schema/Meta) restaura al instante, SIN "Cargando..." — el cache
+    /// por (objeto, tab) evita el re-spawn.
+    #[test]
+    fn cache_restaura_meta_sin_cargando() {
+        let mut app = App::new();
+        app.tables = vec!["t".to_string()];
+        app.set_selected_idx(PanelKind::Tables, 0);
+        // Simular Meta ya cacheado
+        app.data_view.preview_cache.insert(
+            ("t".to_string(), DetailTab::Meta),
+            (vec!["db_path: /tmp/x.db".to_string(), "-- DDL --".to_string()], 0),
+        );
+        app.data_view.detail_tab = DetailTab::Meta;
+        app.refresh_preview_from_selected_object();
+        assert!(
+            app.data_view.preview_rows.first().is_some_and(|l| l.contains("db_path")),
+            "el cache restaura Meta sin 'Cargando': {:?}",
+            app.data_view.preview_rows
+        );
+        assert!(
+            !app.data_view.preview_rows[0].starts_with("Cargando"),
+            "nunca 'Cargando' con cache: {:?}",
+            app.data_view.preview_rows
+        );
+        assert!(!app.is_loading, "cache hit no deja is_loading");
     }
 
     /// REGRESIÓN (bug reportado): la pestaña Query NO debe abrir el modal `:`

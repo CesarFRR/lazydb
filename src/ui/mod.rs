@@ -169,6 +169,23 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
             app.data_view.sort_column.as_deref(),
             app.data_view.sort_asc,
         )
+    } else if kind == PanelKind::Detail && app.data_view.detail_tab == DetailTab::Schema {
+        // Esquema: tabla formateada (reutiliza render_data_table) — columnas
+        // cid/name/type/nullability con cabeceras, en vez de lista plana.
+        let table = table_from_lines(items);
+        widgets::panel::render_data_table(
+            frame,
+            area,
+            &title,
+            table.as_ref(),
+            items,
+            panel.selected_idx,
+            panel.scroll_offset.get(),
+            panel.h_scroll.get(),
+            focused,
+            None,
+            true,
+        )
     } else if kind == PanelKind::Detail && app.data_view.detail_tab == DetailTab::Query {
         // Pestaña Query: input de SQL arriba + resultados debajo (split).
         render_query_tab(frame, area, &title, app);
@@ -528,6 +545,23 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
 /// Modal de input SQL (`:`): buffer editable con cursor visible, historial
 /// navegable debajo (↑/↓, estilo fish) y hint de teclas al pie.
+/// Construye `TableData` desde líneas "a | b | c": header = línea 0,
+/// filas = el resto. Cada celda viaja intacta (sin split doble).
+fn table_from_lines(lines: &[String]) -> Option<crate::db::TableData> {
+    let header = lines.first()?;
+    let columns: Vec<crate::db::Column> = header
+        .split(" | ")
+        .map(|name| crate::db::Column { name: name.to_string(), dtype: String::new() })
+        .collect();
+    let rows: Vec<crate::db::Row> = lines
+        .iter()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .map(|l| crate::db::Row { cells: l.split(" | ").map(ToString::to_string).collect() })
+        .collect();
+    Some(crate::db::TableData { columns, rows })
+}
+
 /// Render de la pestaña Query (`DetailTab::Query`): input de SQL en la parte
 /// superior + resultados (o placeholder) debajo. Split vertical 1/4 - 3/4.
 /// Comparte `QueryInputState` con el modal `:` (un solo historial).
@@ -612,23 +646,8 @@ fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
         return;
     }
 
-    // Construir TableData desde las líneas: la primera línea es el header
-    // (separada por ' | '), el resto son filas.
-    let columns: Vec<crate::db::Column> = results
-        .first()
-        .map(|h| {
-            h.split(" | ")
-                .map(|name| crate::db::Column { name: name.to_string(), dtype: String::new() })
-                .collect()
-        })
-        .unwrap_or_default();
-    let rows: Vec<crate::db::Row> = results
-        .iter()
-        .skip(1)
-        .filter(|l| !l.is_empty())
-        .map(|l| crate::db::Row { cells: l.split(" | ").map(ToString::to_string).collect() })
-        .collect();
-    let table = crate::db::TableData { columns, rows };
+    // Construir TableData desde las líneas (header = línea 0, resto filas)
+    let table = table_from_lines(results);
 
     let scroll = app
         .panels
@@ -639,7 +658,7 @@ fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
         frame,
         results_area,
         " Resultados ",
-        Some(&table),
+        table.as_ref(),
         results,
         app.panel_selected_idx_for_query_tab(),
         scroll,
