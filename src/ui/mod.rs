@@ -154,19 +154,19 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
     }
 
     // Tabla de datos con columnas reales para Detail + Data tab
-    let new_scroll = if kind == PanelKind::Detail && app.detail_tab == DetailTab::Data {
+    let new_scroll = if kind == PanelKind::Detail && app.data_view.detail_tab == DetailTab::Data {
         widgets::panel::render_data_table(
             frame,
             area,
             &title,
-            app.preview_data.as_ref(),
+            app.data_view.preview_data.as_ref(),
             items,
             panel.selected_idx,
             panel.scroll_offset.get(),
             panel.h_scroll.get(),
             focused,
-            app.sort_column.as_deref(),
-            app.sort_asc,
+            app.data_view.sort_column.as_deref(),
+            app.data_view.sort_asc,
         )
     } else {
         widgets::panel::render(
@@ -500,14 +500,14 @@ mod tests {
         let mut app = App::new();
         // Data tab con MUCHAS columnas → h_scroll activo (thumb dibujado).
         // El resize a un frame pequeño hace que el rect del panel sobresalga.
-        app.detail_tab = DetailTab::Data;
+        app.data_view.detail_tab = DetailTab::Data;
         app.tables = vec!["t".to_string()];
         let headers: Vec<String> = (0..30).map(|i| format!("col_{i}")).collect();
         let mut rows = vec![headers.join(" | ")];
         rows.extend(
             (0..50).map(|i| (0..30).map(|c| format!("v{i}_{c}")).collect::<Vec<_>>().join(" | ")),
         );
-        app.preview_rows = rows;
+        app.data_view.preview_rows = rows;
 
         // Layout grande → frame pequeño (resize race)
         app.compute_layout(150, 40);

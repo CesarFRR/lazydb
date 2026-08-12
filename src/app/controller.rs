@@ -343,13 +343,8 @@ pub struct App {
     pub tables: Vec<String>,
     pub views: Vec<String>,
     pub advanced: Vec<String>,
-    pub preview_rows: Vec<String>,
-    /// Celdas TIPADAS del Data tab (última página cargada): la fuente de
-    /// verdad para el render 2D. `None` cuando la vista actual no es una
-    /// tabla (mensajes, SQL, schema). El render usa `preview_rows` solo
-    /// como fallback (List de 1 columna / mensajes).
-    pub preview_data: Option<crate::db::TableData>,
-    pub detail_tab: DetailTab,
+    /// Estado del Data view (Fase 3): preview, tabs, paginación y orden.
+    pub data_view: super::data_view::DataViewState,
 
     // ── estado persistente ──
     pub should_quit: bool,
@@ -368,11 +363,6 @@ pub struct App {
     /// (`row` → `doc`) y muestra el toggle JSON del modal.
     pub is_nosql: bool,
     pub status: String,
-    pub current_page: u32,
-    pub rows_per_page: u32,
-    pub total_rows: u32,
-    /// Índice 0-based en el dataset de `preview_rows[1]` (primera fila de datos)
-    pub preview_loaded_offset: u32,
     pub query_state: query::QueryState,
     pub query_results: Vec<String>,
     pub state: storage::AppState,
@@ -436,9 +426,6 @@ pub struct App {
     /// Estado de la UI de conexión (Fase 2): formulario, prompt de
     /// contraseña y picker de bases viven en connection.rs.
     pub connection: super::connection::ConnectionState,
-    /// El preview muestra el resultado de una query libre del usuario (no el
-    /// objeto seleccionado). Los scrolls infinitos y refreshes lo respetan.
-    pub query_mode: bool,
     /// Doble-click: timestamp del último click (ms) y panel clickeado
     pub last_click_time: u64,
     pub last_click_kind: Option<PanelKind>,
@@ -451,10 +438,6 @@ pub struct App {
     pub input_mode: InputMode,
     pub filter_query: String,
     pub filtered_items: Vec<String>,
-
-    // ── ordenamiento de columnas en Data tab ──
-    pub sort_column: Option<String>,
-    pub sort_asc: bool,
 
     // ── arrastre de barras de scroll (click + drag con mouse) ──
     drag: Option<DragState>,
@@ -539,9 +522,7 @@ impl App {
             tables: vec![],
             views: vec![],
             advanced: vec![],
-            preview_rows: Vec::new(), // se rellena abajo (necesita self listo)
-            preview_data: None,
-            detail_tab: DetailTab::Data,
+            data_view: super::data_view::DataViewState::new(),
             should_quit: false,
             is_loading: false,
             refresh_count: 0,
@@ -550,10 +531,6 @@ impl App {
             db_size_bytes: None,
             is_nosql: false,
             status: "Sin conexion".to_string(),
-            current_page: 0,
-            rows_per_page: ui_config.rows_per_page,
-            total_rows: 0,
-            preview_loaded_offset: 0,
             query_state: query::QueryState::Idle,
             query_results: Vec::new(),
             state,
@@ -570,7 +547,6 @@ impl App {
             error: None,
             query_input: None,
             connection: super::connection::ConnectionState::new(),
-            query_mode: false,
             last_click_time: 0,
             last_click_kind: None,
             last_click_idx: 0,
@@ -578,10 +554,9 @@ impl App {
             input_mode: InputMode::Normal,
             filter_query: String::new(),
             filtered_items: Vec::new(),
-            sort_column: None,
-            sort_asc: true,
             drag: None,
         };
+        app.data_view.rows_per_page = ui_config.rows_per_page;
         // El panel Detail arranca con el formulario de nueva conexión
         // (sin db abierta): auto-detecta el tipo desde la URL/ruta.
         app.status = "Nueva conexión: escribe la URL o ruta y Enter conecta".to_string();
@@ -698,7 +673,7 @@ impl App {
 
         // Si el foco va a un panel de objetos, refrescar preview
         if kind == PanelKind::Tables || kind == PanelKind::Views || kind == PanelKind::Advanced {
-            self.current_page = 0;
+            self.data_view.current_page = 0;
             self.refresh_preview_from_selected_object();
         }
     }
@@ -775,11 +750,11 @@ impl App {
                     len,
                     step,
                 );
-                self.current_page = 0;
+                self.data_view.current_page = 0;
                 self.refresh_preview_from_selected_object();
             }
             PanelKind::Detail => {
-                let len = self.preview_rows.len();
+                let len = self.data_view.preview_rows.len();
                 let old_idx = self.selected_idx(PanelKind::Detail);
                 Self::shift_index_on_vec_len(
                     &mut self.panel_mut(PanelKind::Detail).selected_idx,
@@ -787,18 +762,18 @@ impl App {
                     step,
                 );
                 // En Data tab, no subir al header (row 0) — mínimo row 1
-                if self.detail_tab == DetailTab::Data && len > 1 {
+                if self.data_view.detail_tab == DetailTab::Data && len > 1 {
                     let panel = self.panel_mut(PanelKind::Detail);
                     if panel.selected_idx == 0 {
                         panel.selected_idx = 1;
                     }
                 }
                 // Scroll infinito (append/prepend) para Data tab
-                if self.detail_tab == DetailTab::Data && len > 1 {
+                if self.data_view.detail_tab == DetailTab::Data && len > 1 {
                     if step > 0 && old_idx == len.saturating_sub(1) {
                         // Al bajar del último dato → cargar página siguiente
                         self.scroll_down_infinite();
-                    } else if step < 0 && old_idx == 1 && self.preview_loaded_offset > 0 {
+                    } else if step < 0 && old_idx == 1 && self.data_view.preview_loaded_offset > 0 {
                         // Al subir del primer dato → cargar página anterior
                         self.scroll_up_infinite();
                     }
@@ -814,7 +789,7 @@ impl App {
     /// los bordes, el scroll infinito carga más contenido SIN saltar la
     /// selección (append la deja quieta, prepend la desplaza +n).
     fn move_selection_by_page(&mut self, down: bool) {
-        let len = self.preview_rows.len();
+        let len = self.data_view.preview_rows.len();
         if len <= 1 {
             return;
         }
@@ -839,7 +814,7 @@ impl App {
         // Bordes del buffer: cargar más contenido (la selección no salta)
         if down && target == last {
             self.scroll_down_infinite();
-        } else if !down && target == 1 && self.preview_loaded_offset > 0 {
+        } else if !down && target == 1 && self.data_view.preview_loaded_offset > 0 {
             self.scroll_up_infinite();
         }
     }
@@ -890,7 +865,7 @@ impl App {
             PanelKind::Tables => &self.tables,
             PanelKind::Views => &self.views,
             PanelKind::Advanced => &self.advanced,
-            PanelKind::Detail => &self.preview_rows,
+            PanelKind::Detail => &self.data_view.preview_rows,
         }
     }
 
@@ -941,11 +916,11 @@ impl App {
                     let text = if tab == DetailTab::Data {
                         // Número de fila actual / total. En NoSQL (mongo)
                         // cada fila es un documento → `doc X/Y`.
-                        if self.total_rows > 0 {
-                            let current_row = self.preview_loaded_offset
+                        if self.data_view.total_rows > 0 {
+                            let current_row = self.data_view.preview_loaded_offset
                                 + self.selected_idx(PanelKind::Detail).saturating_sub(1) as u32
                                 + 1;
-                            let total = self.total_rows;
+                            let total = self.data_view.total_rows;
                             let unit = if self.is_nosql { "doc" } else { "row" };
                             format!("{label} - {unit} {current_row}/{total}")
                         } else {
@@ -956,7 +931,7 @@ impl App {
                     };
 
                     // Tab activo entre corchetes, con padding
-                    let padded = if tab == self.detail_tab {
+                    let padded = if tab == self.data_view.detail_tab {
                         format!(" [ {text} ] ")
                     } else {
                         format!("  {text}  ")
@@ -1085,7 +1060,7 @@ impl App {
 
     #[allow(dead_code)]
     pub const fn detail_tab_label(&self) -> &'static str {
-        self.detail_tab.label()
+        self.data_view.detail_tab.label()
     }
 
     pub const fn actions_menu_items() -> &'static [&'static str] {
@@ -1443,7 +1418,7 @@ impl App {
         // `is_loading` se apaga cuando el resultado se aplica (o en el error
         // inmediato del resolver); los callers que esperaban sincronía ahora
         // ven el estado "conectando" hasta el próximo frame.
-        let rows_per_page = self.rows_per_page;
+        let rows_per_page = self.data_view.rows_per_page;
         let tx2 = tx.clone();
         let path2 = path.clone();
         tokio::task::spawn_blocking(move || {
@@ -1546,21 +1521,21 @@ impl App {
                     self.set_selected_idx(PanelKind::Views, 0);
                     self.set_selected_idx(PanelKind::Advanced, 0);
                     self.set_selected_idx(PanelKind::Detail, 0);
-                    self.current_page = 0;
-                    self.preview_loaded_offset = 0;
-                    self.detail_tab = DetailTab::Data;
+                    self.data_view.current_page = 0;
+                    self.data_view.preview_loaded_offset = 0;
+                    self.data_view.detail_tab = DetailTab::Data;
 
                     // Preview ya cargado en background (count + primera
                     // página): aplicarlo directo, sin re-consultar.
                     if let Some((data, total)) = first_preview {
-                        self.preview_data = Some(data.clone());
-                        self.preview_rows = data.to_lines();
-                        self.total_rows = total;
+                        self.data_view.preview_data = Some(data.clone());
+                        self.data_view.preview_rows = data.to_lines();
+                        self.data_view.total_rows = total;
                         self.set_selected_idx(PanelKind::Detail, 1);
                     } else {
-                        self.preview_data = None;
-                        self.preview_rows = vec!["<sin tablas>".to_string()];
-                        self.total_rows = 0;
+                        self.data_view.preview_data = None;
+                        self.data_view.preview_rows = vec!["<sin tablas>".to_string()];
+                        self.data_view.total_rows = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                     }
 
@@ -1611,7 +1586,7 @@ impl App {
         // Restar bordes del bloque (2) + overhead fijo
         // En Data tab: spacer(1) + header(1) + separator(1) = 3
         // En otros tabs: solo borde (0 overhead extra)
-        let overhead: u16 = if self.detail_tab == DetailTab::Data { 5 } else { 2 };
+        let overhead: u16 = if self.data_view.detail_tab == DetailTab::Data { 5 } else { 2 };
         let available = u32::from(detail_h.saturating_sub(overhead));
 
         // Redondear a múltiplo de 10 hacia abajo, mínimo 10
@@ -1632,40 +1607,40 @@ impl App {
     ///
     /// `DetailTab::Meta` es local (sin red): se resuelve al instante.
     fn refresh_preview_from_selected_object(&mut self) {
-        self.query_mode = false;
-        self.rows_per_page = self.optimal_rows_per_page();
+        self.data_view.query_mode = false;
+        self.data_view.rows_per_page = self.optimal_rows_per_page();
         self.panel_mut(PanelKind::Detail).scroll_offset.set(0);
         self.panel_mut(PanelKind::Detail).h_scroll.set(0);
 
         self.is_loading = true;
-        self.status = format!("Cargando {}...", self.detail_tab.label().trim());
+        self.status = format!("Cargando {}...", self.data_view.detail_tab.label().trim());
 
         let object_name = self.selected_object_name();
         if object_name.is_empty() || object_name == "-" {
-            self.preview_rows = vec!["Sin objeto seleccionado".to_string()];
-            self.preview_data = None;
-            self.total_rows = 0;
-            self.preview_loaded_offset = 0;
+            self.data_view.preview_rows = vec!["Sin objeto seleccionado".to_string()];
+            self.data_view.preview_data = None;
+            self.data_view.total_rows = 0;
+            self.data_view.preview_loaded_offset = 0;
             self.is_loading = false;
             self.set_selected_idx(PanelKind::Detail, 0);
             return;
         }
 
         // Meta: información local (path, tamaño, offsets) — sin red.
-        if self.detail_tab == DetailTab::Meta {
-            self.preview_data = None;
-            self.preview_rows = vec![
+        if self.data_view.detail_tab == DetailTab::Meta {
+            self.data_view.preview_data = None;
+            self.data_view.preview_rows = vec![
                 format!("db_path: {}", self.db_path_safe()),
                 format!("db_size: {}", self.db_size_display()),
                 format!("source_tab: {}", self.sources_state.source_tab.label()),
                 format!("object_section: {}", self.object_section.label()),
-                format!("detail_tab: {}", self.detail_tab.label()),
+                format!("detail_tab: {}", self.data_view.detail_tab.label()),
                 format!("object: {}", object_name),
-                format!("rows_per_page: {}", self.rows_per_page),
-                format!("loaded_offset: {}", self.preview_loaded_offset),
-                format!("estimated_rows: {}", self.total_rows),
+                format!("rows_per_page: {}", self.data_view.rows_per_page),
+                format!("loaded_offset: {}", self.data_view.preview_loaded_offset),
+                format!("estimated_rows: {}", self.data_view.total_rows),
             ];
-            self.preview_loaded_offset = 0;
+            self.data_view.preview_loaded_offset = 0;
             self.set_selected_idx(PanelKind::Detail, 0);
             self.is_loading = false;
             return;
@@ -1691,12 +1666,12 @@ impl App {
         let generation = self.preview_gen;
         let Some(tx) = self.preview_tx.clone() else { return };
         let object_section = self.object_section;
-        let detail_tab = self.detail_tab;
-        let rows_per_page = self.rows_per_page;
-        let offset = self.current_page.saturating_mul(self.rows_per_page);
+        let detail_tab = self.data_view.detail_tab;
+        let rows_per_page = self.data_view.rows_per_page;
+        let offset = self.data_view.current_page.saturating_mul(self.data_view.rows_per_page);
         // Clonar el orden: el closure del spawn_blocking no puede prestar self.
         let order_col: Option<(String, bool)> =
-            self.sort_column.as_ref().map(|col| (col.clone(), self.sort_asc));
+            self.data_view.sort_column.as_ref().map(|col| (col.clone(), self.data_view.sort_asc));
 
         tokio::task::spawn_blocking(move || {
             let (preview_rows, preview_data, total_rows) = match detail_tab {
@@ -1824,17 +1799,19 @@ impl App {
                         continue; // stale: el usuario navegó mientras cargaba
                     }
                     // ¿El usuario ya cambió de tab/objeto? Descarta igual.
-                    if self.detail_tab != detail_tab || self.selected_object_name() != object {
+                    if self.data_view.detail_tab != detail_tab
+                        || self.selected_object_name() != object
+                    {
                         continue;
                     }
-                    self.preview_rows = preview_rows;
-                    self.preview_data = preview_data;
-                    self.total_rows = total_rows;
-                    self.preview_loaded_offset =
-                        self.current_page.saturating_mul(self.rows_per_page);
+                    self.data_view.preview_rows = preview_rows;
+                    self.data_view.preview_data = preview_data;
+                    self.data_view.total_rows = total_rows;
+                    self.data_view.preview_loaded_offset =
+                        self.data_view.current_page.saturating_mul(self.data_view.rows_per_page);
                     self.set_selected_idx(
                         PanelKind::Detail,
-                        usize::from(self.preview_rows.len() > 1),
+                        usize::from(self.data_view.preview_rows.len() > 1),
                     );
                     self.is_loading = false;
                 }
@@ -1852,12 +1829,12 @@ impl App {
     /// ellas de forma natural. Antes la selección saltaba a la primera fila
     /// nueva ("cambio de página" fantasma con la rueda).
     fn scroll_down_infinite(&mut self) {
-        if self.query_mode {
+        if self.data_view.query_mode {
             return; // resultado de query libre: sin scroll infinito
         }
-        let data_len = self.preview_rows.len().saturating_sub(1);
-        let next_offset = self.preview_loaded_offset as usize + data_len;
-        if next_offset >= self.total_rows as usize {
+        let data_len = self.data_view.preview_rows.len().saturating_sub(1);
+        let next_offset = self.data_view.preview_loaded_offset as usize + data_len;
+        if next_offset >= self.data_view.total_rows as usize {
             return; // ya estamos al final del dataset
         }
 
@@ -1867,7 +1844,10 @@ impl App {
         }
 
         #[allow(clippy::cast_possible_truncation)]
-        let limit = self.rows_per_page.min(self.total_rows.saturating_sub(next_offset as u32));
+        let limit = self
+            .data_view
+            .rows_per_page
+            .min(self.data_view.total_rows.saturating_sub(next_offset as u32));
 
         if limit == 0 {
             return;
@@ -1876,7 +1856,8 @@ impl App {
         self.is_loading = true;
         self.status = format!("Cargando más filas (offset {next_offset})...");
 
-        let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
+        let order_col =
+            self.data_view.sort_column.as_deref().map(|col| (col, self.data_view.sort_asc));
         let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
@@ -1889,15 +1870,16 @@ impl App {
                 self.is_loading = false;
                 return;
             }
-            self.preview_rows.extend(data.rows.iter().map(|row| row.to_line(" | ")));
+            self.data_view.preview_rows.extend(data.rows.iter().map(|row| row.to_line(" | ")));
             // Sincronizar las celdas tipadas del render 2D: el viewport usa
             // `preview_data.rows.len()` como tope (`rows_hint`) — sin esto el
             // scroll se congela en la primera página mientras el label de
             // `row X/Y` sigue avanzando (bug "la vista no baja").
-            if let Some(existing) = self.preview_data.take() {
+            if let Some(existing) = self.data_view.preview_data.take() {
                 let mut rows = existing.rows;
                 rows.extend(data.rows);
-                self.preview_data = Some(crate::db::TableData { columns: existing.columns, rows });
+                self.data_view.preview_data =
+                    Some(crate::db::TableData { columns: existing.columns, rows });
             }
         }
         self.is_loading = false;
@@ -1909,10 +1891,10 @@ impl App {
     /// quedan ARRIBA) para mantener la MISMA fila global visible — sin salto
     /// visual ("página atrás" fantasma).
     fn scroll_up_infinite(&mut self) {
-        if self.query_mode {
+        if self.data_view.query_mode {
             return; // resultado de query libre: sin scroll infinito
         }
-        if self.preview_loaded_offset == 0 {
+        if self.data_view.preview_loaded_offset == 0 {
             return; // ya estamos al inicio del dataset
         }
 
@@ -1921,8 +1903,8 @@ impl App {
             return;
         }
 
-        let limit = self.rows_per_page.min(self.preview_loaded_offset);
-        let offset = self.preview_loaded_offset.saturating_sub(limit);
+        let limit = self.data_view.rows_per_page.min(self.data_view.preview_loaded_offset);
+        let offset = self.data_view.preview_loaded_offset.saturating_sub(limit);
         if limit == 0 {
             return;
         }
@@ -1930,7 +1912,8 @@ impl App {
         self.is_loading = true;
         self.status = format!("Cargando filas anteriores (offset {offset})...");
 
-        let order_col = self.sort_column.as_deref().map(|col| (col, self.sort_asc));
+        let order_col =
+            self.data_view.sort_column.as_deref().map(|col| (col, self.data_view.sort_asc));
         let Some(adapter) = self.adapter_arc() else {
             self.is_loading = false;
             return;
@@ -1944,23 +1927,24 @@ impl App {
             }
 
             // Anteponer las filas nuevas (preservando el header en index 0)
-            let header = self.preview_rows[0].clone();
+            let header = self.data_view.preview_rows[0].clone();
             let mut expanded = vec![header];
             expanded.extend(data.rows.iter().map(|row| row.to_line(" | ")));
-            expanded.extend(self.preview_rows.iter().skip(1).cloned());
-            self.preview_rows = expanded;
+            expanded.extend(self.data_view.preview_rows.iter().skip(1).cloned());
+            self.data_view.preview_rows = expanded;
 
             // Mantener sincronizadas las celdas tipadas del render 2D
-            if let Some(existing) = self.preview_data.take() {
+            if let Some(existing) = self.data_view.preview_data.take() {
                 let mut rows = data.rows;
                 rows.extend(existing.rows);
-                self.preview_data = Some(crate::db::TableData { columns: existing.columns, rows });
+                self.data_view.preview_data =
+                    Some(crate::db::TableData { columns: existing.columns, rows });
             }
 
             // Actualizar offset
             #[allow(clippy::cast_possible_truncation)]
             {
-                self.preview_loaded_offset -= n as u32;
+                self.data_view.preview_loaded_offset -= n as u32;
             }
 
             // La selección se desplaza +n para mantener la misma fila global
@@ -1991,7 +1975,7 @@ impl App {
             available.iter().find(|t| t.label() > tab.label()).copied().unwrap_or(available[0])
         };
 
-        self.detail_tab = effective;
+        self.data_view.detail_tab = effective;
         self.set_selected_idx(PanelKind::Detail, 0);
         self.refresh_preview_from_selected_object();
     }
@@ -2109,15 +2093,15 @@ impl App {
                     self.is_loading = false;
                     let (state, rows) = Self::apply_user_query_result(&res);
                     if matches!(state, query::QueryState::Done(_)) {
-                        self.query_mode = true;
+                        self.data_view.query_mode = true;
                         self.query_state = state;
                         self.query_results = rows;
-                        self.detail_tab = DetailTab::Data;
+                        self.data_view.detail_tab = DetailTab::Data;
                         // Vista de datos 2D: fila 0 es el header, el
                         // resto son datos (el render ya hace el split).
-                        self.preview_rows = self.query_results.clone();
-                        self.preview_data = None;
-                        self.preview_loaded_offset = 0;
+                        self.data_view.preview_rows = self.query_results.clone();
+                        self.data_view.preview_data = None;
+                        self.data_view.preview_loaded_offset = 0;
                         self.set_selected_idx(PanelKind::Detail, 0);
                         self.status = format!(
                             "{} filas · query OK (limit {})",
@@ -2681,13 +2665,13 @@ impl App {
         self.tables.clear();
         self.views.clear();
         self.advanced.clear();
-        self.preview_rows.clear();
-        self.preview_data = None;
+        self.data_view.preview_rows.clear();
+        self.data_view.preview_data = None;
         self.connection.connection_form = Some(ConnectionFormState::default());
-        self.total_rows = 0;
-        self.preview_loaded_offset = 0;
-        self.current_page = 0;
-        self.detail_tab = DetailTab::Data;
+        self.data_view.total_rows = 0;
+        self.data_view.preview_loaded_offset = 0;
+        self.data_view.current_page = 0;
+        self.data_view.detail_tab = DetailTab::Data;
         // Invalidar cualquier query en vuelo: su resultado ya no aplica y la
         // conexión del pool se libera YA (abort real, no solo generación)
         self.query_gen += 1;
@@ -2792,7 +2776,7 @@ impl App {
 
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1); // skip header
         #[allow(clippy::cast_possible_truncation)]
-        let offset = self.preview_loaded_offset + row_idx as u32;
+        let offset = self.data_view.preview_loaded_offset + row_idx as u32;
 
         // NoSQL (mongo): el backend entrega directo los pares clave→valor SOLO
         // de los campos presentes en este documento. Cada fila puede tener
@@ -2810,6 +2794,7 @@ impl App {
         // en `preview_data` (TableData del Data tab): reutilizarlas evita una
         // consulta `column_names()` aparte por cada apertura del modal.
         let columns: Vec<crate::db::Column> = self
+            .data_view
             .preview_data
             .as_ref()
             .map(|data| data.columns.clone())
@@ -2990,7 +2975,7 @@ impl App {
             PanelKind::Tables => &self.tables,
             PanelKind::Views => &self.views,
             PanelKind::Advanced => &self.advanced,
-            PanelKind::Detail => &self.preview_rows,
+            PanelKind::Detail => &self.data_view.preview_rows,
         }
     }
 
@@ -3011,7 +2996,7 @@ impl App {
         self.rebuild_sources(None);
 
         let ui_config = config::Config::load().ui;
-        self.rows_per_page = ui_config.rows_per_page;
+        self.data_view.rows_per_page = ui_config.rows_per_page;
 
         // Ajustar índices si las listas se achicaron
         if self.selected_idx(PanelKind::Sources) >= self.sources_state.sources.len() {
@@ -3025,8 +3010,10 @@ impl App {
             self.refresh_preview_from_selected_object();
         }
 
-        self.status =
-            format!("Config recargada: keys + estado + ui (rows_per_page={})", self.rows_per_page);
+        self.status = format!(
+            "Config recargada: keys + estado + ui (rows_per_page={})",
+            self.data_view.rows_per_page
+        );
     }
 
     // ── menú de acciones ──────────────────────────────────────────────
@@ -3034,7 +3021,7 @@ impl App {
         if self.active_panel == PanelKind::Detail {
             // Enter sobre una fila de datos: FK Jump si la fila referencia
             // otra tabla; si no, el inspector de fila (comportamiento previo).
-            if self.detail_tab == DetailTab::Data
+            if self.data_view.detail_tab == DetailTab::Data
                 && self.selected_idx(PanelKind::Detail) > 0
                 && self.fk_jump()
             {
@@ -3048,7 +3035,7 @@ impl App {
         match self.active_panel {
             PanelKind::Sources => self.connect_selected_source(),
             PanelKind::Tables | PanelKind::Views | PanelKind::Advanced => {
-                self.current_page = 0;
+                self.data_view.current_page = 0;
                 self.refresh_preview_from_selected_object();
             }
             PanelKind::Detail => {}
@@ -3068,7 +3055,7 @@ impl App {
         if object.is_empty() || object == "-" {
             return false;
         }
-        let Some(data) = self.preview_data.as_ref() else { return false };
+        let Some(data) = self.data_view.preview_data.as_ref() else { return false };
         let row_idx = self.selected_idx(PanelKind::Detail).saturating_sub(1);
         let Some(row) = data.rows.get(row_idx) else { return false };
 
@@ -3139,14 +3126,14 @@ impl App {
 
         // Cargar la página que contiene la fila referenciada
         #[allow(clippy::cast_possible_truncation)]
-        let page = (idx.saturating_sub(1)) / self.rows_per_page;
-        self.current_page = page;
-        self.detail_tab = DetailTab::Data;
+        let page = (idx.saturating_sub(1)) / self.data_view.rows_per_page;
+        self.data_view.current_page = page;
+        self.data_view.detail_tab = DetailTab::Data;
         self.refresh_preview_from_selected_object();
 
         // Seleccionar la fila exacta dentro de la página
         #[allow(clippy::cast_possible_truncation)]
-        let local = idx.saturating_sub(page.saturating_mul(self.rows_per_page));
+        let local = idx.saturating_sub(page.saturating_mul(self.data_view.rows_per_page));
         #[allow(clippy::cast_possible_truncation)]
         {
             self.set_selected_idx(PanelKind::Detail, local as usize);
@@ -3544,12 +3531,16 @@ impl App {
             keys::AppAction::MoveUp => self.move_selection(-1),
             keys::AppAction::MoveDown => self.move_selection(1),
             keys::AppAction::PrevPage => {
-                if self.active_panel == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                if self.active_panel == PanelKind::Detail
+                    && self.data_view.detail_tab == DetailTab::Data
+                {
                     self.move_selection_by_page(false);
                 }
             }
             keys::AppAction::NextPage => {
-                if self.active_panel == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                if self.active_panel == PanelKind::Detail
+                    && self.data_view.detail_tab == DetailTab::Data
+                {
                     self.move_selection_by_page(true);
                 }
             }
@@ -3563,8 +3554,8 @@ impl App {
             keys::AppAction::SourceTabPrev => {
                 self.set_source_tab(self.sources_state.source_tab.prev());
             }
-            keys::AppAction::DetailTabPrev => self.set_detail_tab(self.detail_tab.prev()),
-            keys::AppAction::DetailTabNext => self.set_detail_tab(self.detail_tab.next()),
+            keys::AppAction::DetailTabPrev => self.set_detail_tab(self.data_view.detail_tab.prev()),
+            keys::AppAction::DetailTabNext => self.set_detail_tab(self.data_view.detail_tab.next()),
             keys::AppAction::DetailTabData => self.set_detail_tab(DetailTab::Data),
             keys::AppAction::DetailTabSchema => self.set_detail_tab(DetailTab::Schema),
             keys::AppAction::DetailTabSql => self.set_detail_tab(DetailTab::Sql),
@@ -3643,7 +3634,10 @@ impl App {
             } // ── drop `p` ──
 
             // Header bypass para Data tab no enfocado
-            if target == PanelKind::Detail && self.detail_tab == DetailTab::Data && items_len > 1 {
+            if target == PanelKind::Detail
+                && self.data_view.detail_tab == DetailTab::Data
+                && items_len > 1
+            {
                 let p = self.panel_mut(target);
                 if p.selected_idx == 0 {
                     p.selected_idx = 1;
@@ -3651,10 +3645,13 @@ impl App {
             }
 
             // Scroll infinito en Data tab no enfocado
-            if target == PanelKind::Detail && self.detail_tab == DetailTab::Data && items_len > 1 {
+            if target == PanelKind::Detail
+                && self.data_view.detail_tab == DetailTab::Data
+                && items_len > 1
+            {
                 if !up && old_idx == items_len.saturating_sub(1) {
                     self.scroll_down_infinite();
-                } else if up && old_idx == 1 && self.preview_loaded_offset > 0 {
+                } else if up && old_idx == 1 && self.data_view.preview_loaded_offset > 0 {
                     self.scroll_up_infinite();
                 }
             }
@@ -3716,17 +3713,20 @@ impl App {
     #[allow(clippy::cast_possible_truncation)]
     fn detail_tab_display_width(&self, tab: DetailTab) -> u16 {
         let label = tab.label();
-        let inner = if tab == DetailTab::Data && self.total_rows > 0 {
-            let current_row = self.preview_loaded_offset
+        let inner = if tab == DetailTab::Data && self.data_view.total_rows > 0 {
+            let current_row = self.data_view.preview_loaded_offset
                 + self.selected_idx(PanelKind::Detail).saturating_sub(1) as u32
                 + 1;
-            let total = self.total_rows;
+            let total = self.data_view.total_rows;
             format!("{label} - row {current_row}/{total}")
         } else {
             label.to_string()
         };
-        let padded =
-            if tab == self.detail_tab { format!(" [ {inner} ] ") } else { format!("  {inner}  ") };
+        let padded = if tab == self.data_view.detail_tab {
+            format!(" [ {inner} ] ")
+        } else {
+            format!("  {inner}  ")
+        };
         #[allow(clippy::cast_possible_truncation)]
         {
             padded.len() as u16
@@ -3739,8 +3739,11 @@ impl App {
         let detail = self.panel(PanelKind::Detail);
         let current = detail.h_scroll.get();
         let max_cols = {
-            let headers: Vec<&str> =
-                self.preview_rows.first().map_or_else(Vec::new, |r| r.split(" | ").collect());
+            let headers: Vec<&str> = self
+                .data_view
+                .preview_rows
+                .first()
+                .map_or_else(Vec::new, |r| r.split(" | ").collect());
             headers.len()
         };
         let inner_w = self
@@ -3767,10 +3770,10 @@ impl App {
     /// Dado un click en el área del panel Detail (Data tab), calcula a qué columna
     /// corresponde según la posición X y las columnas parseadas del header.
     fn column_at_x(&self, x: u16, rect: Rect) -> Option<String> {
-        if self.preview_rows.is_empty() {
+        if self.data_view.preview_rows.is_empty() {
             return None;
         }
-        let headers: Vec<&str> = self.preview_rows[0].split(" | ").collect();
+        let headers: Vec<&str> = self.data_view.preview_rows[0].split(" | ").collect();
         let col_count = headers.len();
         if col_count <= 1 {
             return None;
@@ -3829,21 +3832,21 @@ impl App {
         if !self.filtered_items.is_empty() || self.input_mode == InputMode::Filtering {
             self.cancel_filter();
         }
-        if self.sort_column.as_deref() == Some(col.as_str()) {
-            if self.sort_asc {
-                self.sort_asc = false;
+        if self.data_view.sort_column.as_deref() == Some(col.as_str()) {
+            if self.data_view.sort_asc {
+                self.data_view.sort_asc = false;
             } else {
                 // 3er click: desactivar ordenamiento
-                self.sort_column = None;
-                self.sort_asc = true;
+                self.data_view.sort_column = None;
+                self.data_view.sort_asc = true;
             }
         } else {
-            self.sort_column = Some(col);
-            self.sort_asc = true;
+            self.data_view.sort_column = Some(col);
+            self.data_view.sort_asc = true;
         }
         // Recargar datos desde la página actual con el nuevo orden
-        self.current_page = 0;
-        self.preview_loaded_offset = 0;
+        self.data_view.current_page = 0;
+        self.data_view.preview_loaded_offset = 0;
         self.refresh_preview_from_selected_object();
     }
 
@@ -3881,6 +3884,7 @@ impl App {
                     self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
                 {
                     let headers: Vec<&str> = self
+                        .data_view
                         .preview_rows
                         .first()
                         .map_or_else(Vec::new, |r| r.split(" | ").collect());
@@ -3924,7 +3928,7 @@ impl App {
         if self.show_row_inspector || self.show_actions_menu {
             return false;
         }
-        if self.detail_tab != DetailTab::Data {
+        if self.data_view.detail_tab != DetailTab::Data {
             return false;
         }
         let Some(&(_, rect)) = self.layout.panels.iter().find(|(k, _)| *k == PanelKind::Detail)
@@ -3936,7 +3940,7 @@ impl App {
             return false;
         }
         let headers: Vec<&str> =
-            self.preview_rows.first().map_or_else(Vec::new, |r| r.split(" | ").collect());
+            self.data_view.preview_rows.first().map_or_else(Vec::new, |r| r.split(" | ").collect());
         let col_count = headers.len();
         if col_count <= 1 {
             return false;
@@ -4041,7 +4045,7 @@ impl App {
                 continue;
             }
             // Detail + Data tab no tiene scrollbar vertical (usa el horizontal)
-            if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+            if kind == PanelKind::Detail && self.data_view.detail_tab == DetailTab::Data {
                 continue;
             }
             let items_len = self.items_len_for(kind);
@@ -4167,7 +4171,10 @@ impl App {
             self.set_focus(kind);
 
             // Click en header de Data tab → ordenar por columna
-            if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data && rel_y == 2 {
+            if kind == PanelKind::Detail
+                && self.data_view.detail_tab == DetailTab::Data
+                && rel_y == 2
+            {
                 if let Some(col_name) = self.column_at_x(x, rect) {
                     self.toggle_sort(col_name);
                 }
@@ -4177,9 +4184,13 @@ impl App {
             // Click en un ítem de la lista
             // Para Data tab, las filas de datos empiezan en rel_y=4 (spacer+header+separator)
             let top_reserved =
-                if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data { 3 } else { 0 };
+                if kind == PanelKind::Detail && self.data_view.detail_tab == DetailTab::Data {
+                    3
+                } else {
+                    0
+                };
             if let Some(mut index) = list_index_from_click(rel_y, rect.height, top_reserved) {
-                if kind == PanelKind::Detail && self.detail_tab == DetailTab::Data {
+                if kind == PanelKind::Detail && self.data_view.detail_tab == DetailTab::Data {
                     // +1 porque selected_idx=0 salta el header (primera fila de datos es idx=1)
                     index = index.saturating_add(1);
                 }
@@ -4215,7 +4226,7 @@ impl App {
                     || kind == PanelKind::Views
                     || kind == PanelKind::Advanced
                 {
-                    self.current_page = 0;
+                    self.data_view.current_page = 0;
                     self.refresh_preview_from_selected_object();
                 }
                 // Detail: doble-click ya manejado arriba, click simple no hace nada extra
@@ -4800,13 +4811,13 @@ mod tests {
     #[tokio::test]
     async fn pagina_mueve_k_filas_con_clamp_al_contenido() {
         let mut app = App::new();
-        app.detail_tab = DetailTab::Data;
+        app.data_view.detail_tab = DetailTab::Data;
         // Buffer: header + 40 filas cargadas (de 250 totales)
-        app.preview_rows = std::iter::once("col".to_string())
+        app.data_view.preview_rows = std::iter::once("col".to_string())
             .chain((1..=40).map(|i| format!("fila {i}")))
             .collect();
-        app.total_rows = 250;
-        app.preview_loaded_offset = 100;
+        app.data_view.total_rows = 250;
+        app.data_view.preview_loaded_offset = 100;
         app.compute_layout(120, 40);
         let k = {
             let rect = app
@@ -4823,7 +4834,7 @@ mod tests {
         app.set_selected_idx(PanelKind::Detail, 1);
         app.move_selection_by_page(true);
         assert_eq!(app.selected_idx(PanelKind::Detail), 1 + k);
-        assert_eq!(app.preview_loaded_offset, 100, "no debe recargar el preview");
+        assert_eq!(app.data_view.preview_loaded_offset, 100, "no debe recargar el preview");
 
         // avPag: sobrepasa el final del buffer → clamp a la última fila
         app.move_selection_by_page(true);
@@ -5111,7 +5122,7 @@ mod tests {
             panic!("debe existir el formulario de conexión al arrancar");
         };
         assert_eq!(form.active, ConnField::Url, "foco inicial en la URL");
-        assert!(app.preview_rows.is_empty(), "sin items de lista");
+        assert!(app.data_view.preview_rows.is_empty(), "sin items de lista");
     }
 
     #[test]
@@ -5395,12 +5406,12 @@ mod tests {
         let mut app = App::new();
         app.active_adapter = Some(std::sync::Arc::new(FakeScrollAdapter { total }));
         app.active_panel = PanelKind::Detail;
-        app.detail_tab = DetailTab::Data;
+        app.data_view.detail_tab = DetailTab::Data;
         app.tables = vec!["t".to_string()];
         app.object_section = ObjectSection::Tables;
         app.set_selected_idx(PanelKind::Tables, 0);
-        app.rows_per_page = page;
-        app.total_rows = total;
+        app.data_view.rows_per_page = page;
+        app.data_view.total_rows = total;
         app
     }
 
@@ -5408,13 +5419,13 @@ mod tests {
     /// con `n` filas — el estado exacto tras cargar una página.
     fn cargar_pagina(app: &mut App, n: u32) {
         let rows: Vec<db::Row> = (0..n).map(|i| db::Row { cells: vec![format!("v{i}")] }).collect();
-        app.preview_data = Some(db::TableData {
+        app.data_view.preview_data = Some(db::TableData {
             columns: vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }],
             rows: rows.clone(),
         });
         let mut lines = vec!["id".to_string()];
         lines.extend(rows.iter().map(|r| r.to_line(" | ")));
-        app.preview_rows = lines;
+        app.data_view.preview_rows = lines;
     }
 
     /// REGRESIÓN: el scroll hacia abajo se congelaba porque
@@ -5429,10 +5440,10 @@ mod tests {
 
         app.scroll_down_infinite(); // carga la página 2
 
-        let data_len = app.preview_data.as_ref().expect("preview_data").rows.len();
+        let data_len = app.data_view.preview_data.as_ref().expect("preview_data").rows.len();
         assert_eq!(data_len, 50, "preview_data debe crecer con cada página");
         assert_eq!(
-            app.preview_rows.len(),
+            app.data_view.preview_rows.len(),
             data_len + 1,
             "preview_rows (con header) debe seguir a preview_data"
         );
@@ -5449,14 +5460,14 @@ mod tests {
         // Simula haber bajado 4 páginas: buffer con 25 filas, offset global 100
         let rows: Vec<db::Row> =
             (0..25).map(|i| db::Row { cells: vec![format!("v{}", i + 100)] }).collect();
-        app.preview_data = Some(db::TableData {
+        app.data_view.preview_data = Some(db::TableData {
             columns: vec![db::Column { name: "id".to_string(), dtype: "INTEGER".to_string() }],
             rows: rows.clone(),
         });
         let mut lines = vec!["id".to_string()];
         lines.extend(rows.iter().map(|r| r.to_line(" | ")));
-        app.preview_rows = lines;
-        app.preview_loaded_offset = 100;
+        app.data_view.preview_rows = lines;
+        app.data_view.preview_loaded_offset = 100;
         // El usuario está en la PRIMERA fila del buffer (borde superior)
         app.set_selected_idx(PanelKind::Detail, 1);
         app.panel_mut(PanelKind::Detail).scroll_offset.set(0);
@@ -5466,11 +5477,11 @@ mod tests {
         // El viewport debe desplazarse +25 igual que la selección
         assert_eq!(app.panel(PanelKind::Detail).scroll_offset.get(), 25);
         assert_eq!(app.selected_idx(PanelKind::Detail), 26, "selección +25");
-        assert_eq!(app.preview_loaded_offset, 75, "offset global retrocede 25");
+        assert_eq!(app.data_view.preview_loaded_offset, 75, "offset global retrocede 25");
         // Invariante de fila global: misma fila visible que antes del prepend
         // (100 global antes == 75 + (26 - 1) después)
         let fila_global =
-            app.preview_loaded_offset as usize + app.selected_idx(PanelKind::Detail) - 1;
+            app.data_view.preview_loaded_offset as usize + app.selected_idx(PanelKind::Detail) - 1;
         assert_eq!(fila_global, 100);
     }
 
