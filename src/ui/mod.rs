@@ -597,12 +597,9 @@ fn render_query_tab(frame: &mut Frame<'_>, area: Rect, title: &str, app: &App) {
         body.height.saturating_sub(input_h + 1),
     );
 
-    // ── resultados: reutilizar render_data_table (cabeceras + celdas 2D) ──
-    let results: &[String] = if app.query.query_results.is_empty() {
-        &app.data_view.preview_rows
-    } else {
-        &app.query.query_results
-    };
+    // ── resultados: SOLO query_results (nunca preview_rows: eso mostraba
+    // los metadatos/último preview de otra pestaña) ──
+    let results: &[String] = &app.query.query_results;
 
     if results.is_empty() {
         frame.render_widget(

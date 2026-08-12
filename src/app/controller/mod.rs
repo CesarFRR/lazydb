@@ -1600,6 +1600,13 @@ impl App {
         self.is_loading = true;
         self.status = format!("Cargando {}...", self.data_view.detail_tab.label().trim());
 
+        // NO cache: limpiar el preview viejo AHORA — mostrar "Cargando..."
+        // en vez de datos de OTRA pestaña (bug: Schema mostraba filas de
+        // Data hasta que llegaba el resultado async).
+        self.data_view.preview_rows =
+            vec![format!("Cargando {}...", self.data_view.detail_tab.label().trim())];
+        self.data_view.preview_data = None;
+
         if object_name.is_empty() || object_name == "-" {
             self.data_view.preview_rows = vec!["Sin objeto seleccionado".to_string()];
             self.data_view.preview_data = None;
@@ -4759,6 +4766,26 @@ mod tests {
         assert_eq!(app.query.query_results[1], "1 | uno", "numérico asc");
         assert_eq!(app.query.query_results[2], "2 | dos");
         assert_eq!(app.query.query_results[3], "10 | diez");
+    }
+
+    /// REGRESIÓN (bug reportado): al cambiar de pestaña SIN cache, el
+    /// preview viejo se limpia — Schema no muestra filas de Data mientras
+    /// carga el resultado async.
+    #[test]
+    fn cambiar_de_tab_limpia_el_preview_viejo() {
+        let mut app = App::new();
+        app.data_view.preview_rows = vec!["1 | fila de datos".to_string()];
+        app.data_view.last_preview_key = Some(("t".to_string(), DetailTab::Data));
+        app.tables = vec!["t".to_string()];
+        app.set_selected_idx(PanelKind::Tables, 0);
+        // Cambiar a Schema (sin adapter → no cache, limpia preview)
+        app.data_view.detail_tab = DetailTab::Schema;
+        app.refresh_preview_from_selected_object();
+        assert!(
+            app.data_view.preview_rows.first().is_some_and(|l| l.contains("Cargando")),
+            "el preview viejo se limpia al cambiar de tab: {:?}",
+            app.data_view.preview_rows
+        );
     }
 
     /// REGRESIÓN (bug reportado): la pestaña Query NO debe abrir el modal `:`

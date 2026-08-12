@@ -650,6 +650,16 @@ impl App {
 
             // Click en un ítem de la lista
             // Para Data tab, las filas de datos empiezan en rel_y=4 (spacer+header+separator)
+            // Para Query tab, la zona del input (1/3 superior) NO selecciona
+            // filas: solo enfoca el panel para que el teclado escriba.
+            if kind == PanelKind::Detail && self.data_view.detail_tab == DetailTab::Query {
+                let body_h = usize::from(rect.height.saturating_sub(2));
+                let input_h = (body_h / 3).clamp(4, 12);
+                if usize::from(rel_y) <= input_h {
+                    self.set_focus(kind);
+                    return; // click en el input: no seleccionar filas
+                }
+            }
             let top_reserved =
                 if kind == PanelKind::Detail && self.data_view.detail_tab == DetailTab::Data {
                     3
