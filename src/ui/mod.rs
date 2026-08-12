@@ -190,9 +190,117 @@ fn render_panel_at(frame: &mut Frame<'_>, area: Rect, kind: PanelKind, app: &App
 // Footer / status bar
 // ---------------------------------------------------------------------------
 
+/// Un atajo de la barra inferior: tecla + descripción + estilo semántico.
+/// (Patrón `bindingInfo` de lazygit: la barra es DINÁMICA por contexto.)
+struct FooterBinding {
+    key: &'static str,
+    description: &'static str,
+    style: ratatui::style::Style,
+}
+
+/// Bindings del contexto actual (panel activo + tab Detail + modal abierto).
+/// Orden: específicos del contexto primero, globales al final — lazygit
+/// muestra los del contexto + globales que no colisionan.
+fn footer_bindings(app: &App) -> Vec<FooterBinding> {
+    use crate::app::controller::{DetailTab, InputMode};
+    use crate::app::panel::PanelKind;
+    use crate::ui::theme::THEME;
+    use ratatui::style::{Color, Modifier, Style};
+
+    let mut out: Vec<FooterBinding> = Vec::new();
+    let normal = Style::default().fg(THEME.dim);
+    let accent = Style::default().fg(THEME.selection).add_modifier(Modifier::BOLD);
+    let mode = Style::default().fg(Color::Cyan); // modo especial activo
+    let danger = Style::default().fg(Color::Red);
+
+    // ── modales abiertos: los atajos del modal dominan ──
+    if app.query.query_input.is_some() {
+        out.push(FooterBinding { key: "enter", description: "ejecutar", style: accent });
+        out.push(FooterBinding { key: "esc", description: "cerrar", style: normal });
+        out.push(FooterBinding { key: "↑↓", description: "historial", style: normal });
+        out.push(FooterBinding { key: "ctrl+u", description: "limpiar", style: normal });
+        out.push(FooterBinding { key: "ctrl+l", description: "limpiar todo", style: normal });
+        return out;
+    }
+    if app.show_row_inspector {
+        out.push(FooterBinding { key: "esc", description: "cerrar inspector", style: normal });
+        out.push(FooterBinding { key: "shift+j", description: "pares↔json", style: mode });
+        return out;
+    }
+    if app.connection.password_prompt.is_some() {
+        out.push(FooterBinding { key: "enter", description: "autenticar", style: accent });
+        out.push(FooterBinding { key: "esc", description: "cancelar", style: normal });
+        return out;
+    }
+    if app.connection.db_picker.is_some() {
+        out.push(FooterBinding { key: "↑↓", description: "elegir base", style: normal });
+        out.push(FooterBinding { key: "enter", description: "conectar", style: accent });
+        out.push(FooterBinding { key: "esc", description: "cancelar", style: normal });
+        return out;
+    }
+    if app.input_mode == InputMode::Filtering {
+        out.push(FooterBinding { key: "esc", description: "salir filtro", style: normal });
+        out.push(FooterBinding { key: "enter", description: "aplicar", style: accent });
+        return out;
+    }
+
+    // ── sin DB: formulario de conexión ──
+    if app.db_path.is_none() {
+        out.push(FooterBinding { key: "enter", description: "conectar", style: accent });
+        out.push(FooterBinding { key: "tab", description: "siguiente campo", style: normal });
+        out.push(FooterBinding { key: "ctrl+u", description: "limpiar campo", style: normal });
+        out.push(FooterBinding { key: "ctrl+l", description: "limpiar todo", style: normal });
+    }
+
+    // ── panel activo: atajos específicos ──
+    match app.active_panel {
+        PanelKind::Sources => {
+            out.push(FooterBinding { key: "enter", description: "abrir", style: accent });
+            out.push(FooterBinding { key: "f", description: "favorito", style: normal });
+            out.push(FooterBinding { key: "d", description: "olvidar", style: danger });
+        }
+        PanelKind::Tables | PanelKind::Views | PanelKind::Advanced => {
+            out.push(FooterBinding { key: "enter", description: "ver detalle", style: accent });
+            out.push(FooterBinding { key: "/", description: "filtrar", style: normal });
+            out.push(FooterBinding { key: "y", description: "copiar", style: normal });
+            out.push(FooterBinding { key: "e", description: "exportar csv", style: normal });
+            if app.db_path.is_some() && app.active_panel != PanelKind::Advanced {
+                out.push(FooterBinding { key: "ctrl+r", description: "contar filas", style: mode });
+            }
+        }
+        PanelKind::Detail => match app.data_view.detail_tab {
+            DetailTab::Data => {
+                out.push(FooterBinding { key: "j/k", description: "filas", style: normal });
+                out.push(FooterBinding { key: "h/l", description: "columnas", style: normal });
+                out.push(FooterBinding { key: "o", description: "inspector", style: accent });
+                if app.is_nosql {
+                    out.push(FooterBinding {
+                        key: "shift+j",
+                        description: "pares↔json",
+                        style: mode,
+                    });
+                }
+            }
+            DetailTab::Schema | DetailTab::Sql | DetailTab::Meta => {
+                out.push(FooterBinding { key: "j/k", description: "scroll", style: normal });
+            }
+        },
+    }
+
+    // ── globales (siempre visibles, al final) ──
+    out.push(FooterBinding { key: "x", description: "menú", style: accent });
+    out.push(FooterBinding { key: "?", description: "ayuda", style: normal });
+    out.push(FooterBinding { key: "1-5", description: "panel", style: normal });
+    out.push(FooterBinding { key: "esc", description: "atrás", style: normal });
+
+    out
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // Feedback inmediato: spinner mientras corre una query O una conexión
-    // (Capa A: antes `is_loading` solo cambiaba el texto, sin animación).
+    use crate::ui::theme::THEME;
+    use ratatui::style::Style;
+
+    // Feedback inmediato: spinner mientras corre una query O una conexión.
     let status = if app.is_loading || app.query.query_state == QueryState::Running {
         let spin = SPINNER[app.frame % SPINNER.len()];
         format!("{spin} {}", app.status)
@@ -200,17 +308,42 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.status.clone()
     };
 
-    if area.width >= 110 {
-        let shortcuts = format!(
-            "tab: foco | ↑↓: selección | ←→: sidebar | []: tabs | space: toggle | 1-5: panel | rueda: scroll | shift+rueda: cols | x: menu | ?: ayuda | {status}",
-        );
-        frame.render_widget(Paragraph::new(shortcuts), area);
-    } else {
-        let shortcuts = format!(
-            "tab foco | ↑↓ mover | ←→ detalle | space toggle | rueda | shift+rueda cols | {status}",
-        );
-        frame.render_widget(Paragraph::new(shortcuts), area);
+    // Barra DINÁMICA por contexto (patrón lazygit `options_map`): bindings
+    // del contexto actual formateados `desc: tecla`, truncando con `…`.
+    let bindings = footer_bindings(app);
+    let width = usize::from(area.width.saturating_sub(2)); // padding
+    let mut line = Vec::<ratatui::text::Span<'_>>::new();
+    let mut len = 0usize;
+    let sep = " | ";
+    let mut truncated = false;
+
+    for (i, b) in bindings.iter().enumerate() {
+        let text = format!("{}: {}", b.description, b.key);
+        let text_len = text.chars().count();
+        let extra = if i > 0 { sep.len() } else { 0 };
+        if len + extra + text_len > width {
+            truncated = true;
+            break;
+        }
+        if i > 0 {
+            line.push(ratatui::text::Span::styled(sep, Style::default().fg(THEME.dim)));
+            len += sep.len();
+        }
+        line.push(ratatui::text::Span::styled(text, b.style));
+        len += text_len;
     }
+    if truncated {
+        line.push(ratatui::text::Span::styled(format!("{sep}…"), Style::default().fg(THEME.dim)));
+    }
+    // Status al final (spinner + mensaje)
+    if len + 2 + status.chars().count() <= width {
+        line.push(ratatui::text::Span::styled(
+            format!("{sep}{status}"),
+            Style::default().fg(THEME.dim),
+        ));
+    }
+
+    frame.render_widget(ratatui::widgets::Paragraph::new(ratatui::text::Line::from(line)), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -516,5 +649,61 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &mut app))
             .expect("render con h_scroll + resize no debe paniquear");
+    }
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::*;
+    use crate::app::controller::App;
+    use crate::app::panel::PanelKind;
+
+    fn descs(app: &App) -> Vec<String> {
+        footer_bindings(app).iter().map(|b| b.description.to_string()).collect()
+    }
+
+    #[test]
+    fn sin_db_muestra_bindings_del_formulario() {
+        let app = App::new();
+        let d = descs(&app);
+        assert!(d.iter().any(|x| x == "conectar"), "formulario: {d:?}");
+        assert!(d.iter().any(|x| x == "siguiente campo"), "formulario: {d:?}");
+    }
+
+    #[test]
+    fn sources_muestra_favorito_y_olvidar() {
+        let app = App::new();
+        let d = descs(&app);
+        assert!(d.iter().any(|x| x == "favorito"), "sources: {d:?}");
+        assert!(d.iter().any(|x| x == "olvidar"), "sources: {d:?}");
+        assert!(d.iter().any(|x| x == "abrir"), "sources: {d:?}");
+    }
+
+    #[test]
+    fn data_tab_muestra_inspector() {
+        let mut app = App::new();
+        app.data_view.detail_tab = crate::app::controller::DetailTab::Data;
+        app.active_panel = PanelKind::Detail;
+        let d = descs(&app);
+        assert!(d.iter().any(|x| x == "inspector"), "data: {d:?}");
+        assert!(d.iter().any(|x| x == "columnas"), "data: {d:?}");
+    }
+
+    #[test]
+    fn modal_query_domina_los_bindings() {
+        let mut app = App::new();
+        app.query.query_input = Some(crate::query::QueryInputState::default());
+        let d = descs(&app);
+        assert!(d.iter().any(|x| x == "ejecutar"), "modal: {d:?}");
+        // El modal no muestra bindings de panel
+        assert!(!d.iter().any(|x| x == "favorito"), "modal: {d:?}");
+    }
+
+    #[test]
+    fn globales_siempre_presentes() {
+        let app = App::new();
+        let d = descs(&app);
+        assert!(d.iter().any(|x| x == "menú"), "global: {d:?}");
+        assert!(d.iter().any(|x| x == "ayuda"), "global: {d:?}");
     }
 }
